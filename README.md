@@ -55,6 +55,35 @@ git clone https://github.com/ZkwareDAO/trading ~/.claude/plugins/trading
 ln -s /path/to/trading/trading-dev-skill ~/.claude/skills/trading-dev
 ```
 
+### 方式 5：OpenAI Codex CLI
+
+```bash
+# 1. 克隆仓库
+git clone https://github.com/ZkwareDAO/trading ~/.codex/trading
+
+# 2. 创建 skill symlink（Codex 自动发现）
+ln -s ~/.codex/trading/codex/trading-dev ~/.codex/skills/trading-dev
+
+# 3. 创建 prompt 触发器
+ln -s ~/.codex/trading/commands/trading-dev.md ~/.codex/prompts/trading-dev.md
+
+# 4. 重启 Codex
+```
+
+项目级安装（仅当前项目生效）：
+
+```bash
+mkdir -p .agents/skills/trading-dev
+cp -r codex/trading-dev/* .agents/skills/trading-dev/
+
+mkdir -p .agents/prompts
+cp commands/trading-dev.md .agents/prompts/trading-dev.md
+```
+
+Codex 触发方式：`$trading-dev` 直接调用，或 `/prompts:trading-dev` 手动触发。
+
+详细说明见 [.codex/INSTALL.md](.codex/INSTALL.md)。
+
 ## 使用
 
 | 命令 | 模式 | 说明 |
