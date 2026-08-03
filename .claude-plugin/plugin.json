@@ -1,0 +1,25 @@
+{
+    "name": "trading-dev",
+    "version": "0.1.0",
+    "description": "CTA quantitative strategy development lifecycle skill for Claude Code. Scaffold → strategy coding → backtest verification → benchmark output. Supports interactive, fully-automatic, and single-step modes with loop-engineering cross-phase closure.",
+    "author": {
+        "name": "ZkwareDAO",
+        "url": "https://github.com/ZkwareDAO"
+    },
+    "homepage": "https://github.com/ZkwareDAO/trading",
+    "repository": "https://github.com/ZkwareDAO/trading",
+    "license": "MIT",
+    "keywords": [
+        "trading",
+        "cta",
+        "strategy",
+        "backtest",
+        "benchmark",
+        "quantitative",
+        "crypto",
+        "scaffold",
+        "loop-engineering",
+        "strategy-development",
+        "trading-dev"
+    ]
+}

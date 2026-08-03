@@ -1,0 +1,20 @@
+{
+    "name": "trading-skills",
+    "description": "CTA quantitative strategy development skills: scaffold generation, strategy coding, backtest verification, and benchmark output with loop-engineering closure.",
+    "owner": {
+        "name": "ZkwareDAO",
+        "url": "https://github.com/ZkwareDAO"
+    },
+    "plugins": [
+        {
+            "name": "trading-dev",
+            "description": "CTA strategy development lifecycle skill — scaffold → strategy coding → backtest verification → benchmark output, with loop-engineering cross-phase closure.",
+            "version": "0.1.0",
+            "source": "./trading-dev-skill/",
+            "author": {
+                "name": "ZkwareDAO",
+                "url": "https://github.com/ZkwareDAO"
+            }
+        }
+    ]
+}

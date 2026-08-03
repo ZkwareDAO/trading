@@ -1,0 +1,104 @@
+# =============================================================================
+# 系统配置模板 - 实盘/回测共用
+# =============================================================================
+# 复制此文件到 config/settings.yaml 并根据需要修改
+# 所有部署相关配置通过环境变量注入，不硬编码 IP 或密钥
+#
+# 使用方式：
+#   实盘: python run_strategies_manager.py
+#   回测: python -m backtest.batch_runner
+# =============================================================================
+# 环境变量支持：
+#   - 使用 ${VAR_NAME} 语法引用环境变量
+#   - 启动前需设置对应环境变量（参见 .env.example）
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 策略引擎配置
+# -----------------------------------------------------------------------------
+strategy_engine:
+  factory_endpoint: "${FACTORY_ENDPOINT}"
+  position_proxy_url: "${POSITION_PROXY_URL}"
+  heartbeat_interval_ms: 5000
+  auto_register: true
+  strategies_dir: "./strategies"
+  callback_port: ${CALLBACK_PORT}
+  callback_host: "${CALLBACK_HOST}"
+  enable_callback: true
+
+# -----------------------------------------------------------------------------
+# 数据管理器配置
+# -----------------------------------------------------------------------------
+data_manager:
+  csv_dir: "${DATA_PATH}/klines"
+  csv_filename_pattern: "{symbol}_{timeframe}.csv"
+  cache_max_size: 10000
+  auto_load: true
+
+  # klines_service 配置（实时 K线推送服务）
+  klines_service_enabled: true
+  klines_service_ws_url: "${KLINES_WS_URL}"
+  klines_service_http_url: "${KLINES_HTTP_URL}"
+
+# -----------------------------------------------------------------------------
+# 信号日志配置
+# -----------------------------------------------------------------------------
+signal_logging:
+  storage:
+    type: "csv"
+    path: "${DATA_PATH}/signals"
+  retention_days: 90
+  enable_realtime_push: true
+
+  # Kafka 配置（可选）
+  kafka:
+    enabled: false
+    bootstrap_servers: "${KAFKA_BROKERS}"
+    topic: "${KAFKA_TOPIC}"
+    max_retries: 3
+    retry_backoff_ms: 1000
+    acks: "all"
+    compression: "gzip"
+    dedup_file: "${DATA_PATH}/signals/.kafka_sent_ids"
+    dedup_max_size: 10000
+
+# -----------------------------------------------------------------------------
+# Signal Hub 配置
+# -----------------------------------------------------------------------------
+signal_hub:
+  enabled: false
+  endpoint: "${SIGNAL_HUB_ENDPOINT}"
+
+# -----------------------------------------------------------------------------
+# OpenViking 同步配置
+# -----------------------------------------------------------------------------
+openviking_sync:
+  enabled: false
+  dedup:
+    file: "${DATA_PATH}/.ov_synced_records"
+  sources:
+    signal:
+      enabled: true
+      path: "${DATA_PATH}/signals"
+    backtest:
+      enabled: true
+      paths: ["./backtest_output", "./daily_backtest_output"]
+    position:
+      enabled: true
+      path: "${DATA_PATH}/positions"
+    history_position:
+      enabled: true
+      path: "${DATA_PATH}/history_positions"
+
+# -----------------------------------------------------------------------------
+# OpenViking 服务器配置
+# -----------------------------------------------------------------------------
+openviking:
+  server:
+    url: "${OPENVIKING_SERVER_URL}"
+    cli_path: "ov"
+    timeout: 60.0
+  account:
+    name: "trading"
+    root_api_key: "${OPENVIKING_ROOT_API_KEY}"
+    auto_create: true

@@ -1,0 +1,39 @@
+# =============================================================================
+# 策略运行配置 - 实盘/回测共用
+# =============================================================================
+# 使用方式:
+#   实盘: python run_strategies_manager.py
+#   回测: python -m backtest.batch_runner
+#
+# 配置格式（简化版）:
+#   每个策略直接定义完整配置，无需 defaults/templates 层级
+#
+# 策略字段说明:
+#   - trading_mode: 运行模式（live / paper_trading / backtest）
+#   - config_dir: 策略参数配置目录（默认 backtest/config）
+#   - symbols: 交易对列表
+#   - overrides: 回测参数覆盖（可选）
+#
+# symbols 支持两种格式：
+# 1. 字符串数组（所有 symbol 使用相同 trading_mode）:
+#    symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
+#
+# 2. 对象数组（每个 symbol 可独立配置 trading_mode）:
+#    symbols:
+#      - name: BTCUSDT
+#        trading_mode: "live"
+#      - name: SOLUSDT
+#        trading_mode: "paper_trading"
+#
+# 使用 /trading-dev new 创建新策略后，在此文件添加策略配置
+# =============================================================================
+
+strategies:
+  # 示例：取消注释并替换为你的策略
+  # {strategy_name}:
+  #   trading_mode: "paper_trading"
+  #   config_dir: "backtest/config"
+  #   symbols:
+  #     - BTCUSDT
+#     - ETHUSDT
+#     - SOLUSDT

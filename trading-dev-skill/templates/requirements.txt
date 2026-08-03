@@ -1,0 +1,37 @@
+# Core dependencies
+aiohttp>=3.9.0
+pyyaml>=6.0
+sqlalchemy>=2.0.0
+loguru>=0.7.0
+python-dotenv>=1.0.0
+
+# Data processing
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Visualization (for backtest analysis charts)
+matplotlib>=3.7.0
+
+# HTTP requests (for data downloader)
+requests>=2.31.0
+types-requests>=2.31.0
+
+# Binance API client (for data downloader)
+python-binance>=1.0.19
+
+# Type stub packages (for mypy type checking)
+types-PyYAML>=6.0
+
+# Technical indicators
+ta-lib>=0.4.0  # Requires TA-Lib installed system-wide (see docs/TA-Lib-INSTALL.md)
+
+# Security (for XML-RPC)
+defusedxml>=0.7.0  # Prevents XXE attacks on XML-RPC
+
+# Kafka (for real-time signal push)
+kafka-python-ng>=2.2.0
+
+# Arbitrage: Polymarket + Deribit clients
+websockets>=12.0
+py-clob-client-v2>=0.1.0
+

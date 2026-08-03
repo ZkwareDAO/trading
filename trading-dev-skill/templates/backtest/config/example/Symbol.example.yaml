@@ -1,0 +1,19 @@
+# 策略配置模板
+# 复制此文件到 backtest/config/{strategy_name}/{SYMBOL}.yaml
+# 例如: backtest/config/cta_rbreaker_v2/BTCUSDT.yaml
+
+{strategy_name}:
+  enabled: true
+  symbols:
+    - {SYMBOL}
+
+  timeframes:
+    - 15m
+
+  params:
+    # 策略参数
+    threshold: 0.005
+
+  signal:
+    min_strength: 0.5
+    cooldown_ms: 60000

@@ -1,0 +1,177 @@
+# ============================================
+# Python
+# ============================================
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Installer logs
+pip-log.txt
+pip-delete-this-directory.txt
+
+# ============================================
+# Virtual Environment
+# ============================================
+.venv/
+venv/
+ENV/
+env/
+.env
+
+# ============================================
+# IDE / Editor
+# ============================================
+# PyCharm
+.idea/
+*.iml
+
+# VS Code
+.vscode/
+*.code-workspace
+
+# JetBrains
+*.swp
+*.swo
+*~
+.project
+.pydevproject
+.settings/
+
+# ============================================
+# Testing
+# ============================================
+# Pytest
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Coverage
+coverage.xml
+*.cover
+*.py,cover
+
+# ============================================
+# Logs
+# ============================================
+*.log
+logs/
+strategy_core.log
+
+# ============================================
+# Data & Signals (Generated at runtime)
+# ============================================
+data/
+!data/.gitkeep
+
+# ============================================
+# Local Configuration
+# ============================================
+# Claude Code local settings
+.claude/settings.local.json
+.claude/projects/
+.claude/scheduled_tasks.json
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# ============================================
+# OS Generated Files
+# ============================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# ============================================
+# Temporary Files
+# ============================================
+*.tmp
+*.bak
+*.swp
+*~
+tmp/
+temp/
+
+# ============================================
+# Jupyter Notebook
+# ============================================
+.ipynb_checkpoints/
+
+# ============================================
+# mypy / Type checking
+# ============================================
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# ============================================
+# Documents (Optional - keep if docs are generated)
+# ============================================
+# docs/*.pdf
+# docs/reports/
+
+backtest_output/
+backtest_output*/
+backtest_results/
+backtest_log.txt
+signal_comparison_output/
+nohup.out
+
+# ============================================
+# Backtest Config (User-specific)
+# ============================================
+# 忽略用户配置
+backtest/config/main.yaml
+backtest/config/strategies.yaml
+backtest/config/*/
+# 但保留模板
+!backtest/config/main.example.yaml
+!backtest/config/example/
+
+# 回测配置目录（不上传）
+config/backtest/
+config/backtest2/
+config/backtest_*.yaml
+
+# 图表输出目录
+charts/
+
+cta_strategy_core.pid
+skills
