@@ -1,6 +1,6 @@
 ---
 name: trading-dev
-description: CTA quantitative strategy development lifecycle skill. Use when creating new CTA/crypto trading strategies, running backtests, generating benchmarks, or scaffolding strategy projects. Activates on: "new strategy", "backtest", "scaffold", "trading-dev", "CTA strategy", "量化策略".
+description: "CTA quantitative strategy development lifecycle skill. Use when creating new CTA/crypto trading strategies, running backtests, generating benchmarks, or scaffolding strategy projects."
 ---
 
 # Trading Dev — CTA Strategy Development Lifecycle
