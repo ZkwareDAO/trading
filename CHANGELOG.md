@@ -1,13 +1,13 @@
-# Changelog
+# 更新日志
 
-All notable changes to this project are documented here.
+本项目所有重要变更均记录于此。
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+格式遵循 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)，
+版本号遵循 [语义化版本](https://semver.org/spec/v2.0.0.html)。
 
 ## [0.1.0] — 2025-08-04
 
-### Added
+### 新增
 
 - **trading-dev skill** — CTA 量化策略开发全生命周期 Claude Code Skill：脚手架 → 策略编码 → 回测验证 → benchmark 输出，loop-engineering 跨 Phase 大闭环。
 - **三种运行模式**：全自动 / 交互 / 单步。
@@ -19,11 +19,11 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
 - **OpenAI Codex CLI 安装**支持（含项目级安装）。
 - **Apache License 2.0**。
 
-### Changed
+### 变更
 
 - License 从 MIT 变更为 Apache 2.0。
 - README 移除 symlink 安装方式。
 - README 移除「新增 Skill」段落。
-- README 新增 Contributing 段落。
+- README 新增贡献段落。
 
 [0.1.0]: https://github.com/ZkwareDAO/trading/releases/tag/v0.1.0

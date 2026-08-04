@@ -104,9 +104,9 @@ Codex 触发方式：`$trading-dev` 直接调用，或 `/prompts:trading-dev` �
 | Python | 3.10+ | 策略运行环境 |
 | ta-lib C 库 | 0.4.0 | 回测指标计算（可选） |
 
-## Contributing
+## 贡献
 
-Contributions are welcome: bug fixes, documentation, and feature ideas; past contributions are credited per release in [`CHANGELOG.md`](CHANGELOG.md).
+欢迎贡献：bug 修复、文档完善、功能建议；历史贡献按版本记录在 [`CHANGELOG.md`](CHANGELOG.md) 中。
 
 ## License
 
