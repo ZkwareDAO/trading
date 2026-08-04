@@ -49,13 +49,7 @@ git clone https://github.com/ZkwareDAO/trading ~/.claude/plugins/trading
 }
 ```
 
-### 方式 4：symlink（开发迭代）
-
-```bash
-ln -s /path/to/trading/trading-dev-skill ~/.claude/skills/trading-dev
-```
-
-### 方式 5：OpenAI Codex CLI
+### 方式 4：OpenAI Codex CLI
 
 ```bash
 # 1. 克隆仓库
@@ -102,14 +96,6 @@ Codex 触发方式：`$trading-dev` 直接调用，或 `/prompts:trading-dev` �
 - **loop-engineering**：回测不达标自动回到策略开发修改，循环直到达标
 - **完整模板**：strategy_core / backtest / data_manager / scripts 一键脚手架
 
-## 新增 Skill
-
-本项目支持多 skill 架构，新增只需 3 步：
-
-1. 创建 skill 目录（含 `SKILL.md` + `templates/`）
-2. 在 `.claude-plugin/marketplace.json` 的 `plugins` 数组追加条目
-3. 在 `commands/` 下添加命令入口 `.md`
-
 ## 环境要求
 
 | 依赖 | 版本 | 说明 |
@@ -118,6 +104,10 @@ Codex 触发方式：`$trading-dev` 直接调用，或 `/prompts:trading-dev` �
 | Python | 3.10+ | 策略运行环境 |
 | ta-lib C 库 | 0.4.0 | 回测指标计算（可选） |
 
+## Contributing
+
+Contributions are welcome: bug fixes, documentation, and feature ideas; past contributions are credited per release in [`CHANGELOG.md`](CHANGELOG.md).
+
 ## License
 
-MIT
+Apache License 2.0
