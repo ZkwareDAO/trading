@@ -10,8 +10,11 @@ origin: trading
 
 **核心行为**：git pull → AI 分析策略结构和配置 → 验证数据流 → 准备K线数据 → 生成运行时配置 → 启动策略。
 
+**首要原则：无参数或参数不全时，必须一步一步引导用户，不要报错让用户自己补命令。**
+
 ## When to Activate
 
+- `/trading-deploy`（无参数）→ **进入交互式引导**
 - `/trading-deploy run` — 完整部署流程
 - `/trading-deploy run --strategy ema_rsi` — 部署指定策略
 - `/trading-deploy run --git-url git@github.com:user/strategies.git` — 指定 git 地址
@@ -24,6 +27,7 @@ origin: trading
 
 | 命令 | 说明 |
 |------|------|
+| `/trading-deploy` | 无参数 → 进入交互式引导，一步一步收集参数 |
 | `/trading-deploy run` | 完整部署流程（Phase 0→5） |
 | `/trading-deploy run --strategy NAME` | 部署指定策略 |
 | `/trading-deploy run --git-url URL` | 指定 git 地址部署 |
@@ -31,6 +35,126 @@ origin: trading
 | `/trading-deploy prepare-data` | 只准备K线数据（Phase 3） |
 | `/trading-deploy start --strategy NAME` | 只启动策略（Phase 5） |
 | `/trading-deploy status` | 查看运行中的策略状态 |
+
+---
+
+## Phase -1: 交互式引导（无参数/参数不全时） ← NEW
+
+### 触发条件
+
+进入引导的判定（满足任一即进入）：
+
+| 条件 | 说明 |
+|------|------|
+| 无任何参数 | 用户只敲了 `/trading-deploy` |
+| `run` 缺 `--strategy` 且无默认 | 必需参数缺失 |
+| `start` 缺 `--strategy` | start 子命令必需策略名 |
+
+**不进入引导**（直接走原流程）：
+
+- `/trading-deploy run --strategy XXX`（参数齐全）
+- `/trading-deploy status`（无需参数）
+- `/trading-deploy analyze` / `prepare-data`（可用默认策略目录）
+
+### 引导核心原则
+
+1. **缺啥补啥**：用户已经给的参数跳过不问，只问缺失项
+2. **一步一问**：每次只问一个问题，给默认值 + 示例
+3. **每步可改**：用户随时能修改前面给过的值
+4. **不报错**：宁可多问一轮，也不要扔"参数不全"给用户
+5. **引导完汇总**：参数收齐后输出部署计划让用户确认，确认后才进 Phase 0
+
+### 引导顺序
+
+```
+Step 1: 问子命令（run / analyze / prepare-data / start / status）
+        → 给默认：run
+       ↓
+Step 2: 问策略（--strategy）
+        → run / start 必需
+        → 列出 STRATEGIES_DIR 下可用策略供选择
+        → 若策略目录空，先走 git pull
+       ↓
+Step 3: 问 git 地址（--git-url，run 子命令）
+        → 若已有策略，给默认：用本地已有
+        → 若需拉取，从 .env / config.yaml 读默认，或询问
+       ↓
+Step 4: 汇总确认 → 用户确认后进 Phase 0
+```
+
+### Step 1 话术模板：问子命令
+
+```
+🧭 交互式引导 — 第 1 步（共 3 步）：要执行什么操作？
+
+  1. run           ← 完整部署流程
+  2. analyze       ← 只分析策略结构
+  3. prepare-data  ← 只准备K线数据
+  4. start         ← 只启动已配置策略
+  5. status        ← 查看运行中策略
+
+请选择（输入编号或命令名）。默认：1（run）
+```
+
+### Step 2 话术模板：问策略
+
+```
+🧭 交互式引导 — 第 2 步（共 3 步）：选择策略
+
+可用策略（来自 ./strategies）：
+  1. ema_rsi
+  2. ict_v4
+
+请选择（输入编号或策略名）：
+  > 1 / ema_rsi
+```
+
+**若策略目录为空**：先引导 git 地址 → 走 git pull → 拉完再列策略。
+
+### Step 3 话术模板：问 git 地址（run 子命令）
+
+```
+🧭 交互式引导 — 第 3 步（共 3 步）：策略代码来源
+
+本地 ./strategies 已有策略，是否用本地代码？
+  > y / 回车   ← 用本地已有代码
+  > n          ← 重新 git pull，请输入 git 地址
+```
+
+**选 n 时**：
+
+```
+请输入 git 地址（默认从 .env 的 STRATEGIES_GIT_URL 读取）：
+  > git@github.com:user/strategies.git
+```
+
+### Step 4 话术模板：汇总确认
+
+```
+📋 引导完成 — 部署计划确认
+
+  操作:    run（完整部署）
+  策略:    ema_rsi
+  代码来源: 本地 ./strategies
+
+确认执行？
+  > y / 回车   ← 进 Phase 0
+  > n          ← 取消
+  > 改 XX      ← 修改某项
+```
+
+### 引导收尾
+
+用户确认后：把引导参数组装成等效命令行 → **进入 Phase 0 正式预检**。
+
+### 引导 vs 原流程对照
+
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| `/trading-deploy` 无参数 | 不明确 | 进引导，问子命令→策略→git地址 |
+| `/trading-deploy run` | 默认行为可能不明确 | 进引导，问策略 |
+| `/trading-deploy run --strategy XXX` | 直接跑 | 跳过引导直接跑（参数齐全） |
+| `/trading-deploy status` | 直接跑 | 跳过引导直接跑（无需参数） |
 
 ---
 
@@ -243,6 +367,17 @@ bash run_strategy.sh \
 ## 执行顺序
 
 ```
+用户输入:
+  /trading-deploy                  → 无参数，进引导
+  /trading-deploy run              → 进引导（缺策略）
+  /trading-deploy run --strategy X → 参数齐全，直接跑
+       ↓
+Phase -1: 交互式引导（无参数/参数不全时）  ← NEW
+  ├── Step 1: 问子命令（默认 run）
+  ├── Step 2: 问策略（列可用策略，目录空则先 git pull）
+  ├── Step 3: 问 git 地址（默认用本地）
+  └── Step 4: 汇总确认 → 进 Phase 0
+       ↓
 Phase 0: 环境预检 → Phase 1: 配置初始化
   → Phase 2: git pull + AI 分析 + 用户确认
   → Phase 3: K线数据准备 loop

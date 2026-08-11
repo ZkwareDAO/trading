@@ -10,8 +10,11 @@ origin: trading
 
 **核心行为**：每日定时执行，也支持指定日期重新回放。
 
+**首要原则：无参数或参数不全时，必须一步一步引导用户，不要报错让用户自己补命令。**
+
 ## When to Activate
 
+- 用户执行 `/trading-replay`（无参数）→ **进入交互式引导**
 - 用户执行 `/trading-replay run` — 执行当日完整流程（sync + replay）
 - 用户执行 `/trading-replay run --date 20260801` — 指定日期执行
 - 用户执行 `/trading-replay sync` — 只执行策略代码备份
@@ -23,6 +26,7 @@ origin: trading
 
 | 命令 | 说明 |
 |------|------|
+| `/trading-replay` | 无参数 → 进入交互式引导，一步一步收集参数 |
 | `/trading-replay run` | 执行当日完整流程（sync + replay） |
 | `/trading-replay run --date YYYYMMDD` | 指定日期执行完整流程 |
 | `/trading-replay sync` | 策略代码备份（含远程发现 + 用户确认） |
@@ -35,6 +39,121 @@ origin: trading
 | `/trading-replay replay --skip-analysis` | 跳过策略分析阶段，直接回测 |
 | `/trading-replay summary` | 查看最近回测结果摘要 |
 | `/trading-replay summary --date YYYYMMDD` | 查看指定日期回测结果摘要 |
+
+---
+
+## Phase -1: 交互式引导（无参数/参数不全时） ← NEW
+
+### 触发条件
+
+进入引导的判定（满足任一即进入）：
+
+| 条件 | 说明 |
+|------|------|
+| 无任何参数 | 用户只敲了 `/trading-replay` |
+
+**不进入引导**（直接走原流程）：
+
+- `/trading-replay run`（默认当日）
+- `/trading-replay sync` / `replay` / `summary`（各自有明确默认值）
+- 任何带完整参数的命令
+
+### 引导核心原则
+
+1. **缺啥补啥**：用户已经给的参数跳过不问，只问缺失项
+2. **一步一问**：每次只问一个问题，给默认值 + 示例
+3. **每步可改**：用户随时能修改前面给过的值
+4. **不报错**：宁可多问一轮，也不要扔"参数不全"给用户
+5. **引导完汇总**：参数收齐后输出执行计划让用户确认，确认后才进 Phase 0
+
+### 引导顺序
+
+```
+Step 1: 问子命令（run / sync / replay / discover / summary）
+        → 给默认：run
+       ↓
+Step 2: 问日期（--date）
+        → 子命令需要日期时才问
+        → 给默认：今天
+        → replay 额外问是否自定义 --start/--end（默认近30天）
+       ↓
+Step 3: 问可选参数
+        → sync: 是否 --skip-discovery
+        → replay: 是否 --skip-analysis
+        → 默认全否，回车跳过
+       ↓
+Step 4: 汇总确认 → 用户确认后进 Phase 0
+```
+
+### Step 1 话术模板：问子命令
+
+```
+🧭 交互式引导 — 第 1 步（共 3 步）：要执行什么操作？
+
+  1. run       ← 完整流程（备份 + 回测，默认当日）
+  2. sync      ← 只备份策略代码
+  3. replay    ← 只回放回测（默认近 30 天）
+  4. discover  ← 只发现远程策略（不备份）
+  5. summary   ← 查看回测结果摘要
+
+请选择（输入编号或命令名）。默认：1（run）
+```
+
+### Step 2 话术模板：问日期
+
+```
+🧭 交互式引导 — 第 2 步（共 3 步）：日期
+
+默认：今天（20260811），格式：YYYYMMDD
+请输入日期（留空回车用今天）：
+  > 20260801    ← 指定日期
+```
+
+**replay 子命令额外提示**：
+
+```
+replay 默认回测近 30 天。是否自定义范围？留空 = 默认近30天，或输入 start end：
+  > 20260101 20260801   ← 自定义
+  > 留空                  ← 默认近 30 天
+```
+
+### Step 3 话术模板：问可选参数
+
+```
+🧭 交互式引导 — 第 3 步（共 3 步）：可选参数
+
+  sync:   跳过远程发现（--skip-discovery，默认否）
+  replay: 跳过策略分析（--skip-analysis，默认否）
+
+全部用默认值？直接回车即可。
+```
+
+### Step 4 话术模板：汇总确认
+
+```
+📋 引导完成 — 执行计划确认
+
+  操作:    run（完整流程）
+  日期:    20260811（今天）
+  回测范围: 近 30 天
+
+确认执行？
+  > y / 回车   ← 进 Phase 0
+  > n          ← 取消
+  > 改 XX      ← 修改某项，如 "改 日期" 回到 Step 2
+```
+
+### 引导收尾
+
+用户确认后：把引导参数组装成等效命令行 → **进入 Phase 0 正式预检**。
+
+### 引导 vs 原流程对照
+
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| `/trading-replay` 无参数 | 不明确 | 进引导，问子命令→日期→可选参数 |
+| `/trading-replay replay` | 默认近30天直接跑 | 跳过引导直接跑（默认值明确） |
+| `/trading-replay run --date XXX` | 直接跑 | 跳过引导直接跑（参数齐全） |
 
 ---
 
@@ -660,11 +779,18 @@ SCP_RETRY=3
 
 ```
 用户输入:
+  /trading-replay                  → 无参数，进引导
   /trading-replay run              → 完整流程
   /trading-replay run --date XXX   → 指定日期完整流程
   /trading-replay sync             → 只备份
   /trading-replay replay           → 只回测
   /trading-replay replay --date XXX → 重新回放
+       ↓
+Phase -1: 交互式引导（仅无参数时）  ← NEW
+  ├── Step 1: 问子命令（默认 run）
+  ├── Step 2: 问日期（默认今天；replay 额外问回测范围）
+  ├── Step 3: 问可选参数（skip-discovery / skip-analysis）
+  └── Step 4: 汇总确认 → 进 Phase 0
        ↓
 Phase 0: 环境预检
   ├── 检查 SCP 连接

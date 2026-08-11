@@ -10,10 +10,13 @@ origin: trading
 
 **核心行为**：灵活指定回测维度，探索策略在不同代币和时间范围下的表现。
 
+**首要原则：无参数或参数不全时，必须一步一步引导用户，不要报错让用户自己补命令。**
+
 ## When to Activate
 
-- 用户执行 `/trading-discover run --symbols BTCUSDT,ETHUSDT --strategies ema_rsi,ict_v4 --start 20260601 --end 20260701`
-- 用户执行 `/trading-discover run --all-strategies --symbols BTCUSDT --start 20260101`
+- 用户执行 `/trading-discover`（无参数）→ **进入交互式引导**
+- 用户执行 `/trading-discover run --symbols BTCUSDT,ETHUSDT --strategies ema_rsi,ict_v4 --start 20260601 --end 20260701`（参数齐全）→ 跳过引导，直接 Phase 0
+- 用户执行 `/trading-discover run --symbols BTCUSDT --start 20260601`（缺 strategies）→ **进入引导，只补缺失项**
 - 用户说"探索回测"、"对比策略"、"多代币回测"
 - 用户想看某个策略在不同代币或时间范围下的表现对比
 
@@ -21,6 +24,7 @@ origin: trading
 
 | 命令 | 说明 |
 |------|------|
+| `/trading-discover` | 无参数 → 进入交互式引导，一步一步收集参数 |
 | `/trading-discover run --symbols S1,S2 --strategies ST1,ST2 --start DATE --end DATE` | 指定代币×策略×时间范围回测 |
 | `/trading-discover run --all-strategies --symbols S1,S2 --start DATE` | 所有策略×指定代币回测 |
 | `/trading-discover run --symbols S1 --all-timeframes --start DATE --end DATE` | 指定代币×所有时间框架回测 |
@@ -38,6 +42,202 @@ origin: trading
 | Unix 时间戳 | `1748736000` | 秒级时间戳 |
 
 两种格式均支持，脚本自动识别。
+
+---
+
+## Phase -1: 交互式引导（无参数/参数不全时） ← NEW
+
+### 触发条件
+
+进入引导的判定（满足任一即进入）：
+
+| 条件 | 说明 |
+|------|------|
+| 无任何参数 | 用户只敲了 `/trading-discover` 或 `/trading-discover run` |
+| 缺 `--strategies` 且无 `--all-strategies` | 必需参数缺失 |
+| 缺 `--start` | 必需参数缺失 |
+| 缺 `--symbols` 且 `--skip-analysis` | 此时 symbols 必需（无分析阶段无法从配置读取） |
+
+**不进入引导**（参数齐全直接走原流程）：
+
+- 有 `--all-strategies` + `--symbols` + `--start`
+- 或 `--strategies` + `--start`（symbols 可从配置读）
+
+### 引导核心原则
+
+1. **缺啥补啥**：用户已经给的参数跳过不问，只问缺失项
+2. **一步一问**：每次只问一个问题，给默认值 + 示例，用户答完再问下一个
+3. **每步可改**：用户随时能修改前面给过的值
+4. **不报错**：宁可多问一轮，也不要扔"参数不全，请补全命令"给用户
+5. **引导完汇总**：所有参数收齐后，输出完整回测计划让用户确认，确认后才进 Phase 0
+
+### 引导顺序
+
+引导按下面顺序逐步收集，已提供的参数跳过对应步骤：
+
+```
+Step 0: 先跑环境快速探测（策略目录是否有可用策略）
+        → 若无策略，先走 Phase 0.5 git pull 拉策略（这样后面能列出可用策略给用户选）
+        → 若有策略，直接进 Step 1
+       ↓
+Step 1: 问策略（--strategies 或 --all-strategies）
+        → 列出 STRATEGIES_DIR 下可用策略供选择
+        → 给默认：all
+       ↓
+Step 2: 问代币（--symbols）
+        → 若用户选了具体策略，从该策略配置读出默认 symbols 作为建议
+        → 给默认：留空（从策略配置读取）
+       ↓
+Step 3: 问开始时间（--start）  ← 必填，无默认
+        → 提示格式：YYYYMMDD 或 Unix 时间戳
+        → 给示例：20260601
+       ↓
+Step 4: 问结束时间（--end）
+        → 给默认：今天（当前日期）
+       ↓
+Step 5: 问可选参数（并行数/后台执行/跳过分析）
+        → 给默认：全用默认值，直接回车跳过
+       ↓
+Step 6: 汇总确认 → 输出完整回测计划，用户确认后进 Phase 0
+```
+
+### Step 0: 引导前的环境快速探测
+
+引导开始前先快速探测策略目录，目的是决定要不要先 git pull：
+
+```bash
+# 快速检查（不阻塞引导，只决定引导路径）
+STRATEGIES_DIR="${STRATEGIES_DIR:-./strategies}"
+if [ -d "$STRATEGIES_DIR" ] && [ "$(ls -1d "$STRATEGIES_DIR"/*/ 2>/dev/null | grep -v '\.git' | wc -l)" -gt 0 ]; then
+    GUIDE_MODE="strategies_ready"   # 策略已就绪，直接引导选策略
+else
+    GUIDE_MODE="need_git_pull"      # 需要先 git pull，走 Phase 0.5
+fi
+```
+
+- `need_git_pull`：先引导用户确认 git 地址 → 执行 Phase 0.5 拉策略 → 拉完列可用策略 → 进 Step 1
+- `strategies_ready`：直接列可用策略 → 进 Step 1
+
+### Step 1 话术模板：问策略
+
+```
+🧭 交互式引导 — 第 1 步（共 5 步）：选择策略
+
+可用策略（来自 ./strategies）：
+  1. ema_rsi      (3 configs)
+  2. ict_v4       (2 configs)
+  3. macd_cross   (1 config)
+
+请选择（输入编号、策略名、或逗号分隔多个；输入 all 选全部）：
+  > 1,2          ← 选 ema_rsi 和 ict_v4
+  > all           ← 等同 --all-strategies
+  > ema_rsi       ← 直接输策略名
+
+默认：all
+```
+
+**收集逻辑**：
+- 输入 `all` → `--all-strategies`
+- 输入编号 → 映射到策略名
+- 输入策略名 → 直接用
+- 多个用逗号分隔
+
+### Step 2 话术模板：问代币
+
+```
+🧭 交互式引导 — 第 2 步（共 5 步）：选择代币
+
+（若已选策略，从策略配置读出默认代币作为建议）
+ema_rsi 配置中的代币：BTCUSDT, ETHUSDT, SOLUSDT
+ict_v4 配置中的代币：BTCUSDT, ETHUSDT
+
+请输入要回测的代币（逗号分隔），或：
+  > BTCUSDT,ETHUSDT,SOLUSDT   ← 直接指定
+  > 留空回车                    ← 回测时从每个策略配置读取各自的代币
+  > +DOGEUSDT                  ← 在建议基础上追加 DOGEUSDT
+
+默认：留空（从策略配置读取）
+```
+
+### Step 3 话术模板：问开始时间（必填）
+
+```
+🧭 交互式引导 — 第 3 步（共 5 步）：开始时间（必填）
+
+格式：YYYYMMDD 或 Unix 时间戳（秒）
+
+示例：
+  > 20260601       ← 2026年6月1日
+  > 1748736000     ← Unix 时间戳
+
+请输入开始时间：
+```
+
+**校验**：输入后立即校验格式，不合法则重新问，不要报错退出。
+
+### Step 4 话术模板：问结束时间
+
+```
+🧭 交互式引导 — 第 4 步（共 5 步）：结束时间
+
+默认：今天（20260811）
+格式同开始时间（YYYYMMDD 或 Unix 时间戳）
+
+请输入结束时间（留空回车用今天）：
+```
+
+### Step 5 话术模板：问可选参数
+
+```
+🧭 交互式引导 — 第 5 步（共 5 步）：可选参数
+
+  并行回测数（--parallel，默认 1）：留空回车跳过
+  后台执行（--background，默认否）：留空回车跳过，输入 y 后台跑
+  跳过策略分析（--skip-analysis，默认否）：留空回车跳过
+
+全部用默认值？直接回车即可。
+```
+
+### Step 6 话术模板：汇总确认
+
+```
+📋 引导完成 — 回测计划确认
+
+  代币:    BTCUSDT, ETHUSDT, SOLUSDT
+  策略:    ema_rsi, ict_v4
+  时间:    20260601 - 20260811
+  并行:    1
+  后台:    否
+  分析:    启用
+
+回测组合 (6):
+  1. ema_rsi × BTCUSDT
+  2. ema_rsi × ETHUSDT
+  3. ema_rsi × SOLUSDT
+  4. ict_v4 × BTCUSDT
+  5. ict_v4 × ETHUSDT
+  6. ict_v4 × SOLUSDT
+
+确认执行？
+  > y / 回车   ← 进 Phase 0 正式预检 + 回测
+  > n          ← 取消
+  > 改 XX      ← 修改某项，如 "改 时间" 回到 Step 4 重问
+```
+
+### 引导收尾
+
+用户确认后：
+1. 把引导收集到的参数组装成等效命令行（内部使用，不必展示给用户）
+2. **进入 Phase 0 正式预检**（引导前的 Step 0 只是快速探测，Phase 0 才是完整阻塞判定）
+
+### 引导 vs 原流程对照
+
+| 场景 | 旧行为 | 新行为（方案 B） |
+|------|--------|----------------|
+| `/trading-discover` 无参数 | 报错让用户补 run 命令 | 进引导，逐步问 5 步 |
+| 只给 `--symbols` | 报错缺 strategies | 进引导，只问 strategies/start/end |
+| 只给 `--start` | 报错缺 strategies/symbols | 进引导，只问 strategies/symbols |
+| 参数齐全 | 直接 Phase 0 | 跳过引导，直接 Phase 0（不变） |
 
 ---
 
@@ -615,25 +815,35 @@ PYTHON_CMD=python3
 
 ```
 用户输入:
-  /trading-discover run --symbols S1,S2 --strategies ST1,ST2 --start DATE --end DATE
-  /trading-discover run --all-strategies --symbols S1 --start DATE
+  /trading-discover                                  ← 无参数
+  /trading-discover run --symbols S1 --start DATE    ← 参数不全
+  /trading-discover run --symbols S1,S2 --strategies ST1,ST2 --start DATE --end DATE  ← 参数齐全
+       ↓
+Phase -1: 交互式引导（仅无参数/参数不全时）  ← NEW
+  ├── Step 0: 环境快速探测（决定是否先 git pull）
+  ├── Step 1: 问策略（缺 --strategies 时）
+  ├── Step 2: 问代币（缺 --symbols 时）
+  ├── Step 3: 问开始时间（缺 --start 时，必填）
+  ├── Step 4: 问结束时间（缺 --end 时，默认今天）
+  ├── Step 5: 问可选参数（并行/后台/跳过分析）
+  └── Step 6: 汇总确认 → 用户确认后进 Phase 0
        ↓
 Phase 0: 环境预检
   ├── 检查回测引擎
   ├── 检查 K 线数据
   └── 检查策略目录
        ↓
-Phase 0.5: 策略代码获取（git pull）  ← NEW
+Phase 0.5: 策略代码获取（git pull）
   ├── 确认 git 仓库地址
   ├── git clone / git pull
   └── 列出可用策略
        ↓
-Phase 0.6: 代币配置确认  ← NEW
+Phase 0.6: 代币配置确认
   ├── 输出策略代币配置摘要
   ├── 支持 +SYMBOL / -SYMBOL / SYMBOL1=SYMBOL2
   └── 用户确认后继续
        ↓
-Phase 0.7: K线数据需求计算（calc_data_requirements.py）  ← NEW
+Phase 0.7: K线数据需求计算（calc_data_requirements.py）
   ├── 提取技术指标周期参数
   ├── 计算最少需要天数
   ├── 检查本地数据是否充足
