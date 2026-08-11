@@ -1,0 +1,38 @@
+# Trading Deploy Skill — 全局配置模板
+# 复制为 config.yaml 并根据实际环境修改
+
+strategies:
+  git_url: ${STRATEGIES_GIT_URL}
+  git_branch: main
+  local_dir: ./strategies
+
+deploy:
+  target: local
+  remote:
+    host: ${DEPLOY_HOST:-}
+    port: ${DEPLOY_PORT:-22}
+    user: ${DEPLOY_USER:-}
+    key: ${DEPLOY_KEY:-~/.ssh/id_rsa}
+  default_strategy: ""
+  default_symbols: []
+
+runtime:
+  capital: ${DEFAULT_CAPITAL:-10000}
+  leverage: ${DEFAULT_LEVERAGE:-1}
+  max_positions: ${MAX_POSITIONS:-3}
+  position_size_pct: ${POSITION_SIZE_PCT:-0.1}
+  stop_loss_pct: 0.05
+  take_profit_pct: 0.15
+
+websocket:
+  ws_url: ${WS_URL:-wss://stream.binance.com:9443/ws}
+  rest_url: ${REST_URL:-https://api.binance.com}
+  ping_interval: ${WS_PING_INTERVAL:-180}
+  reconnect_delay: ${WS_RECONNECT_DELAY:-5}
+
+paths:
+  strategies_dir: ${STRATEGIES_DIR:-./strategies}
+  data_dir: ${DATA_PATH:-./data}
+  kline_data_dir: ${KLINE_DATA_DIR:-./data/strategies/1m}
+  logs_dir: ${LOGS_DIR:-./logs}
+  deploy_outputs_dir: ${DEPLOY_OUTPUTS_DIR:-./deploy_outputs}

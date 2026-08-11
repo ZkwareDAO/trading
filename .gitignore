@@ -75,3 +75,9 @@ Thumbs.db
 *.tmp
 *.bak
 nohup.out
+
+# ============================================
+# Internal docs (not for open-source)
+# ============================================
+需求.md
+.claude/

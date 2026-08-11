@@ -1,0 +1,18 @@
+# Trading Replay — 定时任务配置
+# 复制到 crontab: crontab crontab.example
+# 或手动添加: crontab -e
+
+# 时区设置（默认使用系统时区，如需 UTC 取消下行注释）
+# CRON_TZ=UTC
+
+# ===== 每日策略代码备份 =====
+# 00:15 执行，将实盘策略代码拉取到 snapshot/{date}/
+15 0 * * * cd /path/to/replay && python3 sync-exee.py --date $(date +\%Y\%m\%d) >> logs/cron-sync.log 2>&1
+
+# ===== 每日回放回测 =====
+# 00:30 执行，对当日 snapshot 执行回测
+30 0 * * * cd /path/to/replay && bash replay.sh --date $(date +\%Y\%m\%d) >> logs/cron-replay.log 2>&1
+
+# ===== 一键完整流程（替代上面两步） =====
+# 00:15 执行备份+回测
+# 15 0 * * * cd /path/to/replay && python3 sync-exee.py --date $(date +\%Y\%m\%d) && bash replay.sh --date $(date +\%Y\%m\%d) >> logs/cron-full.log 2>&1

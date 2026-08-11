@@ -1,0 +1,31 @@
+# Trading Discovery Skill — 全局配置模板
+# 复制为 config.yaml 并根据实际环境修改
+
+# ===== 回测配置 =====
+discovery:
+  # 默认并行数
+  parallel: 1
+  # 默认时间范围（可被命令行参数覆盖）
+  default_start: ""
+  default_end: ""
+
+# ===== 目录配置 =====
+paths:
+  # CTA 项目根目录（含 backtest/strategy_core/data_manager 等）
+  # 回测引擎从此目录加载，策略配置从此目录的 strategies/ 读取
+  project_dir: /path/to/your/cta_project
+  # 策略代码目录（相对于 project_dir 或绝对路径）
+  strategies_dir: ./strategies
+  # Discovery 结果输出目录
+  discovery_outputs_dir: ./discovery_outputs
+  # 日志输出目录
+  logs_dir: ./logs
+
+# ===== 回测引擎配置 =====
+backtest:
+  # Python 命令
+  python_cmd: python3
+  # K 线数据根目录
+  data_dir: ./data
+  # 1m K 线数据目录
+  kline_data_dir: ./data/strategies/1m

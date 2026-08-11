@@ -13,8 +13,9 @@
 - **三种运行模式**：全自动 / 交互 / 单步。
 - **loop-engineering**：回测不达标自动回到策略开发修改，循环直到达标。
 - **完整模板**：strategy_core / backtest / data_manager / scripts 一键脚手架。
-- **Plugin Marketplace 安装**支持。
-- **npx skills CLI 安装**支持。
+- **Plugin Marketplace 安装**支持（`claude plugin marketplace add` + `claude plugin install`）。
+- **本地路径 marketplace 安装**支持（开发迭代）。
+- **symlink 安装**支持（最快开发模式）。
 - **手动安装**支持。
 - **OpenAI Codex CLI 安装**支持（含项目级安装）。
 - **Apache License 2.0**。

@@ -21,6 +21,10 @@
         "scaffold",
         "loop-engineering",
         "strategy-development",
-        "trading-dev"
+        "trading-dev",
+        "replay",
+        "discovery",
+        "snapshot",
+        "strategy-backup"
     ]
 }

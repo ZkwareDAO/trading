@@ -18,36 +18,22 @@ claude plugin marketplace update
 claude plugin update trading-dev@trading-skills
 ```
 
-### 方式 2：npx skills CLI
+### 方式 2：本地路径安装（开发迭代）
 
 ```bash
-npx skills add ZkwareDAO/trading --skill trading-dev
+claude plugin marketplace add /path/to/trading --scope local
+claude plugin install trading-dev@trading-skills --scope local
 ```
 
-重启 Claude Code 会话以加载。
+改完代码后需 `claude plugin marketplace update trading-skills` 重新拉取。
 
-### 方式 3：手动安装
+### 方式 3：symlink（最快开发模式）
 
 ```bash
-git clone https://github.com/ZkwareDAO/trading ~/.claude/plugins/trading
+ln -s /path/to/trading/trading-dev-skill ~/.claude/skills/trading-dev
 ```
 
-编辑 `~/.claude/plugins/installed_plugins.json`，添加：
-
-```json
-{
-  "version": 2,
-  "plugins": {
-    "trading-dev@trading-skills": [
-      {
-        "scope": "user",
-        "installPath": "/home/<you>/.claude/plugins/trading",
-        "version": "0.1.0"
-      }
-    ]
-  }
-}
-```
+无需重启，下次对话自动加载。symlink 模式不注册斜杠命令，需 `/trading-dev` 时用方式 1/2。
 
 ### 方式 4：OpenAI Codex CLI
 

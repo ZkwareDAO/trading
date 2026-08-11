@@ -15,6 +15,36 @@
                 "name": "ZkwareDAO",
                 "url": "https://github.com/ZkwareDAO"
             }
+        },
+        {
+            "name": "trading-replay",
+            "description": "Daily strategy code backup + replay backtest skill. SCP sync from production machine, snapshot storage, daily replay backtest with result output.",
+            "version": "0.1.0",
+            "source": "./trading-replay-skill/",
+            "author": {
+                "name": "ZkwareDAO",
+                "url": "https://github.com/ZkwareDAO"
+            }
+        },
+        {
+            "name": "trading-discovery",
+            "description": "Discovery backtest skill. Multi-symbol × multi-strategy × custom date range backtest exploration with comparison report output.",
+            "version": "0.1.0",
+            "source": "./trading-discovery-skill/",
+            "author": {
+                "name": "ZkwareDAO",
+                "url": "https://github.com/ZkwareDAO"
+            }
+        },
+        {
+            "name": "trading-deploy",
+            "description": "Strategy deployment skill. git pull → AI analyze config → WebSocket verify → K-line data loop → create runtime config → start strategy.",
+            "version": "0.1.0",
+            "source": "./trading-deploy-skill/",
+            "author": {
+                "name": "ZkwareDAO",
+                "url": "https://github.com/ZkwareDAO"
+            }
         }
     ]
 }
