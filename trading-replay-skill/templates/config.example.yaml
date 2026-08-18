@@ -42,9 +42,23 @@ paths:
 
 # ===== 回测引擎配置 =====
 backtest:
-  # Python 命令
-  python_cmd: python3
-  # K 线数据根目录
-  data_dir: ./data
-  # 1m K 线数据目录
-  kline_data_dir: ./data/strategies/1m
+  # Python 命令。留空则自动探测 ./.venv/bin/python → python3 → python
+  # （快照排除了 .venv，用本机 Replay 项目的 .venv 跑快照代码）
+  python_cmd: ""
+  # K 线数据目录。必须与快照 config/settings.yaml 的 data_manager.csv_dir 一致
+  # —— run-profile 的 data_dir 由 make_profile.py 照抄该值，
+  #    不一致时模板启动即报错退出（verify_data_dir_consistency）。
+  kline_data_dir: ./data/klines
+  # run-profile 名：在每个快照目录内生成 config/<name>.yaml，运行结束自动删除
+  profile: replay
+  # --start 未指定时的回看天数
+  lookback_days: 30
+  # 并发回测数（写入 run-profile 的 max_workers）
+  parallel: 1
+  # 回测核算口径（与策略层 capital.max_cash 语义不同）
+  cash: 5000
+  commission: 0.0004
+
+# 注意：策略参数（周期/阈值/止损/资金）不在本文件配置。
+# 回放读的是快照自带的 strategies/<name>/overrides/<SYMBOL>.yaml，
+# 即当天实盘真实生效的那份参数 —— 这正是"回放不失真"的前提。

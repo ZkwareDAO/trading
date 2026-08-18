@@ -246,17 +246,30 @@ ict_v4 配置中的代币：BTCUSDT, ETHUSDT
 ### Step 0: 检查运行环境
 
 ```bash
-# 1. 检查回测引擎
-PYTHON_CMD="${PYTHON_CMD:-python3}"
-if $PYTHON_CMD -m backtest.run_backtest --help &>/dev/null; then
+# 1. 探测 Python（模板依赖在 .venv，很多环境没有 python3 这个名字）
+PROJECT_DIR="${PROJECT_DIR:-.}"
+if [ -z "${PYTHON_CMD:-}" ]; then
+    if [ -x "${PROJECT_DIR}/.venv/bin/python" ]; then
+        PYTHON_CMD="${PROJECT_DIR}/.venv/bin/python"
+    elif command -v python3 &>/dev/null; then
+        PYTHON_CMD="python3"
+    else
+        PYTHON_CMD="python"
+    fi
+fi
+
+# 2. 检查回测引擎（v3.7 批量入口）
+if (cd "$PROJECT_DIR" && $PYTHON_CMD -m backtest.batch_runner --help) &>/dev/null; then
     echo "✅ 回测引擎可用"
 else
     echo "❌ 回测引擎不可用（阻塞项）"
 fi
 
-# 2. 检查 K 线数据
-KLINE_DIR="${KLINE_DATA_DIR:-./data/strategies/1m}"
-if [ -d "$KLINE_DIR" ] && [ -f "$KLINE_DIR/BTCUSDT_1m.csv" ]; then
+# 3. 检查 K 线数据
+#    必须与项目 config/settings.yaml 的 data_manager.csv_dir 一致，
+#    否则 run-profile 的 data_dir 校验不通过、回测启动即退出。
+KLINE_DIR="${KLINE_DATA_DIR:-./data/klines}"
+if [ -d "$KLINE_DIR" ] && [ -n "$(find "$KLINE_DIR" -name '*.csv' -print -quit 2>/dev/null)" ]; then
     echo "✅ K 线数据就绪: $KLINE_DIR"
 else
     echo "❌ K 线数据未就绪（阻塞项）"
@@ -351,12 +364,12 @@ done
 ```
 📋 策略代币配置确认
 
-ema_rsi (config.test.yaml):
+ema_rsi (overrides/: 3 个代币):
   Symbols:   BTCUSDT, ETHUSDT, SOLUSDT
   Timeframes: 4h, 1h
   Direction: neutral
 
-ict_v4 (config/BTCUSDT.yaml):
+ict_v4 (overrides/: 2 个代币):
   Symbols:   BTCUSDT, ETHUSDT
   Timeframes: 1h
   Direction: long
@@ -385,7 +398,7 @@ ict_v4 (config/BTCUSDT.yaml):
 
 ```bash
 for strategy in $STRATEGIES; do
-    python3 calc_data_requirements.py \
+    $PYTHON_CMD calc_data_requirements.py \
         --strategy-dir "${STRATEGIES_DIR}/${strategy}" \
         --start "$START_DATE" \
         --end "$END_DATE" \
@@ -400,7 +413,7 @@ done
   K线数据需求分析
 ==============================================================
   策略:       ema_rsi
-  配置:       ./strategies/ema_rsi/config.test.yaml
+  配置:       ./strategies/ema_rsi/overrides/BTCUSDT.yaml
   代币:       BTCUSDT, ETHUSDT, SOLUSDT
   时间框架:   4h, 1h
 
@@ -465,7 +478,7 @@ done
 | `--config` | `config.yaml` | 配置文件路径 |
 | `--output-dir` | `./discovery_outputs` | 输出目录 |
 | `--parallel` | `1` | 并行回测数 |
-| `--python` | `python3` | Python 命令 |
+| `--python` | 自动探测 | Python 命令（默认 `$PROJECT_DIR/.venv/bin/python` → `python3` → `python`） |
 | `--skip-analysis` | `false` | 跳过策略分析阶段 |
 
 ### Step 2: 时间格式自动识别
@@ -523,7 +536,7 @@ done
 当 `--symbols` 未指定时，从策略配置中读取默认 symbols。
 
 ```bash
-python3 analyze_strategies.py \
+$PYTHON_CMD analyze_strategies.py \
     --strategies "$STRATEGIES" \
     --strategies-dir "$STRATEGIES_DIR" \
     --symbols "$SYMBOLS" \
@@ -539,7 +552,7 @@ python3 analyze_strategies.py \
 |--------|------|----------|
 | strategy.py | 策略入口文件是否存在 | 标记 skip |
 | *_core.py | 策略核心逻辑文件 | 警告，不阻塞 |
-| config/{symbol}.yaml 或 config.test.yaml | 策略配置文件 | 标记 skip |
+| overrides/<SYMBOL>.yaml | 策略参数文件（v3.7 单一事实来源） | 标记 skip |
 | symbols | 配置中定义的代币列表（`--symbols` 未指定时从此读取） | 无 symbols 标记 partial |
 | timeframes | 配置中定义的时间框架 | 信息展示 |
 | K线数据 | 每个 symbol 的 CSV 是否存在、日期范围是否覆盖回测区间 | 缺失标记 partial |
@@ -570,7 +583,7 @@ python3 analyze_strategies.py \
   Data:   ./data/strategies/1m
 
 [READY]   ema_rsi
-  Config: /path/to/config.test.yaml
+  Config: /path/to/strategies/ema_rsi/overrides/BTCUSDT.yaml
   Symbols: BTCUSDT, ETHUSDT, SOLUSDT
   Timeframes: 4h, 1h | Direction: neutral
   Params: obv_period=20, atr_multiplier=2.0
@@ -616,77 +629,67 @@ echo "   日志: ${LOGS_DIR}/discovery-${START_DATE}.log"
 echo "   查看进度: tail -f ${LOGS_DIR}/discovery-${START_DATE}.log"
 ```
 
-### Step 1: 对每个 (策略, 代币) 组合执行回测
+### Step 1: 单次 batch_runner 调用执行全部组合
+
+v3.7 的批量入口自带并发（`ProcessPoolExecutor`），不需要在 shell 里手工
+控制后台任务。策略参数由 `strategies/<name>/overrides/<SYMBOL>.yaml`
+自动解析，回测运行参数（输出目录/并发/资金/费率）由 run-profile 提供。
 
 ```bash
+# 1. 构建运行清单：name:symbol,name:symbol（与实盘 --run 格式一致）
+#    只纳入 overrides/<SYMBOL>.yaml 真实存在的组合 ——
+#    显式清单里的文件缺失会让 batch_runner 整批报错。
+RUN_LIST=""
 for strategy in $STRATEGIES; do
     for symbol in $SYMBOLS; do
-        echo "🔄 回测: ${strategy} × ${symbol}"
-
-        OUTPUT_DIR="${DISCOVERY_OUTPUTS_DIR}/${strategy}/${symbol}/${START_DATE}-${END_DATE}"
-        mkdir -p "$OUTPUT_DIR"
-
-        # 查找策略配置
-        STRATEGY_CONFIG="${STRATEGIES_DIR}/${strategy}/config/${symbol}.yaml"
-        if [ ! -f "$STRATEGY_CONFIG" ]; then
-            STRATEGY_CONFIG="${STRATEGIES_DIR}/${strategy}/config.test.yaml"
-        fi
-
-        # 执行回测
-        $PYTHON_CMD -m backtest.run_backtest \
-            --strategy "$strategy" \
-            --start "$START_DATE" \
-            --end "$END_DATE" \
-            --symbol "$symbol" \
-            --config "$STRATEGY_CONFIG" \
-            --output "$OUTPUT_DIR" \
-            --log-level INFO \
-            2>&1 | tee -a "${LOGS_DIR}/discovery-${START_DATE}.log"
+        [ -f "${STRATEGIES_DIR}/${strategy}/overrides/${symbol}.yaml" ] || continue
+        RUN_LIST="${RUN_LIST:+$RUN_LIST,}${strategy}:${symbol}"
     done
 done
+
+# 2. 生成 run-profile（承载 output_dir / max_workers / cash / commission）
+#    data_dir 由 make_profile.py 照抄 settings.yaml 的 data_manager.csv_dir，
+#    不一致时模板启动即退出（verify_data_dir_consistency）。
+$PYTHON_CMD make_profile.py \
+    --project-dir "$PROJECT_DIR" \
+    --name discovery \
+    --output-dir "$DISCOVERY_OUTPUTS_DIR" \
+    --max-workers "${PARALLEL:-1}"
+
+# 3. 一次调用跑完所有组合
+(cd "$PROJECT_DIR" && $PYTHON_CMD -m backtest.batch_runner \
+    --run "$RUN_LIST" \
+    --start "$START_DATE" \
+    --end "$END_DATE" \
+    --profile discovery \
+    --log-level INFO) 2>&1 | tee -a "${LOGS_DIR}/discovery-${START_DATE}.log"
 ```
 
-**并行控制**：
+**并发控制**：由 profile 的 `max_workers` 决定（`--parallel N` 写入该字段），
+不再用 shell 后台任务 + `wait -n`。
 
-```bash
-# --parallel N 控制并发数
-PARALLEL="${PARALLEL:-1}"
-if [ "$PARALLEL" -gt 1 ]; then
-    echo "$COMBINATIONS" | xargs -P "$PARALLEL" -I {} bash -c '
-        strategy=$(echo {} | cut -d: -f1)
-        symbol=$(echo {} | cut -d: -f2)
-        # ... 执行回测
-    '
-fi
-```
+**⚠ 不要用 `batch_runner --daemon`**：该模式重建子命令时只传
+`--profile` 和 `--batch-id`，会丢掉 `--run/--start/--end/--config`，
+等于跑成空清单。需要后台执行请在外层 `nohup` 本脚本。
 
-**输出目录结构**：
+**输出目录结构**（由 `backtest/backtest_reporter.py` 决定）：
 
 ```
-discovery_outputs/
-├── ema_rsi/
-│   ├── BTCUSDT/
-│   │   └── 20260601-20260701/
-│   │       ├── backtest_result.json
-│   │       ├── trades.csv
-│   │       └── config.yaml
-│   ├── ETHUSDT/
-│   │   └── 20260601-20260701/
-│   │       └── ...
-│   └── SOLUSDT/
-│       └── 20260601-20260701/
-│           └── ...
-└── ict_v4/
-    ├── BTCUSDT/
-    │   └── 20260601-20260701/
-    │       └── ...
-    ├── ETHUSDT/
-    │   └── 20260601-20260701/
-    │       └── ...
-    └── SOLUSDT/
-        └── 20260601-20260701/
-            └── ...
+discovery_outputs/                        # = run-profile 的 output_dir
+└── {strategy}/
+    └── {date}/                           # 运行日期 YYYYMMDD
+        └── {time}/                       # 运行时刻 HHMMSS
+            └── {symbol}/
+                ├── backtest_result.json  # 指标在 "metrics" 段，不在顶层
+                ├── backtest_report.txt
+                ├── backtest_trades.csv
+                ├── backtest_equity.csv
+                ├── backtest_signals.csv
+                └── config.yaml           # 实际生效的参数副本，供复现
 ```
+
+注意路径层级是 `{strategy}/{date}/{time}/{symbol}/` ——
+每次运行独立成目录，同一组合多跑几次不会互相覆盖。
 
 ---
 
@@ -694,32 +697,50 @@ discovery_outputs/
 
 ### Step 1: 汇总所有回测结果
 
-```python
-import json, os, glob
+用 `generate_report.py` 完成，它按 `rglob` 递归找结果文件，并从
+`metrics` 段读指标：
 
-summary = []
-for strategy_dir in sorted(glob.glob("discovery_outputs/*")):
-    strategy = os.path.basename(strategy_dir)
-    for symbol_dir in sorted(glob.glob(f"{strategy_dir}/*")):
-        symbol = os.path.basename(symbol_dir)
-        for date_range_dir in sorted(glob.glob(f"{symbol_dir}/*")):
-            date_range = os.path.basename(date_range_dir)
-            result_file = f"{date_range_dir}/backtest_result.json"
-            if os.path.exists(result_file):
-                with open(result_file) as f:
-                    r = json.load(f)
-                summary.append({
-                    "strategy": strategy,
-                    "symbol": symbol,
-                    "date_range": date_range,
-                    "total_return": r.get("total_return", 0),
-                    "max_drawdown": r.get("max_drawdown", 0),
-                    "win_rate": r.get("win_rate", 0),
-                    "total_trades": r.get("total_trades", 0),
-                    "sharpe_ratio": r.get("sharpe_ratio", 0),
-                    "profit_factor": r.get("profit_factor", 0),
-                })
+```bash
+$PYTHON_CMD generate_report.py \
+    --output-dir "$DISCOVERY_OUTPUTS_DIR" \
+    --start "$START_DATE" \
+    --end "$END_DATE"
 ```
+
+核心逻辑（两个容易踩的点都在这里）：
+
+```python
+from pathlib import Path
+import json
+
+base = Path("discovery_outputs")
+summary = []
+# 路径层级是 {strategy}/{date}/{time}/{symbol}/ —— 用 rglob 而不是固定层级
+# glob，层级微调也不会静默漏结果
+for result_file in sorted(base.rglob("backtest_result.json")):
+    r = json.load(open(result_file))
+    parts = result_file.relative_to(base).parts   # (strategy, date, time, symbol, file)
+    # 指标在 "metrics" 段，不在顶层 —— 直接 r.get("total_return") 恒为 0
+    m = r.get("metrics") if isinstance(r.get("metrics"), dict) else r
+    summary.append({
+        "strategy": parts[0],
+        "symbol": parts[-2],
+        "run_at": f"{parts[1]}/{parts[2]}",
+        "total_return": m.get("total_return", 0),
+        "roe": m.get("roe", 0),
+        "max_drawdown": m.get("max_drawdown", 0),
+        "win_rate": m.get("win_rate", 0),
+        "total_trades": m.get("total_trades", 0),
+        "sharpe_ratio": m.get("sharpe_ratio", 0),
+        "profit_factor": m.get("profit_factor", 0),
+    })
+```
+
+同一 (strategy, symbol) 跑过多次时按 `run_at` 取最新一次。
+
+**零交易要单独点出来**：`total_return` 为 0 多数不是"策略没赚钱"，
+而是回测期内一笔都没成交（数据不足 / 信号未触发 / 周期过长）。
+报告里把 `total_trades == 0` 的组合单列，避免被读成有效结果。
 
 ### Step 2: 输出对比报告
 
@@ -771,7 +792,7 @@ REPORT_FILE="${DISCOVERY_OUTPUTS_DIR}/discovery-report-${START_DATE}-${END_DATE}
 | `STRATEGIES_DIR` | `./strategies` | 策略代码目录 |
 | `DISCOVERY_OUTPUTS_DIR` | `./discovery_outputs` | Discovery 结果输出目录 |
 | `LOGS_DIR` | `./logs` | 日志输出目录 |
-| `PYTHON_CMD` | `python3` | Python 命令路径 |
+| `PYTHON_CMD` | 自动探测 | Python 命令路径（留空则探测 `.venv/bin/python`） |
 
 ### .env.example 模板
 
@@ -782,7 +803,7 @@ KLINE_DATA_DIR=./data/strategies/1m
 STRATEGIES_DIR=./strategies
 DISCOVERY_OUTPUTS_DIR=./discovery_outputs
 LOGS_DIR=./logs
-PYTHON_CMD=python3
+PYTHON_CMD=
 ```
 
 ---

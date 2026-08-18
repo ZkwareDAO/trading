@@ -174,17 +174,25 @@ else
     echo "⚠ SCP_HOST 未配置（策略备份不可用）"
 fi
 
-# 2. 检查回测引擎
-PYTHON_CMD="${PYTHON_CMD:-python3}"
-if $PYTHON_CMD -m backtest.run_backtest --help &>/dev/null; then
-    echo "✅ 回测引擎可用"
-else
-    echo "❌ 回测引擎不可用（阻塞项）"
+# 2. 探测 Python（快照排除了 .venv，用本机 Replay 项目的 .venv 跑快照代码）
+if [ -z "${PYTHON_CMD:-}" ]; then
+    if [ -x "./.venv/bin/python" ]; then
+        PYTHON_CMD="./.venv/bin/python"
+    elif command -v python3 &>/dev/null; then
+        PYTHON_CMD="python3"
+    else
+        PYTHON_CMD="python"
+    fi
 fi
+$PYTHON_CMD -c 'import yaml' &>/dev/null \
+    && echo "✅ Python 可用: $PYTHON_CMD" \
+    || echo "❌ Python 依赖缺失（需要 PyYAML）"
 
 # 3. 检查 K 线数据
-KLINE_DIR="${KLINE_DATA_DIR:-./data/strategies/1m}"
-if [ -d "$KLINE_DIR" ] && [ -f "$KLINE_DIR/BTCUSDT_1m.csv" ]; then
+#    必须与快照 config/settings.yaml 的 data_manager.csv_dir 一致，
+#    否则 run-profile 的 data_dir 校验不通过、回测启动即退出。
+KLINE_DIR="${KLINE_DATA_DIR:-./data/klines}"
+if [ -d "$KLINE_DIR" ] && [ -n "$(find "$KLINE_DIR" -name '*.csv' -print -quit 2>/dev/null)" ]; then
     echo "✅ K 线数据就绪: $KLINE_DIR"
 else
     echo "⚠ K 线数据未就绪（回测将失败）"
@@ -265,7 +273,7 @@ mkdir -p "${REPLAY_OUTPUTS_DIR:-./replay_outputs}/${REPLAY_DATE}"
 在备份之前，先 SSH 到远程机器列出当前运行的策略，让用户知道实盘在跑什么。
 
 ```bash
-python3 discover_remote.py --config config.yaml
+$PYTHON_CMD discover_remote.py --config config.yaml
 ```
 
 **discover_remote.py 行为**：
@@ -297,7 +305,7 @@ python3 discover_remote.py --config config.yaml
 **JSON 输出**（`--json` 标志）：
 
 ```bash
-python3 discover_remote.py --config config.yaml --json --output logs/remote-discovery-${REPLAY_DATE}.json
+$PYTHON_CMD discover_remote.py --config config.yaml --json --output logs/remote-discovery-${REPLAY_DATE}.json
 ```
 
 ```json
@@ -366,7 +374,7 @@ Phase 1.5 输出远程策略清单后，等待用户确认备份范围。
 /trading-replay sync --skip-discovery
 
 # 方式 2：直接调用 sync-exee.py
-python3 sync-exee.py --date 20260801
+$PYTHON_CMD sync-exee.py --date 20260801
 ```
 
 ---
@@ -376,7 +384,7 @@ python3 sync-exee.py --date 20260801
 ### Step 1: 从实盘机器拉取策略代码
 
 ```bash
-python3 sync-exee.py --date "${REPLAY_DATE}" --config config.yaml
+$PYTHON_CMD sync-exee.py --date "${REPLAY_DATE}" --config config.yaml
 ```
 
 **sync-exee.py 行为**：
@@ -430,7 +438,7 @@ snapshot/
 在回测前先分析已同步的策略，确定哪些策略可以回测、配置是否完整、K线数据是否覆盖回测范围。
 
 ```bash
-python3 analyze_snapshot.py \
+$PYTHON_CMD analyze_snapshot.py \
     --snapshot-dir "${SNAPSHOT_DIR}/${REPLAY_DATE}" \
     --start "${BT_START}" \
     --end "${BT_END}" \
@@ -444,7 +452,7 @@ python3 analyze_snapshot.py \
 |--------|------|----------|
 | strategy.py | 策略入口文件是否存在 | 标记 skip |
 | *_core.py | 策略核心逻辑文件 | 警告，不阻塞 |
-| config.yaml | 策略配置文件（config.test.yaml → config.yaml → config*.yaml） | 标记 skip |
+| overrides/<SYMBOL>.yaml | 策略参数文件（v3.7 单一事实来源） | 标记 skip |
 | symbols | 配置中定义的代币列表 | 无 symbols 标记 partial |
 | timeframes | 配置中定义的时间框架 | 信息展示 |
 | K线数据 | 每个 symbol 的 CSV 是否存在、日期范围是否覆盖回测区间 | 缺失标记 partial |
@@ -469,7 +477,7 @@ python3 analyze_snapshot.py \
   Data:   ./data/strategies/1m
 
 [READY]   ema_rsi (product)
-  Config: /path/to/config.test.yaml
+  Config: /path/to/snapshot/20260801/ema_rsi-product/strategies/ema_rsi/overrides/BTCUSDT.yaml
   Symbols: BTCUSDT, ETHUSDT, SOLUSDT
   Timeframes: 4h, 1h | Direction: neutral
   Params: obv_period=20, atr_multiplier=2.0
@@ -506,7 +514,7 @@ Summary: 1 ready, 1 partial, 1 skip | 2 of 3 can proceed
       "strategy_name": "ema_rsi",
       "model": "product",
       "status": "ready",
-      "config_path": "/path/to/config.test.yaml",
+      "config_path": "/path/to/strategies/ema_rsi/overrides/BTCUSDT.yaml",
       "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
       "timeframes": ["4h", "1h"],
       "direction": "neutral",
@@ -563,34 +571,60 @@ done
 
 ```bash
 for snapshot in "${STRATEGY_SNAPSHOTS[@]}"; do
-    # 解析 strategy 和 model
-    strategy_name=$(echo "$snapshot" | rev | cut -d'-' -f2- | rev)
-    model=$(echo "$snapshot" | rev | cut -d'-' -f1 | rev)
+    # 解析 strategy 和 model（最后一个 - 分隔）
+    strategy_name="${snapshot%-*}"
+    model="${snapshot##*-}"
 
     echo "🔄 回测: ${strategy_name} (${model})"
 
-    # 回测输出目录
+    SNAPSHOT_ABS="$(cd "snapshot/${REPLAY_DATE}/${snapshot}" && pwd)"
     OUTPUT_DIR="${REPLAY_OUTPUTS_DIR:-./replay_outputs}/${REPLAY_DATE}/${snapshot}"
     mkdir -p "$OUTPUT_DIR"
 
-    # 执行回测（默认: snapshot 日期前 30 天 ~ 当天，可通过 --start/--end 覆盖）
-    $PYTHON_CMD -m backtest.run_backtest \
-        --strategy "$strategy_name" \
+    # 运行清单来自快照自带的 overrides/ —— 文件名即当天实盘跑的 symbol 全集。
+    # 读这份参数就是"回放当天真实配置"的含义所在。
+    RUN_LIST=""
+    for f in "${SNAPSHOT_ABS}/strategies/${strategy_name}/overrides"/*.yaml; do
+        [ -f "$f" ] || continue
+        sym="$(basename "$f" .yaml)"
+        RUN_LIST="${RUN_LIST:+$RUN_LIST,}${strategy_name}:${sym}"
+    done
+
+    # 在快照内生成 run-profile（output_dir 指向快照之外，避免污染快照）
+    $PYTHON_CMD make_profile.py \
+        --project-dir "$SNAPSHOT_ABS" \
+        --name replay \
+        --output-dir "$(cd "$OUTPUT_DIR" && pwd)" \
+        --max-workers "${PARALLEL:-1}"
+
+    # 一次调用跑完该快照的所有组合（默认 snapshot 日期前 30 天 ~ 当天）
+    (cd "$SNAPSHOT_ABS" && $PYTHON_CMD -m backtest.batch_runner \
+        --run "$RUN_LIST" \
         --start "${BT_START}" \
         --end "${BT_END}" \
-        --config "snapshot/${REPLAY_DATE}/${snapshot}/config.yaml" \
-        --output "$OUTPUT_DIR" \
-        --log-level INFO \
-        2>&1 | tee -a "${LOGS_DIR:-./logs}/replay-${REPLAY_DATE}.log"
+        --profile replay \
+        --log-level INFO) 2>&1 | tee -a "${LOGS_DIR:-./logs}/replay-${REPLAY_DATE}.log"
 
-    # 检查回测结果
-    if [ -f "$OUTPUT_DIR/backtest_result.json" ]; then
-        echo "✅ ${snapshot}: 回测完成"
+    # 检查回测结果（产物在 {output_dir}/{strategy}/{date}/{time}/{symbol}/）
+    RESULT_COUNT=$(find "$OUTPUT_DIR" -name "backtest_result.json" 2>/dev/null | wc -l)
+    if [ "$RESULT_COUNT" -gt 0 ]; then
+        echo "✅ ${snapshot}: 回测完成 (${RESULT_COUNT} 个结果)"
     else
         echo "⚠ ${snapshot}: 回测未产出结果"
     fi
 done
 ```
+
+**快照之间串行**：每个快照有自己的 `config/`，并行会互相踩生成的 profile。
+单快照内的多个 (策略, 代币) 由 `profile.max_workers` 并发。
+
+**⚠ 不要用 `batch_runner --daemon`**：该模式重建子命令时只传
+`--profile` 和 `--batch-id`，会丢掉 `--run/--start/--end/--config`，
+等于跑成空清单。需要后台执行请在外层 `nohup` 本脚本。
+
+**跳过无 K 线数据的标的**：Phase 2.5 的分析结果里 `csv_exists=false`
+的 symbol 必然回测失败，提交给 `batch_runner` 只会把整批退出码染红，
+掩盖真正的异常 —— 构建清单时应先剔除。
 
 **回测输出目录结构**：
 
@@ -691,7 +725,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Replay Summary - ${REPLAY_DATE}" > "$SUMMAR
 
 ```cron
 # 每日 00:15 执行策略代码备份
-15 0 * * * cd /path/to/replay && python3 sync-exee.py --date $(date +\%Y\%m\%d) >> logs/cron-sync.log 2>&1
+15 0 * * * cd /path/to/replay && $PYTHON_CMD sync-exee.py --date $(date +\%Y\%m\%d) >> logs/cron-sync.log 2>&1
 
 # 每日 00:30 执行回放回测
 30 0 * * * cd /path/to/replay && bash replay.sh --date $(date +\%Y\%m\%d) >> logs/cron-replay.log 2>&1
@@ -712,7 +746,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Replay Summary - ${REPLAY_DATE}" > "$SUMMAR
 | `SNAPSHOT_DIR` | `./snapshot` | 策略代码快照目录 |
 | `LOGS_DIR` | `./logs` | 日志输出目录 |
 | `REPLAY_OUTPUTS_DIR` | `./replay_outputs` | 回测结果输出目录 |
-| `PYTHON_CMD` | `python3` | Python 命令路径 |
+| `PYTHON_CMD` | 自动探测 | Python 命令路径（留空则探测 `./.venv/bin/python`） |
 
 ### SCP 配置（sync 需要）
 
@@ -735,7 +769,7 @@ KLINE_DATA_DIR=./data/strategies/1m
 SNAPSHOT_DIR=./snapshot
 LOGS_DIR=./logs
 REPLAY_OUTPUTS_DIR=./replay_outputs
-PYTHON_CMD=python3
+PYTHON_CMD=
 
 # ===== SCP 连接（sync 需要） =====
 SCP_HOST=your-server-ip

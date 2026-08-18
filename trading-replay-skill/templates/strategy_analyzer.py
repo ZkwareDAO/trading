@@ -156,55 +156,111 @@ def _extract_strategy_config(config_data: dict, strategy_name: str) -> dict:
     return {}
 
 
-def resolve_config_replay(strategy_dir: str, strategy_name: str) -> Optional[str]:
-    """Replay 模式配置解析: config.test.yaml → config.yaml → config*.yaml
+def list_override_symbols(strategy_dir: str) -> list:
+    """列出 strategies/<name>/overrides/ 下所有 per-symbol 配置对应的 symbol。
+
+    v3.7 起每个 (策略, 代币) 的参数各自独立成文件，overrides/ 的文件名
+    即该策略实际可运行的 symbol 全集。
+    """
+    odir = Path(strategy_dir) / "overrides"
+    if not odir.is_dir():
+        return []
+    return sorted(
+        f.stem for f in odir.glob("*.yaml")
+        if f.is_file() and not f.name.startswith(".")
+    )
+
+
+def resolve_config(strategy_dir: str, strategy_name: str, symbol: str = "") -> Optional[str]:
+    """解析策略参数配置路径（v3.7 单一事实来源）。
+
+    唯一来源: strategies/<name>/overrides/<SYMBOL>.yaml
+    —— 与实盘 run_strategy.py 和回测 run_backtest.py 读的是同一份文件，
+    这正是"回测不失真"的前提。
+
+    symbol 为空时取 overrides/ 下第一个文件作为代表（仅用于读 symbols/
+    timeframes 等元信息，不用于实际回测）。
 
     Returns: 配置文件绝对路径，未找到返回 None
     """
     sdir = Path(strategy_dir)
-
-    cfg = sdir / "config.test.yaml"
-    if cfg.is_file():
-        return str(cfg.resolve())
-
-    cfg = sdir / "config.yaml"
-    if cfg.is_file():
-        return str(cfg.resolve())
-
-    for f in sorted(sdir.glob("config*.yaml")):
-        if f.is_file():
-            return str(f.resolve())
-
-    return None
-
-
-def resolve_config_discovery(strategy_dir: str, strategy_name: str, symbol: str = "") -> Optional[str]:
-    """Discovery 模式配置解析: config/{symbol}.yaml → config.test.yaml
-
-    Returns: 配置文件绝对路径，未找到返回 None
-    """
-    sdir = Path(strategy_dir)
+    odir = sdir / "overrides"
 
     if symbol:
-        cfg = sdir / "config" / f"{symbol}.yaml"
+        cfg = odir / f"{symbol}.yaml"
+        return str(cfg.resolve()) if cfg.is_file() else None
+
+    for name in list_override_symbols(strategy_dir):
+        cfg = odir / f"{name}.yaml"
         if cfg.is_file():
             return str(cfg.resolve())
 
-    cfg = sdir / "config.test.yaml"
-    if cfg.is_file():
-        return str(cfg.resolve())
-
-    cfg = sdir / "config.yaml"
-    if cfg.is_file():
-        return str(cfg.resolve())
-
     return None
+
+
+# 向后兼容别名：两种模式现在读同一份 overrides，不再有 replay/discovery 之分
+def resolve_config_replay(strategy_dir: str, strategy_name: str) -> Optional[str]:
+    """已统一为 resolve_config()，保留名字避免调用方断裂"""
+    return resolve_config(strategy_dir, strategy_name)
+
+
+def resolve_config_discovery(strategy_dir: str, strategy_name: str, symbol: str = "") -> Optional[str]:
+    """已统一为 resolve_config()，保留名字避免调用方断裂"""
+    return resolve_config(strategy_dir, strategy_name, symbol)
 
 
 # ===== K线数据检查 =====
 
+def _find_kline_csv(data_dir: Path, symbol: str, timeframe: str = "") -> Optional[Path]:
+    """定位某 symbol 的 K 线 CSV。
+
+    模板实际布局是按周期分目录: {csv_dir}/{tf}/{SYMBOL}_{tf}.csv
+    （如 data/klines/8h/BTCUSDT_8h.csv），所以优先按 timeframe 精确命中；
+    否则退回扁平布局与全局 rglob。
+
+    传入 timeframe 很重要：不传时 rglob 会拿到任意周期的文件，
+    而不同周期的起止日期不同，覆盖范围判断会跟着抖。
+    """
+    if not data_dir.is_dir():
+        return None
+
+    candidates = []
+    if timeframe:
+        candidates.extend([
+            data_dir / timeframe / f"{symbol}_{timeframe}.csv",
+            data_dir / timeframe / f"{symbol}.csv",
+        ])
+    candidates.extend([
+        data_dir / f"{symbol}.csv",
+    ])
+
+    for c in candidates:
+        if c.is_file():
+            return c
+
+    # 扁平布局的带后缀命名: BTCUSDT_8h.csv
+    for pattern in [f"{symbol}_*.csv"]:
+        matches = sorted(data_dir.glob(pattern))
+        if matches:
+            return matches[0]
+
+    # 独立子目录: {data_dir}/{SYMBOL}/*.csv
+    symbol_dir = data_dir / symbol
+    if symbol_dir.is_dir():
+        matches = sorted(symbol_dir.glob("*.csv"))
+        if matches:
+            return matches[0]
+
+    # 兜底全局搜索
+    for f in sorted(data_dir.rglob(f"{symbol}*.csv")):
+        if f.is_file():
+            return f
+
+    return None
+
+
 def check_kline_data(symbol: str, kline_data_dir: str, start_date: str = "",
-                     end_date: str = "") -> KlineDataStatus:
+                     end_date: str = "", timeframe: str = "") -> KlineDataStatus:
     """检查单个 symbol 的 K线数据
 
     纯 Python file I/O，不依赖 pandas。
@@ -213,26 +269,7 @@ def check_kline_data(symbol: str, kline_data_dir: str, start_date: str = "",
     status = KlineDataStatus()
 
     data_dir = Path(kline_data_dir)
-    csv_file = None
-
-    for pattern in [f"{symbol}.csv", f"{symbol}_*.csv"]:
-        matches = list(data_dir.glob(pattern))
-        if matches:
-            csv_file = matches[0]
-            break
-
-    if not csv_file:
-        symbol_dir = data_dir / symbol
-        if symbol_dir.is_dir():
-            matches = list(symbol_dir.glob("*.csv"))
-            if matches:
-                csv_file = matches[0]
-
-    if not csv_file:
-        for f in data_dir.rglob(f"{symbol}*.csv"):
-            if f.is_file():
-                csv_file = f
-                break
+    csv_file = _find_kline_csv(data_dir, symbol, timeframe)
 
     if not csv_file:
         return status
@@ -285,9 +322,13 @@ def check_kline_data(symbol: str, kline_data_dir: str, start_date: str = "",
 
 
 def _extract_date(csv_line: str) -> Optional[str]:
-    """从 CSV 行提取日期（第一列）
+    """从 CSV 行提取日期（第一列），统一返回 YYYYMMDD
 
-    支持格式: YYYYMMDD, YYYY-MM-DD, Unix timestamp
+    支持格式:
+      - YYYYMMDD
+      - YYYY-MM-DD
+      - YYYY-MM-DD HH:MM:SS[+00:00]  ← 模板 K 线 CSV 的实际格式
+      - Unix timestamp（秒/毫秒）
     """
     if not csv_line:
         return None
@@ -297,9 +338,17 @@ def _extract_date(csv_line: str) -> Optional[str]:
         return None
 
     date_str = parts[0].strip().strip('"')
+    if not date_str:
+        return None
 
-    if len(date_str) == 10 and date_str[4] == '-' and date_str[7] == '-':
-        return date_str.replace('-', '')[:8]
+    # ISO 日期或 ISO datetime：取前 10 字符的日期部分。
+    # 模板 CSV 首列形如 "2026-06-02 00:00:00+00:00"，长度 25，
+    # 早期版本只判 len==10 会漏掉它，然后 fallback 到 date_str[:8]
+    # 得到 "2026-06-" 这种非法值，导致后续所有日期比较静默失效。
+    if len(date_str) >= 10 and date_str[4] == '-' and date_str[7] == '-':
+        head = date_str[:10]
+        if head[:4].isdigit() and head[5:7].isdigit() and head[8:10].isdigit():
+            return head.replace('-', '')
 
     if len(date_str) == 8 and date_str.isdigit():
         return date_str
@@ -313,7 +362,7 @@ def _extract_date(csv_line: str) -> Optional[str]:
     except (ValueError, OSError):
         pass
 
-    return date_str[:8] if len(date_str) >= 8 else None
+    return None
 
 
 def _parse_date_str(date_str: str) -> Optional[datetime]:
@@ -327,9 +376,9 @@ def _parse_date_str(date_str: str) -> Optional[datetime]:
         except ValueError:
             return None
 
-    if len(date_str) == 10:
+    if len(date_str) >= 10 and date_str[4] == '-' and date_str[7] == '-':
         try:
-            return datetime.strptime(date_str, '%Y-%m-%d')
+            return datetime.strptime(date_str[:10], '%Y-%m-%d')
         except ValueError:
             return None
 
@@ -346,18 +395,20 @@ def _parse_date_str(date_str: str) -> Optional[datetime]:
 
 def analyze_strategy(strategy_dir: str, strategy_name: str, model: str = "",
                      start_date: str = "", end_date: str = "",
-                     kline_data_dir: str = "./data/strategies/1m",
+                     kline_data_dir: str = "./data/klines",
                      config_mode: str = "replay") -> StrategyAnalysisResult:
     """分析单个策略
 
     Args:
-        strategy_dir: 策略目录路径 (含 strategy.py, config.yaml 等)
+        strategy_dir: 策略目录路径 (含 strategy.py, overrides/ 等)
         strategy_name: 策略名称
         model: 模型标识 (replay 用)
         start_date: 回测开始日期
         end_date: 回测结束日期
         kline_data_dir: K线数据目录
-        config_mode: "replay" 或 "discovery"
+        config_mode: 已废弃且不再生效。v3.7 起 replay 与 discovery
+            读同一份 strategies/<name>/overrides/<SYMBOL>.yaml，
+            不再有两套配置解析路径。参数保留仅为兼容旧调用方。
 
     Returns:
         StrategyAnalysisResult
@@ -385,14 +436,13 @@ def analyze_strategy(strategy_dir: str, strategy_name: str, model: str = "",
     if not result.code_checks.strategy_py:
         result.issues.append("strategy.py 缺失")
 
-    # 2. 解析配置文件
-    if config_mode == "replay":
-        config_path = resolve_config_replay(strategy_dir, strategy_name)
-    else:
-        config_path = resolve_config_discovery(strategy_dir, strategy_name)
+    # 2. 解析配置文件（v3.7: strategies/<name>/overrides/<SYMBOL>.yaml）
+    config_path = resolve_config(strategy_dir, strategy_name)
 
     if not config_path:
-        result.issues.append("无配置文件")
+        result.issues.append(
+            "无 per-symbol 配置（缺 overrides/<SYMBOL>.yaml）"
+        )
         result.status = "skip"
         return result
 
@@ -409,9 +459,15 @@ def analyze_strategy(strategy_dir: str, strategy_name: str, model: str = "",
                 result.issues.append(f"配置文件中未找到策略 '{strategy_name}' 的配置段")
                 strategy_cfg = {}
 
-        result.symbols = strategy_cfg.get('symbols', [])
-        if isinstance(result.symbols, str):
-            result.symbols = [s.strip() for s in result.symbols.split(',')]
+        # symbols 来自 overrides/ 目录的文件名，而不是某一份配置里的 symbols 字段。
+        # v3.7 每份 overrides/<SYM>.yaml 只描述自己那个 symbol，读单份的
+        # symbols 字段只会看到一个代币，会漏掉该策略其余已配好的标的。
+        result.symbols = list_override_symbols(strategy_dir)
+        if not result.symbols:
+            fallback = strategy_cfg.get('symbols', [])
+            if isinstance(fallback, str):
+                fallback = [s.strip() for s in fallback.split(',') if s.strip()]
+            result.symbols = fallback
 
         result.timeframes = strategy_cfg.get('timeframes', [])
         if isinstance(result.timeframes, str):
@@ -431,11 +487,15 @@ def analyze_strategy(strategy_dir: str, strategy_name: str, model: str = "",
 
     # 3. 检查 K线数据
     if not result.symbols:
-        result.issues.append("配置中无 symbols 定义")
+        result.issues.append("overrides/ 下无 per-symbol 配置，无可回测标的")
     else:
+        # 用策略主周期定位 CSV：数据按 {csv_dir}/{tf}/{SYM}_{tf}.csv 分目录存放
+        main_tf = result.timeframes[0] if result.timeframes else ""
         all_ok = True
         for symbol in result.symbols:
-            kline_status = check_kline_data(symbol, kline_data_dir, start_date, end_date)
+            kline_status = check_kline_data(
+                symbol, kline_data_dir, start_date, end_date, timeframe=main_tf
+            )
             result.kline_data[symbol] = kline_status
             if not kline_status.csv_exists:
                 result.issues.append(f"{symbol} 无K线数据")
@@ -461,7 +521,7 @@ def analyze_strategy(strategy_dir: str, strategy_name: str, model: str = "",
 
 
 def analyze_snapshot(snapshot_day_dir: str, start_date: str = "", end_date: str = "",
-                     kline_data_dir: str = "./data/strategies/1m",
+                     kline_data_dir: str = "./data/klines",
                      strategy_filter: str = "", model_filter: str = "") -> list:
     """分析 snapshot 目录下所有策略
 
@@ -520,7 +580,7 @@ def analyze_snapshot(snapshot_day_dir: str, start_date: str = "", end_date: str 
 
 def analyze_strategy_list(strategies: list, strategies_dir: str,
                           symbols: list = None, start_date: str = "",
-                          end_date: str = "", kline_data_dir: str = "./data/strategies/1m") -> list:
+                          end_date: str = "", kline_data_dir: str = "./data/klines") -> list:
     """分析策略列表（discovery 模式）
 
     Args:
@@ -549,18 +609,39 @@ def analyze_strategy_list(strategies: list, strategies_dir: str,
         )
 
         if symbols:
-            result.symbols = list(symbols)
+            # 用户指定的 symbols 与该策略实际配好的 overrides 求交集。
+            # 不做交集会把没有 overrides 的组合报成 ready，等到 batch_runner
+            # 才因显式清单里的文件缺失而整批报错。
+            available = set(list_override_symbols(str(strategy_dir)))
+            requested = list(symbols)
+            usable = [s for s in requested if s in available] if available else []
+            missing = [s for s in requested if s not in available]
+
+            result.symbols = usable
             result.kline_data = {}
-            result.issues = [i for i in result.issues if "无K线数据" not in i and "数据不覆盖" not in i]
-            for symbol in symbols:
-                kline_status = check_kline_data(symbol, kline_data_dir, start_date, end_date)
+            result.issues = [
+                i for i in result.issues
+                if "无K线数据" not in i
+                and "数据不覆盖" not in i
+                and "无可回测标的" not in i
+            ]
+            for symbol in missing:
+                result.issues.append(f"{symbol} 缺 overrides/{symbol}.yaml")
+
+            main_tf = result.timeframes[0] if result.timeframes else ""
+            for symbol in usable:
+                kline_status = check_kline_data(
+                    symbol, kline_data_dir, start_date, end_date, timeframe=main_tf
+                )
                 result.kline_data[symbol] = kline_status
                 if not kline_status.csv_exists:
                     result.issues.append(f"{symbol} 无K线数据")
                 elif not kline_status.covers_range and start_date and end_date:
                     result.issues.append(f"{symbol} 数据不覆盖回测范围: {kline_status.missing_range}")
 
-            if not result.issues:
+            if not usable:
+                result.status = "skip"
+            elif not result.issues:
                 result.status = "ready"
             elif result.code_checks.strategy_py and result.config_path:
                 result.status = "partial"
@@ -711,7 +792,7 @@ if __name__ == "__main__":
     parser.add_argument("--symbols", help="代币列表，逗号分隔")
     parser.add_argument("--start", help="回测开始日期")
     parser.add_argument("--end", help="回测结束日期")
-    parser.add_argument("--kline-data-dir", default="./data/strategies/1m", help="K线数据目录")
+    parser.add_argument("--kline-data-dir", default="./data/klines", help="K线数据目录")
     parser.add_argument("--output", help="JSON 输出路径")
     parser.add_argument("--mode", choices=["replay", "discovery"], default="replay")
 
