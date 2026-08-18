@@ -205,7 +205,7 @@ DISK_OK="0"
 | Python 3.10+ | `PYTHON_CMD` 非空 | Ubuntu: `sudo apt install python3.12 python3.12-venv` / macOS: `brew install python@3.12` |
 | ta-lib C 库 | `TALIB_FOUND ≥ 1` | `wget ...ta-lib... && ./configure && make && sudo make install && ldconfig` |
 | pip 可用 | `PIP_AVAILABLE = 1` | `python3 -m ensurepip` |
-| K 线数据 | `KLINE_READY = 1` | 设置 `KLINE_DATA_DIR` 指向已有数据目录，或运行 `python utils/prepare_data.py --symbol BTCUSDT,ETHUSDT,SOLUSDT --start 20250101` |
+| K 线数据 | `KLINE_READY = 1` | 设置 `KLINE_DATA_DIR` 指向已有数据目录，或运行 `python scripts/download_data.py --symbol BTCUSDT,ETHUSDT,SOLUSDT --interval 1m --days 600` |
 | 磁盘空间 ≥ 2G | `DISK_OK = 1` | 清理空间或更换 `DATA_PATH` |
 
 **阻塞 vs 非阻塞**：
@@ -215,7 +215,7 @@ DISK_OK="0"
 | Python 3.10+ | **阻塞** — 无法创建 venv 和运行回测 | 核心依赖 |
 | ta-lib C 库 | **非阻塞** — 降级安装，回测时部分指标不可用 | 可后续安装 |
 | pip 可用 | **阻塞** — 无法安装依赖 | 核心依赖 |
-| K 线数据 | **非阻塞** — Phase 1 自动 symlink/下载，仍无数据则自动运行 prepare_data.py | 可自动修复 |
+| K 线数据 | **非阻塞** — Phase 1 自动 symlink/下载，仍无数据则自动运行 `scripts/download_data.py` | 可自动修复 |
 | 磁盘空间 | **非阻塞** — 警告，可能回测输出空间不足 | 可后续清理 |
 
 **阻塞项处理**：Python/pip 不可用 → 报错退出，提示安装命令。这是唯一需要用户干预的情况。
@@ -399,8 +399,7 @@ fi
 | `templates/strategy_core/` | 基类框架（BaseStrategy/BaseState/BaseStrategyCore） |
 | `templates/backtest/` | 回测引擎 |
 | `templates/data_manager/` | K线数据管理 |
-| `templates/scripts/` | 辅助脚本 |
-| `templates/utils/` | 工具脚本（prepare_data.py 等） |
+| `templates/scripts/` | 辅助脚本（含 `download_data.py` K线下载、`run_backtest_batch.sh`、`run_live_batch.sh`） |
 | `templates/config/settings.example.yaml` | 系统配置模板 |
 | `templates/docs/strategy/` | 开发规范文档（QUICKSTART/DEVELOPMENT_GUIDE/AI_CONSTRAINTS/REVIEW_CHECKLIST/EXAMPLES） |
 | `templates/requirements.txt` | 依赖清单 |
@@ -438,7 +437,6 @@ cp -r $TEMPLATE_DIR/strategy_core/ $PROJECT_DIR/strategy_core/
 cp -r $TEMPLATE_DIR/backtest/ $PROJECT_DIR/backtest/
 cp -r $TEMPLATE_DIR/data_manager/ $PROJECT_DIR/data_manager/
 cp -r $TEMPLATE_DIR/scripts/ $PROJECT_DIR/scripts/
-cp -r $TEMPLATE_DIR/utils/ $PROJECT_DIR/utils/
 
 # 复制配置和文档
 cp -r $TEMPLATE_DIR/config/ $PROJECT_DIR/config/
@@ -520,15 +518,17 @@ if [ -d "$KLINE_SRC" ] && [ -f "$KLINE_SRC/BTCUSDT_1m.csv" ]; then
     ln -sf "$KLINE_SRC"/*.csv "$DATA_DIR/strategies/1m/"
     echo "✅ 已 symlink 1m kline 数据: $KLINE_SRC → $DATA_DIR/strategies/1m/"
 
-# 方式 2: 运行 prepare_data.py 从 Binance 下载（自动，约 30-60 分钟）
-elif [ -f "utils/prepare_data.py" ]; then
+# 方式 2: 运行 scripts/download_data.py 从 Binance 下载（自动，约 30-60 分钟）
+#   注意 CLI 是 --days N（回看天数），v3.7 没有 --start / --output 参数
+elif [ -f "scripts/download_data.py" ]; then
     echo "📥 K 线数据未就绪，从 Binance Futures 下载..."
-    echo "  时间范围: 20250101 → 今天"
+    echo "  回看天数: 600 天"
     echo "  交易对: BTCUSDT,ETHUSDT,SOLUSDT（默认）"
-    python utils/prepare_data.py \
+    $PYTHON_CMD scripts/download_data.py \
         --symbol BTCUSDT,ETHUSDT,SOLUSDT \
-        --start 20250101 \
-        --output "$DATA_DIR/strategies/1m"
+        --interval 1m \
+        --days 600 \
+        --data-dir "$DATA_DIR/klines"
 
 # 方式 3: 数据未就绪，记录警告（不阻塞流程，回测时会报错）
 else
@@ -536,7 +536,7 @@ else
     echo "  需要路径: $DATA_DIR/strategies/1m/"
     echo "  文件格式: {SYMBOL}_1m.csv (timestamp,open,high,low,close,volume)"
     echo "  设置 KLINE_DATA_DIR 环境变量指向已有数据目录"
-    echo "  或运行: python utils/prepare_data.py --symbol BTCUSDT,ETHUSDT,SOLUSDT --start 20250101"
+    echo "  或运行: python scripts/download_data.py --symbol BTCUSDT,ETHUSDT,SOLUSDT --interval 1m --days 600"
 fi
 ```
 
@@ -586,8 +586,7 @@ Python 环境: .venv (Python 3.x)
   │       ├── strategies.example.yaml
   │       └── strategies.yaml     # 运行时配置（从 .example 生成）
   ├── data_manager/               # K线数据管理（DataManager, klines_loader）
-  ├── scripts/                    # 辅助脚本
-  ├── utils/                      # 工具脚本（prepare_data.py 等）
+  ├── scripts/                    # 辅助脚本（download_data.py / run_backtest_batch.sh / run_live_batch.sh）
   ├── strategies/                 # 策略目录
   │   ├── __init__.py             # 策略注册（空壳，Phase 2 更新）
   │   └── {strategy_name}/        # ⬅ Phase 2 生成
