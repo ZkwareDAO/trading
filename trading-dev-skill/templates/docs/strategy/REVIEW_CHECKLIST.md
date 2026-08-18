@@ -4,13 +4,15 @@
 
 ---
 
-## 0. 基类继承检查
+## 0. 新架构检查（推荐）
+
+> 使用 `BaseStrategy` / `BaseStrategyCore` / `BaseState` 基类的策略检查项
 
 | # | 检查项 | 标准 | 状态 |
 |---|--------|------|------|
-| 0.1 | Strategy 继承 `BaseStrategy` | 必需 | ⬜ |
-| 0.2 | Core 继承 `BaseStrategyCore` | 必需 | ⬜ |
-| 0.3 | State 继承 `BaseState` | 必需 | ⬜ |
+| 0.1 | Strategy 继承 `BaseStrategy` | 推荐 | ⬜ |
+| 0.2 | Core 继承 `BaseStrategyCore` | 推荐 | ⬜ |
+| 0.3 | State 继承 `BaseState` | 推荐 | ⬜ |
 | 0.4 | 设置 `STRATEGY_TYPE` 类属性 | 必需 | ⬜ |
 | 0.5 | 设置 `STRATEGY_PREFIX` 类属性 | 必需 | ⬜ |
 | 0.6 | 实现 `_create_core()` 方法 | 必需 | ⬜ |
@@ -18,12 +20,12 @@
 | 0.8 | State 子类重写 `to_persist_dict()` | 有特有字段时必需 | ⬜ |
 | 0.9 | State 子类重写 `restore_from_dict()` | 有特有字段时必需 | ⬜ |
 | 0.10 | 使用 `state.clear_position()` 清除持仓 | 必需 | ⬜ |
-| 0.11 | `_close()` 调用 `_notify_exit_and_clear()` | 必需 | ⬜ |
-| 0.12 | `check_realtime_exit()` 调用 `update_pnl_extremes()` | 必需 | ⬜ |
+| 0.11 | `_close()` 调用 `_notify_exit_and_clear()` | 必需（v3.6.0） | ⬜ |
+| 0.12 | `check_realtime_exit()` 调用 `update_pnl_extremes()` | 必需（v3.6.0） | ⬜ |
 | 0.13 | 数组/字典字段使用 `field(default_factory=...)` | 必需 | ⬜ |
 | 0.14 | 嵌套对象实现 `to_dict()` 和反序列化 | 有嵌套对象时必需 | ⬜ |
 
-**0 类结论**：⬜ PASS / ⬜ FAIL
+**0 类结论**：⬜ PASS / ⬜ FAIL / ⬜ N/A（使用旧版架构）
 
 ---
 
@@ -34,9 +36,14 @@
 | A1 | `strategy.py` 存在 | 必需 | ⬜ |
 | A2 | `{prefix}_core.py` 存在 | 必需 | ⬜ |
 | A3 | `__init__.py` 存在 | 推荐 | ⬜ |
-| A4 | `config.yaml` 存在 | 必需 | ⬜ |
-| A5 | `config.test.yaml` 存在 | 必需（回测） | ⬜ |
+| A4 | `overrides/{SYMBOL}.yaml` 至少一份 | 必需（实盘与回测共用） | ⬜ |
+| A5 | `.strategy-spec.yaml` 存在 | 推荐（策略契约） | ⬜ |
 | A6 | `tests/` 目录存在 | 推荐 | ⬜ |
+
+> ⚠️ v3.7 起 **不存在** `config.yaml` / `config.dev.yaml` / `config.test.yaml`。
+> per-symbol 参数的唯一事实来源是 `overrides/{SYMBOL}.yaml`——实盘 `run_strategy.py`
+> 与回测 `run_backtest.py` 读的都是它。按环境分文件会让回测与实盘读到两份参数，
+> 是回测失真的根源，v3.7 已删除。
 
 **A 类结论**：⬜ PASS / ⬜ FAIL
 
@@ -69,8 +76,8 @@
 | C2 | State 包含必需字段 | position, entry_timestamp, entry_price, stop_price | ⬜ |
 | C3 | `_get_state(symbol)` 方法存在 | 必需 | ⬜ |
 | C4 | `analyze()` 方法存在 | 必需 | ⬜ |
-| C5 | `analyze()` 接收 `realtime_price` 参数 | 必需 | ⬜ |
-| C6 | `analyze()` 使用 `realtime_price` 判断入场 | 必需 | ⬜ |
+| C5 | `analyze()` 接收 `realtime_price` 参数 | 必需（v3.7.0） | ⬜ |
+| C6 | `analyze()` 使用 `realtime_price` 判断入场 | 必需（v3.7.0） | ⬜ |
 | C7 | `analyze()` 返回格式正确 | action, price, strength, metadata | ⬜ |
 | C8 | `check_realtime_exit()` 方法存在 | 必需 | ⬜ |
 | C9 | `check_realtime_exit()` 返回格式正确 | action, price, strength, metadata | ⬜ |
@@ -91,7 +98,7 @@
 
 | # | 检查项 | 标准 | 状态 |
 |---|--------|------|------|
-| D1 | 入场判断使用 `realtime_price` | 必需 | ⬜ |
+| D1 | 入场判断使用 `realtime_price` | 必需（v3.7.0） | ⬜ |
 | D2 | 出场判断使用 `current_price` 参数 | 必需 | ⬜ |
 | D3 | 各指标配置 `*_timeframes` | 必需 | ⬜ |
 | D4 | `_get_indicator_timeframes()` 实现 | 必需 | ⬜ |
@@ -136,7 +143,7 @@
 | G3 | `_on_position_exit()` 实现 | 实盘必需 | ⬜ |
 | G4 | `_restore_position_state()` 实现 | 实盘必需 | ⬜ |
 
-**G 类结论**：⬜ PASS / ⬜ FAIL
+**G 类结论**：⬜ PASS / ⬜ FAIL / ⬜ N/A
 
 ---
 
@@ -168,3 +175,7 @@
 | H. 测试覆盖 | /4 | ⬜ PASS / ⬜ N/A |
 
 **总体结论**：⬜ PASS / ⬜ FAIL
+
+**架构版本**：⬜ 新架构（BaseStrategy） / ⬜ 旧架构（手动实现）
+
+**审查人**：___________ **日期**：___________

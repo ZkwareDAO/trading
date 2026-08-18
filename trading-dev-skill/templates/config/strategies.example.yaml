@@ -1,0 +1,107 @@
+# =============================================================================
+# 策略运行配置示例 - 实盘/回测共用
+# =============================================================================
+# 复制此文件到 config/strategies.yaml 并根据需要修改
+#
+# 使用方式:
+#   实盘: python run_strategies_manager.py
+#   回测: python -m backtest.batch_runner --config config/strategies.yaml
+#
+# 配置格式（简化版）:
+#   每个策略直接定义完整配置，无需 defaults/templates 层级
+#
+# 策略字段说明:
+#   - interval: 主周期（如 4h, 15m, 1h）
+#   - version: 版本号（如 v2）
+#   - trading_mode: 运行模式（live / paper_trading）
+#   - config_dir: 策略参数配置目录（默认 config/zktrading）
+#   - symbols: 交易对列表
+#   - overrides: 回测参数覆盖（可选）
+#
+# symbols 支持两种格式：
+# 1. 字符串数组（所有 symbol 使用相同 trading_mode）:
+#    symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
+#
+# 2. 对象数组（每个 symbol 可独立配置 trading_mode）:
+#    symbols:
+#      - name: BTCUSDT
+#        trading_mode: "live"
+#      - name: SOLUSDT
+#        trading_mode: "paper_trading"
+# =============================================================================
+
+strategies:
+  # -----------------------------------------------------------
+  # 示例 1: 基本配置（所有 symbol 使用相同 trading_mode）
+  # -----------------------------------------------------------
+  example_strategy_1:
+    interval: "4h"
+    version: "v2"
+    trading_mode: "live"
+    symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
+
+  # -----------------------------------------------------------
+  # 示例 2: 混合模式（部分实盘、部分模拟盘）
+  # -----------------------------------------------------------
+  example_strategy_2:
+    interval: "15m"
+    version: "v2"
+    trading_mode: "live"        # 默认 trading_mode
+    config_dir: "config/custom" # 自定义配置目录
+    symbols:
+      - BTCUSDT              # 使用默认 trading_mode (live)
+      - ETHUSDT              # 使用默认 trading_mode (live)
+      - name: SOLUSDT
+        trading_mode: "paper_trading"  # 覆盖为模拟盘
+      - name: DOGEUSDT
+        trading_mode: "paper_trading"  # 覆盖为模拟盘
+
+  # -----------------------------------------------------------
+  # 示例 3: 带回测参数覆盖
+  # -----------------------------------------------------------
+  # overrides 仅在回测时生效
+  # 支持深度合并，可覆盖任意层级的字段
+  example_strategy_3:
+    interval: "1h"
+    version: "v2"
+    trading_mode: "paper_trading"
+    symbols: [BTCUSDT]
+    overrides:
+      params:
+        cooldown_bars: 30
+        risk_ratio: 0.02
+
+# -----------------------------------------------------------------------------
+# overrides 使用说明
+# -----------------------------------------------------------------------------
+# overrides 支持深度合并，可以覆盖任意层级的字段：
+#
+# 示例 1: 覆盖顶层字段
+# overrides:
+#   enabled: false
+#   version: 'v1'
+#
+# 示例 2: 覆盖嵌套字段（深度合并）
+# overrides:
+#   params:
+#     cooldown_bars: 30
+#     fvg_min_size: 0.002
+#   # 其他 params 字段保持原值
+#
+# 示例 3: 覆盖多层嵌套
+# overrides:
+#   risk:
+#     fixed_stop_loss_pct: 3.0
+#     trailing_profit:
+#       enabled: false
+#
+# 示例 4: 删除字段（设置为 null）
+# overrides:
+#   capital:
+#     leverage: null  # 删除 leverage 字段
+#
+# 示例 5: 替换数组
+# overrides:
+#   params:
+#     ote_levels: [0.5, 0.618, 0.786]  # 完全替换数组，不合并
+# -----------------------------------------------------------------------------

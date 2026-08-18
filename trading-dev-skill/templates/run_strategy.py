@@ -9,19 +9,16 @@ Strategy Process Runner — 策略独立进程入口
 - 独立注册到 factory-service
 
 使用方式:
-    # 新格式（推荐）
-    python run_strategy.py --name cta_ict_v2 --symbol BTCUSDT --interval 4h --version v2 --trading-mode live
-    python run_strategy.py --name cta_ict_v2 --symbol BTCUSDT --interval 4h --version v2 --trading-mode paper_trading --config-file config.prod.yaml
+    python run_strategy.py --name sar_snt3_v3 --symbol BTCUSDT --interval 4h --version v3 --trading-mode live
 
-    # 旧格式（兼容）
-    python run_strategy.py --strategy cta_rbreaker
-    python run_strategy.py --strategy cta_rbreaker --config /path/to/config.yaml
+配置文件统一为 strategies/<name>/overrides/<symbol>.yaml（per-symbol），不再使用共享层 config.yaml。
 """
 
 import argparse
 import asyncio
 import logging
 import os
+import re
 import signal
 import sys
 import yaml
@@ -32,50 +29,44 @@ from data_manager import DataManager, DataManagerConfig
 from strategy_core.strategy_engine.engine import StrategyEngine
 from strategy_core.signal_logging import SignalLogger, SignalStorage, KafkaSignalProducer
 from strategy_core.signal_logging.csv_adapter import SignalCsvWriter
-from strategy_core.utils.config_loader import load_config_with_env
-from strategy_core.utils.strategy_naming import build_strategy_id
+from strategy_core.utils.strategy_naming import build_strategy_id_from_overrides
 from strategy_core.utils.log_handlers import DailyDirectoryFileHandler
 
-def get_settings_path() -> str:
-    """
-    获取配置文件路径
+# ${VAR} 占位符正则
+_ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 
-    新模式：配置文件通过 --global-config 参数指定，或使用默认 config/settings.yaml
-    不再依赖 CTA_ENV 环境变量
 
-    Returns:
-        配置文件路径
+def _resolve_env_placeholders(obj: Any) -> Any:
+    """递归解析配置中的 ${VAR} 占位符为环境变量值
+
+    环境变量未设置时替换为 None（而非保留字面量 ${VAR}），
+    让下游判断 None 走回退逻辑。
     """
-    # 默认使用 settings.yaml
-    settings_path = "config/settings.yaml"
-    if not Path(settings_path).exists():
-        logging.warning(f"默认配置文件不存在: {settings_path}")
-    return settings_path
+    if isinstance(obj, dict):
+        return {k: _resolve_env_placeholders(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_env_placeholders(v) for v in obj]
+    if isinstance(obj, str):
+        m = _ENV_PATTERN.fullmatch(obj.strip())
+        if m:
+            # 整串就是 ${VAR}：返回环境变量原值（可能为 None）
+            return os.environ.get(m.group(1))
+        # 字符串中嵌入 ${VAR}：做替换，未设置的替换为空串
+        return _ENV_PATTERN.sub(
+            lambda mm: (os.environ.get(mm.group(1)) or ""), obj
+        )
+    return obj
 
 
 def build_strategy_config(
     strategy_name: str,
     config_dir: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """[已废弃] 配置统一走 per-symbol overrides，旧格式 --strategy 入口已移除。
+
+    保留空壳仅为避免外部直接 import 报错，不再读 config.yaml。
     """
-    加载策略配置文件
-
-    支持多环境配置:
-    - config.{env}.yaml (如 config.prod.yaml)
-    - config.yaml (默认回退)
-
-    Args:
-        strategy_name: 策略目录名 (如 cta_rbreaker)
-        config_dir: 策略目录路径，默认使用项目 strategies/{strategy_name}
-
-    Returns:
-        策略配置字典，失败返回空字典
-    """
-    # 转换为 Path 对象
-    config_dir_path = Path(config_dir) if config_dir else None
-
-    # 使用多环境配置加载器
-    return load_config_with_env(strategy_name, config_dir=config_dir_path)
+    return {}
 
 
 def resolve_log_level(
@@ -103,6 +94,23 @@ def resolve_log_level(
 
     # 默认 INFO
     return "INFO"
+
+
+def _read_interval_from_overrides(overrides_section: Dict[str, Any]) -> Optional[str]:
+    """从 overrides 段读取主周期（timeframes[0]）
+
+    与 StrategiesLoader._load_overrides_fields 的读取逻辑保持一致。
+
+    Args:
+        overrides_section: overrides 配置中 <strategy_name> 段的内容
+
+    Returns:
+        主周期字符串（如 "4h"），未配置返回 None
+    """
+    timeframes = overrides_section.get("timeframes", [])
+    if timeframes:
+        return str(timeframes[0])
+    return None
 
 
 class StrategyProcessRunner:
@@ -154,19 +162,21 @@ class StrategyProcessRunner:
         strategy_data_dir.mkdir(parents=True, exist_ok=True)
 
         # 初始化 DataManager（独立实例）
+        # 地址来自 settings.yaml 的 ${ENV_VAR} 占位；缺失时回退到 Binance 公共源
         dm_global_config = self.global_config.get("data_manager", {})
+        ws_url = dm_global_config.get("klines_service_ws_url")
+        http_url = dm_global_config.get("klines_service_http_url")
+        if not ws_url:
+            logging.info("未配置 data_manager.klines_service_ws_url，实时数据将回退到 Binance 公共 WS")
+        if not http_url:
+            logging.info("未配置 data_manager.klines_service_http_url，历史下载将回退到 Binance fapi")
         dm_config = DataManagerConfig(
             csv_dir=str(strategy_data_dir),
             cache_max_size=dm_global_config.get("cache_max_size", 10000),
-            # Kafka 配置 (新增)
-            kafka_enabled=dm_global_config.get("kafka_enabled", False),
-            kafka_brokers=dm_global_config.get("kafka_brokers", []),
-            kafka_topic=dm_global_config.get("kafka_topic", "biance_klines"),
-            kafka_group_id=f"strategy-{self.strategy_name}",  # 使用策略名作为 group_id
-            # WebSocket 配置 (回退)
+            # WebSocket 配置
             klines_service_enabled=dm_global_config.get("klines_service_enabled", True),
-            klines_service_ws_url=dm_global_config.get("klines_service_ws_url", "ws://127.0.0.1:17081/ws/klines"),
-            klines_service_http_url=dm_global_config.get("klines_service_http_url", "http://127.0.0.1:17081"),
+            klines_service_ws_url=ws_url,
+            klines_service_http_url=http_url,
         )
         self.data_manager = DataManager(dm_config)
 
@@ -204,10 +214,15 @@ class StrategyProcessRunner:
         self.csv_writer = SignalCsvWriter()
 
         # 初始化 StrategyEngine（只加载当前策略）
+        # 地址来自 settings.yaml 的 ${ENV_VAR} 占位；缺失时策略仍可运行，仅对应功能不可用
         engine_config = self.global_config.get("strategy_engine", {})
-        factory_endpoint = engine_config.get("factory_endpoint", "http://127.0.0.1:8888")
-        position_proxy_url = engine_config.get("position_proxy_url", "http://127.0.0.1:8889")
+        factory_endpoint = engine_config.get("factory_endpoint")
+        position_proxy_url = engine_config.get("position_proxy_url")
         strategies_dir = engine_config.get("strategies_dir", "./strategies")
+        if not factory_endpoint:
+            logging.warning("未配置 strategy_engine.factory_endpoint，跳过 factory-service 注册/心跳")
+        if not position_proxy_url:
+            logging.warning("未配置 strategy_engine.position_proxy_url，远程仓位查询不可用")
 
         self.engine = StrategyEngine(
             factory_endpoint=factory_endpoint,
@@ -225,13 +240,14 @@ class StrategyProcessRunner:
         self._running = False
 
     def _load_global_config(self, config_path: str) -> Dict[str, Any]:
-        """加载全局 settings.yaml"""
+        """加载全局 settings.yaml，并解析 ${VAR} 占位符为环境变量值"""
         path = Path(config_path)
         if not path.exists():
             logging.warning(f"全局配置文件不存在：{config_path}，使用空配置")
             return {}
         with open(path, "r", encoding="utf-8") as f:
-            return yaml.safe_load(f) or {}
+            raw = yaml.safe_load(f) or {}
+        return _resolve_env_placeholders(raw)
 
     def load_strategy(self) -> bool:
         """
@@ -289,14 +305,17 @@ class StrategyProcessRunner:
                     symbols.add(entry.instance.symbol)
         return symbols
 
-    async def _load_historical_data(self, days: int = 7) -> None:
+    async def _load_historical_data(self, days: int) -> None:
         """
         加载历史数据 + 恢复大周期缓存
+
+        Args:
+            days: 补齐历史数据的天数上限（来自 settings.yaml data_manager.sync_history_days）
 
         复用已有方法:
         1. load_history — 加载 1m CSV 到缓存
         2. _preload_all_big_intervals_from_csv — 恢复已有大周期 CSV 到缓存
-        3. sync_to_latest — 补齐缺失的历史数据（默认 7 天）
+        3. sync_to_latest — 补齐缺失的历史数据
         4. _preload_big_intervals_to_cache — 聚合大周期到内存
         """
         symbols = await self._collect_subscribed_symbols()
@@ -347,9 +366,12 @@ class StrategyProcessRunner:
             logging.error(f"[{self.strategy_name}] 策略加载失败")
             return False
 
-        # 加载历史数据（30 天默认）—— 必须在 engine.start_all() 之前，
+        # 加载历史数据 —— 必须在 engine.start_all() 之前，
         # 因为策略 on_start() 需要从缓存中读取 K 线数据初始化
-        await self._load_historical_data(days=30)
+        # 天数来自 settings.yaml data_manager.sync_history_days（默认 30）
+        dm_global_config = self.global_config.get("data_manager", {})
+        history_days = dm_global_config.get("sync_history_days", 30)
+        await self._load_historical_data(days=history_days)
 
         # 启动策略
         results = self.engine.start_all()
@@ -400,10 +422,10 @@ class StrategyProcessRunner:
         if symbols:
             logging.info(f"[{self.strategy_name}] 订阅 WS symbols: {symbols}")
 
-            # 启动实时数据服务（Kafka 或 WebSocket）
-            ws_ok = await self.data_manager.start_klines_service_async()
+            # 启动实时数据服务（WebSocket）—— 先传 symbols，Binance 回退模式拼 URL 需要
+            ws_ok = await self.data_manager.start_klines_service_async(list(symbols))
             if ws_ok:
-                # 订阅 symbols
+                # 订阅 symbols（自建模式发 subscribe 消息；Binance 模式已在 URL 订阅）
                 sub_ok = await self.data_manager.subscribe_klines_async(list(symbols))
                 # 日志已由 DataManager 根据实际数据源打印
             else:
@@ -423,54 +445,37 @@ async def main():
     """CLI 入口点"""
     parser = argparse.ArgumentParser(description="Strategy Process Runner")
 
-    # 新格式参数
+    # 新格式参数（--interval/--version/--trading-mode 可选，缺失时从 overrides 补全）
     parser.add_argument(
         "--name",
         default=None,
-        help="策略目录名 (如 cta_ict_v2)",
+        help="策略目录名 (如 sar_snt3_v3)，必填（新格式）",
     )
     parser.add_argument(
         "--symbol",
         default=None,
-        help="交易对 (如 BTCUSDT)",
+        help="交易对 (如 BTCUSDT)，必填（新格式）",
     )
     parser.add_argument(
         "--interval",
         default=None,
-        help="主周期 (如 4h)",
+        help="主周期 (如 4h)，可选；缺失时从 overrides 的 timeframes[0] 读取",
     )
     parser.add_argument(
         "--version",
         default=None,
-        help="版本号 (如 v2)",
+        help="版本号 (如 v2 / 3)，可选；缺失时从 overrides 的 version 读取",
     )
     parser.add_argument(
         "--trading-mode",
         choices=["live", "paper_trading", "smoking"],
-        default="live",
-        help="运行模式 (live 实盘 / paper_trading 模拟盘 / smoking 小金额实盘)",
-    )
-    parser.add_argument(
-        "--config-file",
-        default="config.yaml",
-        help="策略配置文件名 (默认 config.yaml，在策略目录内查找)",
+        default=None,
+        help="运行模式，可选；缺失时从 overrides 的 trading_mode 读取，默认 live",
     )
     parser.add_argument(
         "--config-path",
         default=None,
-        help="策略配置文件完整路径 (优先级高于 --config-file)",
-    )
-
-    # 旧格式参数（兼容）
-    parser.add_argument(
-        "--strategy",
-        default=None,
-        help="策略名称（旧格式，如 cta_rbreaker）",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="策略配置文件路径（旧格式）",
+        help="策略配置文件完整路径 (优先级最高，覆盖默认 overrides 路径)",
     )
 
     # 通用参数
@@ -497,63 +502,49 @@ async def main():
         handlers=[logging.StreamHandler()],
     )
 
-    # 判断使用新格式还是旧格式
-    use_new_format = args.name and args.symbol and args.interval and args.version
-
-    if use_new_format:
-        # 新格式：生成标准化 strategy_name（包含 trading_mode）
-        strategy_name = build_strategy_id(
-            args.name, args.interval, args.version, args.symbol, args.trading_mode
-        )
-        strategy_dir = args.name
-
-        # 加载策略配置（优先使用 --config-path）
-        if args.config_path:
-            # 使用独立配置文件路径
-            config_path = Path(args.config_path)
-            if config_path.exists():
-                with open(config_path, "r", encoding="utf-8") as f:
-                    full_config = yaml.safe_load(f) or {}
-                strategy_config = full_config.get(args.name, {})
-                logging.info(f"加载配置文件: {config_path}")
-            else:
-                logging.error(f"配置文件不存在: {config_path}")
-                sys.exit(1)
-        else:
-            # 使用策略目录内的配置文件
-            config_path = Path("strategies") / args.name / args.config_file
-            if config_path.exists():
-                with open(config_path, "r", encoding="utf-8") as f:
-                    full_config = yaml.safe_load(f) or {}
-                strategy_config = full_config.get(args.name, {})
-                logging.info(f"加载配置文件: {config_path}")
-            else:
-                logging.warning(f"配置文件不存在: {config_path}")
-                strategy_config = {}
-
-        # 覆盖 symbol
-        strategy_config["symbols"] = [args.symbol]
-
-        trading_mode = args.trading_mode
-
-    elif args.strategy:
-        # 旧格式兼容
-        strategy_name = args.strategy
-        strategy_dir = args.strategy
-
-        strategy_config = build_strategy_config(
-            args.strategy,
-            config_dir=args.config,
-        )
-        if not strategy_config:
-            logging.error(f"无法加载策略 {args.strategy} 的配置，退出")
-            sys.exit(1)
-
-        trading_mode = "live"
-
-    else:
-        logging.error("必须指定 --name/--symbol/--interval/--version 或 --strategy")
+    # 新格式：--name + --symbol 必填；--interval/--version/--trading-mode 缺失时从 overrides 补全
+    if not (args.name and args.symbol):
+        logging.error("必须指定 --name 和 --symbol")
         sys.exit(1)
+
+    strategy_dir = args.name
+
+    # 定位 overrides 配置文件路径（--config-path 优先，否则默认 strategies/<name>/overrides/<symbol>.yaml）
+    if args.config_path:
+        config_path = Path(args.config_path)
+    else:
+        config_path = Path("strategies") / args.name / "overrides" / f"{args.symbol}.yaml"
+
+    # 读取 overrides 配置（用于补全 interval/version/trading_mode + 策略参数）
+    if config_path.exists():
+        with open(config_path, "r", encoding="utf-8") as f:
+            full_config = yaml.safe_load(f) or {}
+        overrides_section = full_config.get(args.name, {})
+        logging.info(f"加载配置文件: {config_path}")
+    else:
+        logging.warning(f"配置文件不存在: {config_path}，使用空配置")
+        overrides_section = {}
+
+    # 补全 interval/version/trading_mode：CLI > overrides > 默认值
+    interval = args.interval or _read_interval_from_overrides(overrides_section) or "4h"
+    version = args.version or str(overrides_section.get("version", "2"))
+    trading_mode = args.trading_mode or overrides_section.get("trading_mode", "live")
+
+    logging.info(
+        f"参数来源: interval={interval}{'(CLI)' if args.interval else '(overrides)'}, "
+        f"version={version}{'(CLI)' if args.version else '(overrides)'}, "
+        f"trading_mode={trading_mode}{'(CLI)' if args.trading_mode else '(overrides)'}"
+    )
+
+    # 生成标准化 strategy_name（包含 trading_mode）
+    strategy_name = build_strategy_id_from_overrides(
+        args.name, args.symbol, trading_mode,
+        interval=interval, version=version,
+    )
+
+    strategy_config = overrides_section
+    # 覆盖 symbol
+    strategy_config["symbols"] = [args.symbol]
 
     # 确定日志级别：策略配置优先，命令行参数其次，默认 INFO
     log_level_str = resolve_log_level(args.log_level, strategy_config)

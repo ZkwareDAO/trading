@@ -90,7 +90,7 @@ trading-deploy-skill/
 ├── INSTALL.md               # 本文件
 └── templates/               # 模板文件
     ├── deploy.sh            # 部署入口脚本
-    ├── run_strategy.sh      # 策略启动脚本
+    ├── run_strategy.sh      # 单标的调试启动（正式部署走 scripts/run_live_batch.sh）
     ├── git_pull.py          # git pull + 策略分析
     ├── create_config.py     # 运行时配置生成
     ├── data_readiness_check.py  # K线数据就绪检查

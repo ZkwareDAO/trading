@@ -194,43 +194,57 @@ def _extract_date(line: str) -> Optional[str]:
 
 def calculate(strategy_dir: str, symbol: str = "",
               start_date: str = "", end_date: str = "",
-              kline_data_dir: str = "./data/strategies/1m") -> dict:
+              kline_data_dir: str = "./data/klines") -> dict:
     sdir = Path(strategy_dir)
     if not sdir.is_dir():
         return {"error": f"策略目录不存在: {strategy_dir}"}
 
     name = sdir.name
 
-    # 找配置
+    # 找配置：v3.7 单一事实来源是 strategies/<name>/overrides/<SYMBOL>.yaml。
+    # 指定 --symbol 时读该 symbol 的那份；否则取 overrides/ 下第一份作为代表
+    # （指标周期在同策略各 symbol 间通常一致，仅用于估算数据天数）。
+    odir = sdir / "overrides"
+    override_symbols = sorted(
+        f.stem for f in odir.glob("*.yaml")
+        if f.is_file() and not f.name.startswith(".")
+    ) if odir.is_dir() else []
+
     cfg_path = None
-    for cn in ["config.test.yaml", "config.yaml"]:
-        c = sdir / cn
+    if symbol:
+        c = odir / f"{symbol}.yaml"
         if c.is_file():
             cfg_path = str(c)
-            break
+        else:
+            return {
+                "error": f"缺少 per-symbol 配置: {c}",
+                "strategy_name": name,
+                "available_symbols": override_symbols,
+            }
+    elif override_symbols:
+        cfg_path = str(odir / f"{override_symbols[0]}.yaml")
+
     if not cfg_path:
-        for c in sorted(sdir.glob("config*.yaml")):
-            cfg_path = str(c)
-            break
-    if not cfg_path:
-        cd = sdir / "config"
-        if cd.is_dir():
-            for c in sorted(cd.glob("*.yaml")):
-                cfg_path = str(c)
-                break
-    if not cfg_path:
-        return {"error": "未找到策略配置文件", "strategy_name": name}
+        return {
+            "error": f"未找到 per-symbol 配置（{odir}/<SYMBOL>.yaml 不存在）",
+            "strategy_name": name,
+        }
 
     data = _parse_yaml(cfg_path)
     sc = data.get(name, data)
     if not isinstance(sc, dict):
         sc = data
 
-    symbols = sc.get("symbols", [])
-    if isinstance(symbols, str):
-        symbols = [s.strip() for s in symbols.split(',')]
+    # symbols 取 overrides/ 文件名全集，而非单份配置里的 symbols 字段
+    # （每份 overrides 只描述自己那一个 symbol）
     if symbol:
         symbols = [symbol]
+    elif override_symbols:
+        symbols = override_symbols
+    else:
+        symbols = sc.get("symbols", [])
+        if isinstance(symbols, str):
+            symbols = [s.strip() for s in symbols.split(',')]
 
     timeframes = sc.get("timeframes", ["1h"])
     if isinstance(timeframes, str):
@@ -336,7 +350,7 @@ def main():
     p.add_argument("--symbol", default="", help="指定代币")
     p.add_argument("--start", default="", help="回测开始日期 (YYYYMMDD)")
     p.add_argument("--end", default="", help="回测结束日期 (YYYYMMDD)")
-    p.add_argument("--kline-data-dir", default="./data/strategies/1m")
+    p.add_argument("--kline-data-dir", default="./data/klines")
     p.add_argument("--json", action="store_true")
     p.add_argument("--output", default="")
     args = p.parse_args()

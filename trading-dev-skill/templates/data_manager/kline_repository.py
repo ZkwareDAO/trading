@@ -14,6 +14,7 @@ K 线仓库模块 - 轻量级多时间框架更新管理
 - 实时聚合：1m 更新时立即聚合并保存到大周期 CSV
 """
 
+import io
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
@@ -51,6 +52,11 @@ class KlineRepository:
     不存储：
     - K 线数据本身（读取时从 CSV 加载）
     """
+
+    # 尾部重写时向文件末尾回扫的最大字节数。
+    # 增量聚合只重写最后 1-2 根 K 线，1MB 足够覆盖上万行的重叠窗口；
+    # 超出则判定重叠过深，回退全量合并。
+    _TAIL_SCAN_BYTES = 1024 * 1024
 
     def __init__(self, csv_dir: str = "./data/klines"):
         """
@@ -144,17 +150,19 @@ class KlineRepository:
             # 截断到秒级，与 CSV 存储格式对齐（strftime 不带毫秒），确保去重匹配
             df_new["timestamp"] = df_new["timestamp"].dt.floor("s")
 
-        # 与已有数据合并（保留所有列）
+        # 智能合并保存：快速路径直接追加，仅重叠时全量合并
+        if self._smart_merge_save(df_new, filepath, f"{symbol.upper()} {interval}"):
+            return True
+
         if filepath.exists():
+            # 慢速路径：全量合并去重
             try:
                 df_existing = pd.read_csv(filepath)
                 if not df_existing.empty:
-                    # 解析并规范化时间戳
                     df_existing["timestamp"] = pd.to_datetime(
                         df_existing["timestamp"], utc=True
                     )
                     df_combined = pd.concat([df_existing, df_new], ignore_index=True)
-                    # 规范化确保类型一致后再去重
                     df_combined["timestamp"] = pd.to_datetime(
                         df_combined["timestamp"], utc=True
                     )
@@ -216,28 +224,38 @@ class KlineRepository:
                 logger.error(f"save_dataframe_to_csv: 缺少必要列 {col}")
                 return False
 
-        # 与现有 CSV 合并
+        # 智能合并保存：快速路径直接追加，仅重叠时全量合并
+        # 规范化时间戳（与 CSV 存储格式对齐）
+        if pd.api.types.is_numeric_dtype(df_to_save["timestamp"]):
+            df_to_save["timestamp"] = pd.to_datetime(
+                df_to_save["timestamp"], unit="ms", utc=True
+            )
+        else:
+            df_to_save["timestamp"] = pd.to_datetime(
+                df_to_save["timestamp"], utc=True
+            )
+        df_to_save["timestamp"] = df_to_save["timestamp"].dt.floor("s")
+
+        if self._smart_merge_save(df_to_save, filepath, f"{symbol.upper()} {interval}"):
+            return True
+
         if filepath.exists():
+            # 慢速路径：全量合并
             try:
                 df_existing = pd.read_csv(filepath)
                 if not df_existing.empty:
-                    # 解析并规范化时间戳
                     df_existing["timestamp"] = pd.to_datetime(
                         df_existing["timestamp"], utc=True
                     )
-                    # 确保 df_to_save 的时间戳也已规范化（支持毫秒数字和已解析的 datetime）
-                    if pd.api.types.is_numeric_dtype(df_to_save["timestamp"]):
-                        df_to_save["timestamp"] = pd.to_datetime(df_to_save["timestamp"], unit="ms", utc=True)
-                    else:
-                        df_to_save["timestamp"] = pd.to_datetime(df_to_save["timestamp"], utc=True)
-                    # 截断到秒级，与 CSV 存储格式对齐
-                    df_to_save["timestamp"] = df_to_save["timestamp"].dt.floor("s")
-                    df_merged = pd.concat([df_existing, df_to_save], ignore_index=True)
-                    # 规范化确保类型一致后再去重
+                    df_merged = pd.concat(
+                        [df_existing, df_to_save], ignore_index=True
+                    )
                     df_merged["timestamp"] = pd.to_datetime(
                         df_merged["timestamp"], utc=True
                     )
-                    df_to_save = df_merged.sort_values("timestamp").reset_index(drop=True)
+                    df_to_save = df_merged.sort_values("timestamp").reset_index(
+                        drop=True
+                    )
             except Exception as e:
                 logger.warning(f"读取现有 CSV 失败，直接覆盖：{e}")
 
@@ -268,7 +286,7 @@ class KlineRepository:
         Args:
             symbol: 交易对
             timeframe: 时间框架
-            limit: 最大加载条数
+            limit: 最大加载条数（有值时只读尾部，避免加载全量）
 
         Returns:
             DataFrame 对象
@@ -280,11 +298,21 @@ class KlineRepository:
             return None
 
         try:
-            df = pd.read_csv(filepath)
+            if limit:
+                # 有 limit 时只读尾部，避免加载全量 CSV（1m 可达 190 万行）
+                df = self._read_csv_tail(filepath, nrows=limit)
+                if df is None:
+                    # tail 读失败，回退全量读
+                    df = pd.read_csv(filepath)
+                    if "timestamp" in df.columns:
+                        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            else:
+                df = pd.read_csv(filepath)
+                if "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
 
-            # 解析时间戳
-            if "timestamp" in df.columns:
-                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            if df is None or df.empty:
+                return df
 
             # 按时间排序
             df = df.sort_values("timestamp").reset_index(drop=True)
@@ -418,8 +446,18 @@ class KlineRepository:
         Returns:
             是否成功
         """
-        # 从源 CSV 读取数据
-        df_source = self._get_dataframe(symbol, source_tf, limit=5000)
+        # 从源 CSV 读取数据：根据目标周期动态计算需要多少源数据行
+        interval_hours = self._get_interval_hours(target_tf)
+        if interval_hours is not None and interval_hours > 0:
+            # 需要约 2 个目标周期的源数据，4x 安全边际
+            source_minutes_per_period = interval_hours * 60
+            limit = max(1000, source_minutes_per_period * 4)
+        elif interval_hours == 0:
+            limit = 500  # 分钟级目标周期
+        else:
+            limit = 5000  # fallback
+
+        df_source = self._get_dataframe(symbol, source_tf, limit=limit)
 
         if df_source is None or df_source.empty:
             logger.debug(f"{symbol}: 没有 {source_tf} 数据，无法聚合 {target_tf}")
@@ -450,10 +488,14 @@ class KlineRepository:
             logger.debug(f"{symbol} {target_tf}: 聚合结果为空")
             return True
 
-        # 合并到现有 CSV
+        # 智能合并保存
         filepath = self._get_file_path(symbol, target_tf)
 
+        if self._smart_merge_save(df_aggregated, filepath, f"{symbol} {target_tf}"):
+            return True
+
         if filepath.exists():
+            # 慢速路径：全量合并
             try:
                 df_existing = pd.read_csv(filepath)
                 if not df_existing.empty:
@@ -557,26 +599,211 @@ class KlineRepository:
         else:
             return last_ts - pd.Timedelta(days=1)
 
-    def _save_dataframe(self, df: pd.DataFrame, filepath: Path):
-        """保存 DataFrame 到 CSV"""
-        save_df = df.copy()
+    @staticmethod
+    def _format_timestamp_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+        """格式化时间戳列为 UTC 字符串，返回新 DataFrame。
 
-        # 转换时间戳为字符串
-        if save_df["timestamp"].dt.tz is None:
-            save_df = save_df.copy()
-            save_df["timestamp"] = save_df["timestamp"].dt.tz_localize("UTC")
+        格式 "%Y-%m-%d %H:%M:%S+00:00" 与 _try_tail_rewrite 的字节级
+        查找硬编码一致，修改此处必须同步更新 _try_tail_rewrite。
+        """
+        result = df.copy()
+        if result["timestamp"].dt.tz is None:
+            result["timestamp"] = result["timestamp"].dt.tz_localize("UTC")
         else:
-            save_df = save_df.copy()
-            save_df["timestamp"] = save_df["timestamp"].dt.tz_convert("UTC")
-        save_df["timestamp"] = save_df["timestamp"].dt.strftime(
+            result["timestamp"] = result["timestamp"].dt.tz_convert("UTC")
+        result["timestamp"] = result["timestamp"].dt.strftime(
             "%Y-%m-%d %H:%M:%S+00:00"
         )
+        return result
 
-        # 确保目录存在
+    def _save_dataframe(self, df: pd.DataFrame, filepath: Path):
+        """保存 DataFrame 到 CSV"""
+        save_df = self._format_timestamp_for_csv(df)
         filepath.parent.mkdir(parents=True, exist_ok=True)
-
-        # 保存
         save_df.to_csv(filepath, index=False)
+
+    def _read_csv_tail(
+        self, filepath: Path, nrows: int = 500
+    ) -> Optional[pd.DataFrame]:
+        """高效读取 CSV 尾部 N 行，用于时间戳重叠检测。
+
+        小文件 (< 10MB) 直接全量读取；大文件用 seek 只读尾部。
+        返回 None 表示读取失败。
+        """
+        if not filepath.exists():
+            return None
+        try:
+            file_size = filepath.stat().st_size
+            if file_size < 10 * 1024 * 1024:  # < 10MB: 全量读
+                df = pd.read_csv(filepath)
+                if "timestamp" in df.columns:
+                    df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+                return df.tail(nrows)
+
+            # 大文件：seek 到尾部读取，避免读全量
+            # bytes_per_line=80 覆盖 taker_buy_* 等额外列，5x 乘数覆盖估算误差
+            bytes_per_line = 80
+            read_bytes = min(nrows * bytes_per_line * 5, file_size)
+            with open(filepath, "rb") as f:
+                f.seek(max(0, file_size - read_bytes))
+                raw_lines = f.readlines()
+            if len(raw_lines) <= 1:
+                return pd.DataFrame()
+            # 读取 header 拼接到尾部数据前面
+            with open(filepath, "r") as f:
+                header = f.readline()
+
+            csv_text = header + b"".join(raw_lines[1:]).decode("utf-8")
+            df = pd.read_csv(io.StringIO(csv_text))
+            if "timestamp" in df.columns:
+                df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+            return df.tail(nrows)
+        except Exception as e:
+            logger.debug(f"读取 CSV 尾部失败 {filepath}: {e}")
+            return None
+
+    def _append_to_csv(self, df: pd.DataFrame, filepath: Path):
+        """追加 DataFrame 到已有 CSV 文件（不读全量，极快）。
+
+        列顺序与已有 CSV header 对齐，时间戳格式与 _save_dataframe 一致。
+        """
+        existing_cols = pd.read_csv(filepath, nrows=0).columns.tolist()
+        # 对齐列顺序，再格式化时间戳
+        save_df = df[[c for c in existing_cols if c in df.columns]]
+        save_df = self._format_timestamp_for_csv(save_df)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
+        save_df.to_csv(filepath, mode="a", header=False, index=False)
+
+    def _smart_merge_save(
+        self, df_new: pd.DataFrame, filepath: Path, log_label: str
+    ) -> bool:
+        """智能合并保存：依次尝试快速追加和尾部重写，任一成功即返回 True。
+        均不满足时返回 False，调用方应回退到全量合并。
+        """
+        return (
+            self._try_fast_append(df_new, filepath, log_label)
+            or self._try_tail_rewrite(df_new, filepath, log_label)
+        )
+
+    def _try_fast_append(
+        self, df_new: pd.DataFrame, filepath: Path, log_label: str
+    ) -> bool:
+        """尝试快速追加：读尾部检测重叠，无重叠则追加并返回 True。
+
+        有重叠或任何异常返回 False，调用方应回退到全量合并。
+        """
+        if not filepath.exists():
+            return False
+        df_tail = self._read_csv_tail(filepath)
+        if df_tail is None or df_tail.empty:
+            return False
+        latest_existing = df_tail["timestamp"].max()
+        earliest_new = df_new["timestamp"].min()
+        if earliest_new <= latest_existing:
+            return False
+        try:
+            df_to_append = df_new.drop_duplicates(
+                subset=["timestamp"], keep="last"
+            )
+            self._append_to_csv(df_to_append, filepath)
+            logger.info(f"{log_label}: 追加了 {len(df_to_append)} 条 → {filepath}")
+            return True
+        except Exception as e:
+            logger.debug(f"追加 CSV 失败，回退到全量保存：{e}")
+            return False
+
+    def _try_tail_rewrite(
+        self, df_new: pd.DataFrame, filepath: Path, log_label: str
+    ) -> bool:
+        """尝试尾部重写：重叠仅限文件尾部时，truncate 掉重叠行再 append。
+
+        增量聚合每次都会重写未闭合的最后几根 K 线，时间戳必然与 CSV 尾部重叠。
+        全量合并的成本由文件总行数决定；尾部重写只与重叠行数相关。
+
+        用 _read_csv_tail 获取尾部 DataFrame 做内存比对，找到截断点后
+        seek+truncate+append。不逐行解析文件。
+
+        成功返回 True；重叠深入文件中部、或任何异常时返回 False，
+        调用方应回退到全量合并。
+        """
+        if not filepath.exists():
+            return False
+        try:
+            # 1000 行足够覆盖所有周期的尾部重叠窗口。
+            # 增量聚合最多重写 3 个周期的 K 线；1d = 1440 分钟也只需 ~1500 行，
+            # 但 _read_csv_tail 已在内存中完成比对，1000 行足够检测尾部重叠深度。
+            df_tail = self._read_csv_tail(filepath, nrows=1000)
+            if df_tail is None or df_tail.empty:
+                return False
+
+            earliest_new = df_new["timestamp"].min()
+            new_ts = set(df_new["timestamp"].dropna())
+
+            # 在内存中找第一条 >= earliest_new 的行，其字节偏移即截断点
+            tail_ts = df_tail["timestamp"]
+            overlap_mask = tail_ts >= earliest_new
+            if not overlap_mask.any():
+                # 没有重叠 → 纯新增，交给 append 路径
+                return False
+
+            overlap_in_tail = tail_ts[overlap_mask]
+            # 如果重叠行中任何一条不在新数据里，则不是纯尾部覆盖
+            for ts in overlap_in_tail:
+                if ts not in new_ts:
+                    return False
+            # 如果 tail 的第一条就已经重叠，说明重叠可能更深入文件主体
+            if overlap_mask.iloc[0]:
+                return False
+
+            # 找出截断点：最后一条 < earliest_new 的行的位置
+            before_idx = (~overlap_mask).sum() - 1
+            if before_idx < 0:
+                return False
+            truncate_ref_ts = tail_ts.iloc[before_idx]
+
+            # 用字节偏移定位截断点：从尾扫描找到 truncate_ref_ts 所在行
+            file_size = filepath.stat().st_size
+            scan_bytes = min(self._TAIL_SCAN_BYTES, file_size)
+            if scan_bytes <= 0:
+                return False
+            with open(filepath, "rb") as f:
+                f.seek(max(0, file_size - scan_bytes))
+                chunk = f.read(scan_bytes)
+                chunk_start = max(0, file_size - scan_bytes)
+
+            # 丢弃首个不完整行
+            first_nl = chunk.find(b"\n")
+            if first_nl == -1:
+                return False
+            cursor = chunk_start + first_nl + 1
+
+            # 找到 truncate_ref_ts 所在行的末尾偏移 = 截断点
+            ref_bytes = truncate_ref_ts.strftime("%Y-%m-%d %H:%M:%S+00:00").encode()
+            ref_pos = chunk.find(ref_bytes)
+            if ref_pos == -1:
+                return False
+            nl_after = chunk.find(b"\n", ref_pos)
+            if nl_after == -1:
+                return False
+            truncate_at = chunk_start + nl_after + 1
+
+            if truncate_at <= 0:
+                return False
+
+            df_to_write = df_new.drop_duplicates(
+                subset=["timestamp"], keep="last"
+            ).sort_values("timestamp")
+
+            with open(filepath, "r+b") as f:
+                f.truncate(truncate_at)
+            self._append_to_csv(df_to_write, filepath)
+            logger.info(
+                f"{log_label}: 尾部重写 {len(df_to_write)} 条 → {filepath}"
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"尾部重写失败，回退到全量保存：{e}")
+            return False
 
     def get_status(self) -> Dict[str, Any]:
         """获取仓库状态"""

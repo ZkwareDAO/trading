@@ -29,7 +29,8 @@ origin: trading
 |------|------|
 | `/trading-deploy` | 无参数 → 进入交互式引导，一步一步收集参数 |
 | `/trading-deploy run` | 完整部署流程（Phase 0→5） |
-| `/trading-deploy run --strategy NAME` | 部署指定策略 |
+| `/trading-deploy run --strategy NAME [--symbols S1,S2]` | 部署指定策略（symbols 默认取 overrides 全集） |
+| `/trading-deploy run --strategy NAME --symbols S1 --init-configs` | 为缺 overrides 的代币自动创建配置（Phase 2.5） |
 | `/trading-deploy run --git-url URL` | 指定 git 地址部署 |
 | `/trading-deploy analyze` | 只分析策略结构（Phase 2） |
 | `/trading-deploy prepare-data` | 只准备K线数据（Phase 3） |
@@ -161,15 +162,39 @@ Step 4: 汇总确认 → 用户确认后进 Phase 0
 ## Phase 0: 环境预检
 
 ```bash
-PYTHON_CMD="${PYTHON_CMD:-python3}"
-$PYTHON_CMD --version &>/dev/null && echo "✅ Python" || echo "❌ Python 不可用（阻塞）"
+PROJECT_DIR="${PROJECT_DIR:-.}"
+
+# 项目根目录必须含 run_strategy.py（v3.7 实盘入口）
+[ -f "${PROJECT_DIR}/run_strategy.py" ] \
+    && echo "✅ 项目根目录: $PROJECT_DIR" \
+    || echo "❌ run_strategy.py 不存在（阻塞）"
+
+# 实盘启动 wrapper（本 skill 经它启动，共用 cta_strategy_core.pid）
+[ -f "${PROJECT_DIR}/scripts/run_live_batch.sh" ] \
+    && echo "✅ scripts/run_live_batch.sh" \
+    || echo "❌ scripts/run_live_batch.sh 不存在（阻塞，需模板 v3.7+）"
+
+# 探测 Python：模板依赖装在 .venv，很多环境没有 python3 这个名字
+if [ -z "${PYTHON_CMD:-}" ]; then
+    if [ -x "${PROJECT_DIR}/.venv/bin/python" ]; then
+        PYTHON_CMD="${PROJECT_DIR}/.venv/bin/python"
+    elif command -v python3 &>/dev/null; then
+        PYTHON_CMD="python3"
+    else
+        PYTHON_CMD="python"
+    fi
+fi
+$PYTHON_CMD -c 'import sys' &>/dev/null && echo "✅ Python: $PYTHON_CMD" || echo "❌ Python 不可用（阻塞）"
 git --version &>/dev/null && echo "✅ git" || echo "❌ git 不可用（阻塞）"
-KLINE_DIR="${KLINE_DATA_DIR:-./data/strategies/1m}"
+
+KLINE_DIR="${KLINE_DATA_DIR:-./data/klines}"
 [ -d "$KLINE_DIR" ] && echo "✅ K线目录: $KLINE_DIR" || echo "⚠ K线目录不存在"
 ```
 
 | 检测项 | 不达标 |
 |--------|--------|
+| `run_strategy.py` 存在 | **阻塞** |
+| `scripts/run_live_batch.sh` 存在 | **阻塞** |
 | Python | **阻塞** |
 | git | **阻塞** |
 | K线目录 | 非阻塞（Phase 3 可创建） |
@@ -184,7 +209,7 @@ KLINE_DIR="${KLINE_DATA_DIR:-./data/strategies/1m}"
 |--------|------|--------|
 | `STRATEGIES_GIT_URL` | Phase 2 | 无 |
 | `STRATEGIES_DIR` | 全流程 | ./strategies |
-| `KLINE_DATA_DIR` | Phase 3+ | ./data/strategies/1m |
+| `KLINE_DATA_DIR` | Phase 3+ | ./data/klines |
 | `LOGS_DIR` | 全流程 | ./logs |
 | `DEPLOY_OUTPUTS_DIR` | Phase 4+ | ./deploy_outputs |
 
@@ -195,7 +220,7 @@ KLINE_DIR="${KLINE_DATA_DIR:-./data/strategies/1m}"
 ### Step 1: git pull
 
 ```bash
-python3 git_pull.py \
+$PYTHON_CMD git_pull.py \
     --git-url "${STRATEGIES_GIT_URL}" \
     --strategies-dir "${STRATEGIES_DIR}" \
     --branch "${GIT_BRANCH:-main}"
@@ -210,7 +235,7 @@ python3 git_pull.py \
 ### Step 2: AI 分析策略配置
 
 ```bash
-python3 git_pull.py --analyze --strategy "${STRATEGY_NAME}"
+$PYTHON_CMD git_pull.py --analyze --strategy "${STRATEGY_NAME}"
 ```
 
 **分析输出**：
@@ -219,7 +244,7 @@ python3 git_pull.py --analyze --strategy "${STRATEGY_NAME}"
 ============================================================
   AI 策略分析 — ema_rsi
 ============================================================
-  配置:       config.test.yaml
+  配置:       overrides/BTCUSDT.yaml（共 3 个代币）
   代币:       BTCUSDT, ETHUSDT, SOLUSDT
   时间框架:   4h, 1h
   方向:       neutral
@@ -240,12 +265,48 @@ python3 git_pull.py --analyze --strategy "${STRATEGY_NAME}"
 
 ---
 
+## Phase 2.5: per-symbol 配置初始化（init_overrides.py） ← NEW
+
+git pull 拉来的策略未必有目标代币的 `overrides/<SYMBOL>.yaml`。这一步补上它，
+**必须排在 Phase 3 和 Phase 4 之前**：
+
+| 后续环节 | 缺配置时的表现 |
+|----------|---------------|
+| Phase 3 K线数据准备 | 需求天数是从 overrides 的 `timeframes` + 指标周期算出的，缺配置算不出要下多少 |
+| Phase 4 配置校验 | `--check` 直接判 ISSUE，退出码 1，拒绝启动 |
+| Phase 5 启动 | wrapper 的 `precheck_overrides` 拒绝整批 |
+
+```bash
+$PYTHON_CMD init_overrides.py \
+    --strategy-dir "${STRATEGIES_DIR}/${STRATEGY_NAME}" \
+    --symbols "${SYMBOLS}" \
+    --dry-run          # 先看会建什么，确认后去掉
+
+$PYTHON_CMD init_overrides.py \
+    --strategy-dir "${STRATEGIES_DIR}/${STRATEGY_NAME}" \
+    --symbols "${SYMBOLS}"
+```
+
+模板来源优先级：**同策略已有 override**（结构完整、参数调过，复制它保证新老
+代币口径一致）→ `.strategy-spec.yaml` 的 `default_params`（只够拼骨架，
+缺 `capital`/`risk`/`signal` 及若干 timeframe 参数，需人工复核）→ 报错。
+
+**⚠ 新建配置一律 `trading_mode: paper_trading`**，即使模板那份是 live。
+新代币未经回测验证就继承 live 会直接下真单。要上实盘必须人工改这一行。
+
+创建后把参数展示给用户，问是否需要调整，用户要改则直接编辑对应 YAML。
+
+**开关**：`--init-configs`。默认关闭 —— 写盘动作且参数需复核，
+不该在用户没要求时静默发生。
+
+---
+
 ## Phase 3: K线数据准备（loop）
 
 ### Step 1: 计算数据需求
 
 ```bash
-python3 calc_data_requirements.py \
+$PYTHON_CMD calc_data_requirements.py \
     --strategy-dir "${STRATEGIES_DIR}/${STRATEGY_NAME}" \
     --kline-data-dir "${KLINE_DATA_DIR}"
 ```
@@ -255,7 +316,7 @@ python3 calc_data_requirements.py \
 ### Step 2: 数据就绪检查 → loop
 
 ```bash
-python3 data_readiness_check.py \
+$PYTHON_CMD data_readiness_check.py \
     --strategy-dir "${STRATEGIES_DIR}/${STRATEGY_NAME}" \
     --symbols "${SYMBOLS}" \
     --kline-data-dir "${KLINE_DATA_DIR}" \
@@ -282,23 +343,71 @@ python3 data_readiness_check.py \
 
 ---
 
-## Phase 4: 创建配置文件
+## Phase 4: 配置校验（不生成 runtime config）
 
-### Step 1: 生成运行时配置
+v3.7 起策略参数的唯一事实来源是 `strategies/<name>/overrides/<SYMBOL>.yaml` ——
+实盘 `run_strategy.py` 与回测 `run_backtest.py` 读的都是这一份，
+"回测不失真"正是靠这个单一来源保证的。
+
+因此本阶段**不再生成** `{strategy}-runtime.yaml`。早期版本会合成这样一份文件，
+但模板没有任何代码消费它：真正生效的仍是 `overrides/<SYMBOL>.yaml`，
+那份合成文件只会让人误以为改它就能改参数。
+
+### Step 1: 校验 per-symbol 配置齐备性
 
 ```bash
-python3 create_config.py \
+$PYTHON_CMD create_config.py \
     --strategy-dir "${STRATEGIES_DIR}/${STRATEGY_NAME}" \
     --symbols "${SYMBOLS}" \
-    --output "${DEPLOY_OUTPUTS_DIR}/${DEPLOY_DATE}/${STRATEGY_NAME}-runtime.yaml"
+    --check
 ```
 
-**生成配置包含**：策略参数 + 资金/杠杆/风控 + WebSocket URL + 日志设置
+**校验内容**：
 
-### Step 2: 用户确认
+| 检查项 | 不通过时 |
+|--------|----------|
+| `overrides/<SYMBOL>.yaml` 存在 | **ISSUE** — 退出码 1，拒绝启动 |
+| `trading_mode` 合法（live/paper_trading/smoking） | **ISSUE** |
+| `trading_mode` 未设置 | **WARN** — 框架按 `live` 处理，会下真单 |
+| `enabled: false` | **WARN** — manager 会跳过它 |
+| `timeframes` 缺失 | **WARN** |
+
+**⚠ trading_mode 缺省即 live**：`run_strategy.py` 与
+`run_strategies_manager.py` 在 overrides 未声明时都按 `live` 处理，直接下真单。
+
+**首次部署必须去改 `overrides/<SYMBOL>.yaml`，写上
+`trading_mode: paper_trading`** —— 不能靠命令行。v3.7 已删除"命令行覆盖
+trading_mode"的能力（那是回测实盘不一致的来源），`scripts/run_live_batch.sh`
+也没有 `--trading-mode` 参数。
+
+本 skill 的 `--trading-mode` 只是**断言**：与 overrides 实际值不符时
+Phase 5 直接报错退出，提示你去改唯一来源。它不会改变任何实际行为。
+
+### Step 2（可选）: 登记进编排表
+
+把策略写入项目的 `config/strategies.yaml`（编排层，实盘回测共用）：
+
+```bash
+$PYTHON_CMD create_config.py \
+    --strategy-dir "${STRATEGIES_DIR}/${STRATEGY_NAME}" \
+    --symbols "${SYMBOLS}" \
+    --check --register \
+    --project-dir "${PROJECT_DIR}" \
+    --trading-mode paper_trading \
+    --dry-run          # 先看会改什么，确认后去掉此参数
+```
+
+登记后可用项目自带的 `./start.sh` 一次拉起全部编排（单进程托管）。
+
+**注意 `--trading-mode` 在这里含义不同**：`--register` 是**写入**动作 ——
+把该值写进 `config/strategies.yaml` 的登记项，是真实生效的配置。
+而 Phase 5 启动时的 `--trading-mode` 只是**断言**（校验 overrides，不覆盖）。
+两者同名但一个写、一个只读。
+
+### Step 3: 用户确认
 
 ```
-📋 运行时配置已生成，确认启动？(y/n/edit)
+📋 配置校验通过，确认启动？(y/n/edit)
 ```
 
 ---
@@ -308,29 +417,54 @@ python3 create_config.py \
 ### Step 1: WebSocket 验证（可选）
 
 ```bash
-python3 subscribe_websocket.py \
+$PYTHON_CMD subscribe_websocket.py \
     --symbol "${FIRST_SYMBOL}" \
     --test --timeout 30
 ```
 
 ### Step 2: 启动策略
 
+**转调模板自带的 `scripts/run_live_batch.sh`，不要自己 nohup
+`run_strategy.py`。**
+
+理由是安全而非洁癖：wrapper 用的 PID 文件是 `cta_strategy_core.pid` ——
+与模板 `start.sh` / `stop.sh` 同一个。自己 nohup 起的进程不在 `stop.sh`
+管辖范围内，一旦忘记手动 kill，就是"以为停了、实际还在下单"的孤儿进程。
+实盘场景下这是钱的问题。
+
 ```bash
-bash run_strategy.sh \
-    --strategy "${STRATEGY_NAME}" \
-    --config "${DEPLOY_OUTPUTS_DIR}/${DEPLOY_DATE}/${STRATEGY_NAME}-runtime.yaml" \
-    --log-dir "${LOGS_DIR}" \
-    --background
+(cd "${PROJECT_DIR}" && bash scripts/run_live_batch.sh \
+    --strategies "${STRATEGY_NAME}" \
+    --symbols "${SYMBOLS}" \
+    --daemon \
+    --yes)
 ```
 
-**输出**：
+**⚠ 整体重启语义**：wrapper 启动前会 kill 已有 manager 并
+`pkill -9 -f "python.*run_strategies_manager.py"`，然后用**一个**
+`run_strategies_manager.py` 进程托管全部 (策略, 代币)。所以本次部署会
+**连带重启当前在跑的其它策略实例**。执行前必须向用户说明这一点。
 
-```
-✅ 策略已启动
-  策略: ema_rsi | PID: 12345
-  日志: logs/ema_rsi-20260810.log
-  监控: tail -f logs/ema_rsi-20260810.log
-```
+**⚠ wrapper 没有 `--trading-mode`**：v3.7 中 `trading_mode` 的唯一来源是
+`overrides/<SYMBOL>.yaml`（登记表模式下是 `config/strategies.yaml`）。
+若用户传了 `--trading-mode`，**只能当断言用** —— 与 overrides 实际值不符
+时报错并退出，让用户去改唯一来源，而不是在命令行悄悄覆盖。命令行覆盖正是
+"回测实盘参数不一致"的来源，模板刻意删掉了这个能力。
+
+**`--yes` 的作用**：跳过 wrapper 的任务数确认（> 3 个实例）与 live 模式
+手输 `live` 确认。deploy 自己在 Phase 4 已做过 live 确认，此处重复交互在
+非 TTY 下会直接卡死。
+
+参数文件由 `--strategies` + `--symbols` 推导为
+`strategies/<name>/overrides/<SYMBOL>.yaml`；
+`interval` / `version` / `trading_mode` 都从该文件自动读取，无需显式传。
+
+**停止**：`cd "${PROJECT_DIR}" && ./stop.sh`
+
+**替代方案 — 全量托管启动**：项目自带的 `./start.sh` 会读
+`config/strategies.yaml` 编排表拉起全部登记实例。想跑登记表而非临时清单
+时用它；`run_live_batch.sh --registry config/strategies.yaml` 等价且多一层
+模式提示。
 
 ---
 
@@ -342,7 +476,7 @@ bash run_strategy.sh \
 |------|--------|------|
 | `STRATEGIES_GIT_URL` | — | 策略 git 仓库 |
 | `STRATEGIES_DIR` | ./strategies | 策略本地目录 |
-| `KLINE_DATA_DIR` | ./data/strategies/1m | K线数据目录 |
+| `KLINE_DATA_DIR` | ./data/klines | K线数据目录（须与 settings.yaml 的 csv_dir 一致） |
 | `LOGS_DIR` | ./logs | 日志目录 |
 | `DEPLOY_OUTPUTS_DIR` | ./deploy_outputs | 部署产物目录 |
 
@@ -357,10 +491,15 @@ bash run_strategy.sh \
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `DEFAULT_CAPITAL` | 10000 | 默认资金 (USDT) |
-| `DEFAULT_LEVERAGE` | 1 | 默认杠杆 |
-| `MAX_POSITIONS` | 3 | 最大持仓数 |
-| `POSITION_SIZE_PCT` | 0.1 | 仓位比例 |
+| `PROJECT_DIR` | `.` | CTA 项目根目录（含 `run_strategy.py`） |
+| `TRADING_MODE` | 空 | `live` / `paper_trading` / `smoking`；留空则由 overrides 决定，**而 overrides 缺省时框架按 live 处理** |
+| `REGISTER` | false | 是否登记进 `config/strategies.yaml` |
+
+**资金 / 杠杆 / 仓位不由环境变量配置。** 唯一来源是
+`strategies/<name>/overrides/<SYMBOL>.yaml` 的 `capital` / `risk` 段
+（实盘与回测读的都是那一份）。早期版本的 `DEFAULT_CAPITAL` /
+`DEFAULT_LEVERAGE` / `MAX_POSITIONS` / `POSITION_SIZE_PCT` 已移除 ——
+它们只写进那份没人消费的 runtime config，设了也不生效。
 
 ---
 
@@ -381,8 +520,8 @@ Phase -1: 交互式引导（无参数/参数不全时）  ← NEW
 Phase 0: 环境预检 → Phase 1: 配置初始化
   → Phase 2: git pull + AI 分析 + 用户确认
   → Phase 3: K线数据准备 loop
-  → Phase 4: 创建配置文件 + 用户确认
-  → Phase 5: WebSocket 验证 + 启动策略
+  → Phase 4: 配置校验（+ 可选登记编排表）+ 用户确认
+  → Phase 5: WebSocket 验证 + 逐 symbol 启动策略
 ```
 
 ---

@@ -1,4 +1,3 @@
-# NOTE: IP addresses in this test are mock values, not real endpoints
 #!/usr/bin/env python3
 """
 测试 FactoryClient — 与 cta_factory_service 的通信封装
@@ -313,7 +312,7 @@ class TestFactoryClientQueryPositions:
         return FactoryClient(
             factory_endpoint="http://127.0.0.1:8888",
             callback_url="http://127.0.0.1:8892",
-            position_proxy_url="http://127.0.0.1:8889",
+            position_proxy_url="http://203.0.113.11:8889",
         )
 
     def _mock_api_response(self, response_data):

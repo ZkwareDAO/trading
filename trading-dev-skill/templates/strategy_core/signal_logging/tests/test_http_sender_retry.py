@@ -1,4 +1,3 @@
-# NOTE: IP addresses in this test are mock values, not real endpoints
 #!/usr/bin/env python3
 """
 测试 HTTP 信号发送器重试机制
@@ -38,7 +37,7 @@ class TestHttpSenderRetry:
     def test_retry_on_connection_error(self, caplog):
         """连接失败时应自动重试"""
         retry_config = RetryConfig(max_retries=3, base_delay=0.1, max_delay=1.0)
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888", retry_config=retry_config)
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888", retry_config=retry_config)
 
         signal = self._make_signal()
 
@@ -66,7 +65,7 @@ class TestHttpSenderRetry:
     def test_retry_on_server_error(self, caplog):
         """服务器错误时应自动重试"""
         retry_config = RetryConfig(max_retries=3, base_delay=0.1, max_delay=1.0)
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888", retry_config=retry_config)
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888", retry_config=retry_config)
 
         signal = self._make_signal()
 
@@ -91,7 +90,7 @@ class TestHttpSenderRetry:
     def test_max_retries_exhausted(self, caplog):
         """重试耗尽后应返回 False"""
         retry_config = RetryConfig(max_retries=3, base_delay=0.1, max_delay=1.0)
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888", retry_config=retry_config)
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888", retry_config=retry_config)
 
         signal = self._make_signal()
 
@@ -109,7 +108,7 @@ class TestHttpSenderRetry:
     def test_no_retry_on_success(self, caplog):
         """成功时不应重试"""
         retry_config = RetryConfig(max_retries=3, base_delay=0.1, max_delay=1.0)
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888", retry_config=retry_config)
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888", retry_config=retry_config)
 
         signal = self._make_signal()
 
@@ -128,7 +127,7 @@ class TestHttpSenderRetry:
     def test_exponential_backoff(self, caplog):
         """重试应使用指数退避"""
         retry_config = RetryConfig(max_retries=3, base_delay=0.1, max_delay=1.0)
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888", retry_config=retry_config)
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888", retry_config=retry_config)
 
         signal = self._make_signal()
 
@@ -155,7 +154,7 @@ class TestHttpSenderRetry:
 
     def test_default_retry_config(self):
         """默认重试配置应为 3 次"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
         assert sender.retry_config.max_retries == 3
         assert sender.retry_config.base_delay == 1.0
         assert sender.retry_config.max_delay == 10.0
@@ -163,7 +162,7 @@ class TestHttpSenderRetry:
     def test_disable_retry(self, caplog):
         """禁用重试时只尝试一次"""
         retry_config = RetryConfig(max_retries=0, base_delay=0.1, max_delay=1.0)
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888", retry_config=retry_config)
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888", retry_config=retry_config)
 
         signal = self._make_signal()
 

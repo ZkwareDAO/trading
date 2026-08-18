@@ -1,9 +1,14 @@
 # Trading Discovery Skill — 全局配置模板
 # 复制为 config.yaml 并根据实际环境修改
+#
+# 注意：本文件只配置 Discovery 自身的运行方式。
+# 策略参数（周期/阈值/止损/资金）的唯一来源是
+#   strategies/<name>/overrides/<SYMBOL>.yaml
+# 在这里写策略参数不会有任何效果。
 
 # ===== 回测配置 =====
 discovery:
-  # 默认并行数
+  # 默认并发数（写入自动生成的 run-profile 的 max_workers）
   parallel: 1
   # 默认时间范围（可被命令行参数覆盖）
   default_start: ""
@@ -16,16 +21,22 @@ paths:
   project_dir: /path/to/your/cta_project
   # 策略代码目录（相对于 project_dir 或绝对路径）
   strategies_dir: ./strategies
-  # Discovery 结果输出目录
+  # Discovery 结果输出目录（写入 run-profile 的 output_dir）
   discovery_outputs_dir: ./discovery_outputs
   # 日志输出目录
   logs_dir: ./logs
 
 # ===== 回测引擎配置 =====
 backtest:
-  # Python 命令
-  python_cmd: python3
-  # K 线数据根目录
-  data_dir: ./data
-  # 1m K 线数据目录
-  kline_data_dir: ./data/strategies/1m
+  # Python 命令。留空则自动探测 project_dir/.venv/bin/python → python3 → python
+  # （模板依赖装在 .venv 里，且不少环境没有 python3 这个名字）
+  python_cmd: ""
+  # K 线数据目录。必须与项目 config/settings.yaml 的 data_manager.csv_dir 一致
+  # —— run-profile 的 data_dir 由 make_profile.py 照抄该值，
+  #    不一致时模板启动即报错退出（verify_data_dir_consistency）。
+  kline_data_dir: ./data/klines
+  # run-profile 名：生成 project_dir/config/<name>.yaml，运行结束自动删除
+  profile: discovery
+  # 回测核算口径（与策略层 capital.max_cash 语义不同）
+  cash: 5000
+  commission: 0.0004

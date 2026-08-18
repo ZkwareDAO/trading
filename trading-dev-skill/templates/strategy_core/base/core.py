@@ -8,7 +8,10 @@
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Callable, TypeVar, Generic, List
+import logging
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from .state import BaseState
 from .risk_config import RiskControlConfig
@@ -216,7 +219,9 @@ class BaseStrategyCore(ABC, Generic[StateType]):
         action = "sell_close" if is_long else "buy_close"
 
         # 通知平仓回调（在清除状态之前）
-        if state.position_id:
+        # 即使 position_id 为 None 也要调用，确保持久化文件被清理
+        # （部分策略入场时未生成 position_id，导致 JSON 残留）
+        try:
             self._notify_position_exit(
                 symbol=symbol,
                 state=state,
@@ -225,9 +230,14 @@ class BaseStrategyCore(ABC, Generic[StateType]):
                 is_stop_loss=is_stop_loss,
                 exit_time=exit_time,
             )
-
-        # 清除状态
-        state.clear_position(record_stop_loss=is_stop_loss, current_time=exit_time)
+        except Exception:
+            logger.warning(
+                f"[{symbol}] _notify_position_exit 异常，继续清除状态",
+                exc_info=True,
+            )
+        finally:
+            # 清除状态（无论回调是否成功）
+            state.clear_position(record_stop_loss=is_stop_loss, current_time=exit_time)
 
         return action
 

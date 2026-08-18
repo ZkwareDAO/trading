@@ -8,7 +8,7 @@
     },
     "homepage": "https://github.com/ZkwareDAO/trading",
     "repository": "https://github.com/ZkwareDAO/trading",
-    "license": "MIT",
+    "license": "Apache-2.0",
     "commands": "./commands/",
     "keywords": [
         "trading",

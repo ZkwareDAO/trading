@@ -88,8 +88,22 @@ strategy_core.log
 # ============================================
 # Data & Signals (Generated at runtime)
 # ============================================
-data/
+# 默认屏蔽 data/ 下所有运行时产物（K线缓存、信号 CSV、仓位快照）。
+# 例外：放行 data/klines/ 下的开箱示例数据（BTCUSDT 30 天，约 2.7MB），
+# 让新用户 clone 后无需下载即可跑通一次回测。
+data/*
 !data/.gitkeep
+!data/klines/
+data/klines/*
+!data/klines/.gitkeep
+!data/klines/1m/
+!data/klines/4h/
+data/klines/1m/*
+data/klines/4h/*
+!data/klines/1m/.gitkeep
+!data/klines/4h/.gitkeep
+!data/klines/1m/BTCUSDT_1m.csv
+!data/klines/4h/BTCUSDT_4h.csv
 
 # ============================================
 # Local Configuration
@@ -103,6 +117,7 @@ data/
 .env
 .env.local
 .env.*.local
+scripts/frontend_data.env
 
 # ============================================
 # OS Generated Files
@@ -152,26 +167,21 @@ backtest_output*/
 backtest_results/
 backtest_log.txt
 signal_comparison_output/
+frontend_data/
 nohup.out
 
 # ============================================
-# Backtest Config (User-specific)
+# Backtest Config
 # ============================================
-# 忽略用户配置
-backtest/config/main.yaml
-backtest/config/strategies.yaml
-backtest/config/*/
-# 但保留模板
-!backtest/config/main.example.yaml
-!backtest/config/example/
-
-# 回测配置目录（不上传）
-config/backtest/
-config/backtest2/
-config/backtest_*.yaml
+# 配置已收敛到 config/ 三层模型 + config/backtest.yaml（run-profile），全部入库。
+# 原先的 backtest/config/ 与 config/backtest*/ 配置族已删除（配置分叉源头），
+# 对应的 8 条忽略规则同时移除：留着会误伤 config/backtest.yaml —— 它必须入库，
+# 否则新克隆的仓库跑回测会报"profile 文件不存在"。
+# 用户私有值走 .env（见下方 Secrets 段），不再靠 gitignore 排除配置文件。
 
 # 图表输出目录
 charts/
 
 cta_strategy_core.pid
 skills
+.claude/

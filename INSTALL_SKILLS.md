@@ -96,7 +96,7 @@ ls -la ~/.claude/skills/trading-*
 | 命令 | 说明 |
 |------|------|
 | `/trading-dev new` | 新建策略项目 |
-| `/trading-discover run --symbols BTCUSDT --strategies ema_rsi --start 20260601` | 多策略回测探索 |
+| `/trading-discovery run --symbols BTCUSDT --strategies ema_rsi --start 20260601` | 多策略回测探索 |
 | `/trading-deploy run` | 策略部署上线 |
 | `/trading-replay run` | 每日备份 + 回放 |
 

@@ -1,446 +1,349 @@
 # CTA 策略回测框架
 
-基于 `backtrader` + 真实 CTA 策略。
+基于 `backtrader` 驱动**真实策略代码**——回测与实盘跑同一个 `BaseStrategy.on_kline()`，
+读同一份策略参数（`strategies/<name>/overrides/<SYM>.yaml`）。这是"回测结果可信"的前提。
 
 ## 架构
 
 ```
 backtest/
-├── run_backtest.py        # 回测入口 CLI
-├── bt_strategy.py          # backtrader ↔ CTA 策略桥接层
+├── run_backtest.py         # 回测入口 CLI（8 个参数）
+├── bt_strategy.py          # backtrader ↔ CTA 策略桥接层（模拟 WS 推送）
 ├── signal_mapper.py        # Signal → buy/sell/close 映射
 ├── batch_runner.py         # 批量回测执行器（subprocess 并发）
 ├── backtest_reporter.py    # 报告生成 (CSV/TXT/JSON)
 ├── analyzer.py             # 回测分析器（权益曲线、回撤、图表）
-├── config_loader.py        # 回测配置加载
+├── config_loader.py        # 配置加载（load_main_config / parse_date / merge）
 ├── backtest_resample.py    # 数据重采样
 ├── chart_generator.py      # 图表生成
 └── tests/                  # 单元测试
 ```
+
+**桥接原理**：`BacktestBTStrategy` 每根 1m bar 调用
+`data_manager._on_kline_received(kline)` 模拟实盘 WS 推送，再调 `strategy.on_kline()`。
+策略代码完全不知道自己在回测中——不存在"回测专用分支"。
 
 ## 快速开始
 
 ### 前置条件
 
 ```bash
-pip install backtrader
+pip install -r requirements.txt   # 含 backtrader、TA-Lib
 ```
+
+仓库自带 30 天 BTCUSDT 示例数据（`data/klines/1m/BTCUSDT_1m.csv`），可直接跑。
 
 ### 单次回测
 
 ```bash
-# 通用格式
-python -m backtest.run_backtest \
-  --strategy <策略简称> \
-  --start <开始日期 YYYYMMDD> \
-  --end <结束日期 YYYYMMDD> \
-  --symbol <交易对> \
-  [--timeframe <K线周期>] \
-  [--data-dir <数据目录>] \
-  [--output-dir <输出目录>] \
-  [--cash <初始资金>] \
-  [--commission <手续费率>] \
-  [--log-level <日志级别>] \
-  [--config <配置文件路径>]
-
-# 各策略示例
-python -m backtest.run_backtest --strategy rbreaker --start 20260101 --end 20260331 --symbol btcusdt
-python -m backtest.run_backtest --strategy trend --start 20260101 --end 20260331 --symbol btcusdt
-python -m backtest.run_backtest --strategy ict --start 20260101 --end 20260331 --symbol btcusdt
-python -m backtest.run_backtest --strategy trend_strength --start 20260101 --end 20260331 --symbol btcusdt
-
-# 性能优化：使用 WARNING 日志级别减少 IO 开销
-python -m backtest.run_backtest --strategy obv --start 20260501 --end 20260514 --symbol ETHUSDT --log-level WARNING
+python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260610 --end 20260708
 ```
 
-### 参数说明
+回测**不依赖任何外部服务**——回测链路不初始化 factory 与 signal hub 客户端（由代码保证，非配置开关）。
+
+### CLI 参数（7 个）
 
 | 参数 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--strategy` | 是 | - | 策略简称或完整目录名 |
-| `--start` | 是 | - | 开始日期（YYYYMMDD） |
-| `--end` | 否 | 当前时间 | 结束日期（YYYYMMDD） |
-| `--symbol` | 否 | BTCUSDT | 交易对，支持逗号分隔多个 |
-| `--timeframe` | 否 | 1m | K 线周期（回测强制使用 1m） |
-| `--data-dir` | 否 | ./data/strategies | K 线数据目录 |
-| `--output-dir` | 否 | ./backtest_output | 回测输出目录 |
-| `--cash` | 否 | 100000 | 初始资金 |
-| `--commission` | 否 | 0.0 | 手续费率 |
-| `--log-level` | 否 | INFO | 日志级别（DEBUG/INFO/WARNING/ERROR） |
-| `--config` | 否 | strategies/{strategy}/config.test.yaml | 策略配置文件路径 |
+| `--strategies` | 是 | - | 运行清单 `name:symbol`，格式与实盘 `--run` 一致；symbol 唯一来源 |
+| `--start` | 是 | - | 开始日期（YYYYMMDD / 秒 / 毫秒时间戳） |
+| `--end` | 否 | 当前时间 | 结束日期，覆盖 `profile.end` |
+| `--profile` | 否 | `backtest` | run-profile，读 `config/<name>.yaml` |
+| `--config-path` | 否 | 按 overrides 推导 | 策略配置完整路径，与实盘同名参数一致 |
+| `--overrides` | 否 | - | 字段覆盖（JSON 字符串） |
+| `--log-level` | 否 | 跟 profile | DEBUG/INFO/WARNING/ERROR |
 
-### 策略简称映射
+单次回测**只跑一个 `name:symbol`**，多个请用 `batch_runner`。
 
-| 简称 | 策略目录 | 时间框架 |
-|------|----------|----------|
-| `rbreaker` | `cta_rbreaker_v3` | 15m |
-| `trend` | `cta_trend` | 15m |
-| `ict` | `cta_ict_v3` | 1d, 4h, 15m |
-| `trend_strength` | `cta_trend_strength` | 1d, 4h, 15m |
-| `dolphin` | `dolphin_trading_v2` | 4h, 1h, 15m |
-| `obv` | `obv_atr_v2` | 4h, 1h |
+**已删除的参数**（v3.7 配置收敛）：`--strategy`、`--config`、`--symbol`、`--timeframe`、
+`--data-dir`、`--output-dir`、`--cash`、`--commission`、
+`--use-today-as-output-date`、`--use-end-date-as-output-date`。
+
+这些不是"简化掉了"，而是**移到了它们该在的层**：
+
+| 原 CLI 参数 | 现在从哪读 |
+|-------------|-----------|
+| `--timeframe` `--data-dir` `--output-dir` `--cash` `--commission` 输出日期模式 | `config/backtest.yaml` |
+| `--strategy` `--config` | `--strategies name:symbol` → `strategies/<name>/overrides/<SYM>.yaml` |
+
+理由：策略参数（周期 / 资金 / 风控 / 交易所）由 CLI 覆盖，就等于回测与实盘读两份
+不同的参数——那是**回测失真**，性质等同未来函数。详见
+[docs/CONFIG_UNIFICATION_SPEC.md](../docs/CONFIG_UNIFICATION_SPEC.md)。
+
+### run-profile
+
+`config/backtest.yaml` 只承载**回测的运行方式**。
+
+回测读**两份**配置：`config/settings.yaml`（与实盘共用，提供
+`use_bar_high_low_for_exit` —— 决定止损止盈用 K 线 high/low 还是收盘价判定，
+影响成交次数与 PnL）+ 本文件。两者键集合不相交，无覆盖关系：
+
+```yaml
+start: "20260601"
+end: ""
+cash: 5000
+commission: 0.0004      # 币安合约 taker 0.04%
+data_dir: "./data/klines"   # 必须与 settings.yaml 的 csv_dir 一致，启动时校验
+output_dir: "./backtest_output"
+use_today_as_output_date: true
+log_level: "INFO"
+max_workers: 4
+```
+
+以上 9 个键**全部有代码消费**。profile 里不写没人读的"说明性配置" ——
+早期版本曾写 `mode: backtest` 与 `signal_hub.enabled: false` /
+`strategy_engine.factory_enabled: false`，但回测不初始化推送与 factory 客户端，
+"回测不推信号"由链路本身保证，那三个键从未生效，
+反而与 `settings.yaml`（其中 `signal_hub.enabled: true`）形成"两处不同值"的假象，
+已删除。
+
+### `--profile`：参数集存档（可选）
+
+`--profile` 默认 `backtest`，即读 `config/backtest.yaml`。**日常回测不需要传这个参数**：
+
+```bash
+# 这两条命令完全等价
+python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260610
+python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260610 --profile backtest
+```
+
+它的用途是**换一套参数而不改动入库文件**。调参是量化开发的日常（试不同初始资金、
+手续费口径、并发数），但直接改 `config/backtest.yaml` 有两个问题：容易误提交，
+以及"上次那轮跑的什么参数"不可追溯。一个 profile 文件 = 一套有名字、可存档、
+可复现的参数集：
+
+```bash
+cp config/quick.example.yaml config/myrun.yaml   # 改 cash / commission / max_workers
+python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT \
+  --start 20260610 --end 20260708 --profile myrun
+```
+
+`config/quick.example.yaml` 是可直接使用的示例（`cash=100000`、`commission=0.001`）。
+
+约束：profile 名不能是 `settings` / `strategies`（那是系统层与编排层配置，
+结构完全不同，会被 `load_profile` 拦截并报错），也不能含路径分隔符。
 
 ## 数据准备
 
-### 1. 准备 K 线数据
-
-回测需要 1m 精度的 CSV 数据。数据来源：
-
-**方式 A：使用 klines_service（本地服务）**
-
-确保 `http://127.0.0.1:17081` 正在运行。
-
-**方式 B：手动放置 CSV 文件**
-
-CSV 文件放在 `data/strategies/<策略名>/1m/` 目录下，格式：
+### 目录结构
 
 ```
-timestamp,open,high,low,close,volume,quote_volume,count,taker_buy_volume,taker_buy_quote_volume
-2026-04-01 00:00:00+00:00,77000.0,77100.0,76900.0,77050.0,100.0,...
-```
-
-### 2. ICT 策略特殊要求
-
-ICT 策略需要多时间框架数据，会自动从 1m 聚合：
-
-```
-data/strategies/cta_ict/
+data/klines/
 ├── 1m/
-│   └── BTCUSDT_1m.csv    # 必须有（聚合源）
+│   └── BTCUSDT_1m.csv    # 必须有（大周期的聚合源）
 ├── 15m/                   # 自动从 1m 聚合并保存
 ├── 1h/                    # 自动从 1m 聚合并保存
 └── 4h/                    # 自动从 1m 聚合并保存
 ```
 
-**自动保存大周期 CSV**：回测完成后，聚合的 15m/4h/1d 数据会自动保存到对应目录的 CSV 文件，下次回测可直接使用，无需重新聚合。
+`data_dir` 由 `config/backtest.yaml` 指定，与实盘 `config/settings.yaml` 的
+`csv_dir` 指向同一路径——回测与实盘读同一份数据。
 
-数据量参考：
-- 30 天 1m ≈ 43,200 条
-- 30 天 15m ≈ 2,880 条
-- 30 天 4h ≈ 180 条
+CSV 格式：
+
+```
+timestamp,open,high,low,close,volume,quote_volume,count,taker_buy_volume,taker_buy_quote_volume
+2026-06-10 00:00:00+00:00,77000.0,77100.0,76900.0,77050.0,100.0,...
+```
+
+### 下载数据
+
+```bash
+# Binance 公共 API，无需 API key
+python scripts/download_data.py --symbol ETHUSDT --interval 1m --days 30
+
+# 国内网络配代理
+HTTPS_PROXY=http://<host>:<port> python scripts/download_data.py --symbol ETHUSDT --interval 1m --days 30
+```
+
+**自动保存大周期 CSV**：回测中聚合出的 15m/1h/4h 会自动写回对应目录，下次直接复用。
+注意这会让 1m CSV 被补齐缺口后**行数变化**，属预期行为。
+
+数据量参考：30 天 1m ≈ 43,200 条 / 15m ≈ 2,880 条 / 4h ≈ 180 条。
 
 ## 输出结果
 
-回测完成后在 `backtest_output/` 生成 4 个文件：
+输出到 `backtest_output/<策略名>/<日期>/<时刻>/<SYMBOL>/`：
 
 | 文件 | 格式 | 内容 |
 |------|------|------|
-| `*_report.txt` | 文本 | 可读摘要（盈亏、回撤、交易次数） |
-| `*_result.json` | JSON | 完整指标（可编程读取） |
-| `*_equity.csv` | CSV | 权益曲线（每 bar 一个数据点） |
-| `*_trades.csv` | CSV | 信号明细（时间、类型、价格、强度） |
+| `backtest_report.txt` | 文本 | 可读摘要（盈亏、回撤、交易次数） |
+| `backtest_result.json` | JSON | 完整指标（可编程读取） |
+| `backtest_analysis_report.md` | Markdown | 分析报告 |
+| `backtest_equity.csv` | CSV | 权益曲线（每 bar 一个数据点） |
+| `backtest_trades.csv` | CSV | 交易明细 |
+| `backtest_signals.csv` | CSV | 信号明细（时间、类型、价格、强度） |
+| `charts/*.png` | 图表 | 权益曲线与回撤图 |
+| `config.yaml` | YAML | 本次回测实际生效的策略配置（供复现） |
 
-### 示例报告
-
-```
-============================================================
-回测报告
-============================================================
-
-初始资金: 100000.00
-最终净值: 103031.73
-盈亏:     +3031.73 (+3.03%)
-信号数量: 1
-
-最大回撤: 9.52
-回撤比例: 9.52%
-
-总交易次数: 1
-净盈亏: +0.00
-```
+`config.yaml` 是复现的关键——它是本次实际读取的 `overrides/<SYM>.yaml` 副本。
 
 ## 回测流程
 
 ```
-1. 加载策略配置 (config.yaml)
+1. 加载 run-profile (config/backtest.yaml)
    ↓
-2. 创建 DataManager (回测模式：禁用 WS，启用 backtest_timestamp 过滤)
+2. 加载策略配置 (strategies/<name>/overrides/<SYM>.yaml)
    ↓
-3. 预加载全部 1m CSV 数据到缓存
+3. 创建 DataManager (回测模式：禁用 WS，启用 backtest_timestamp 过滤)
    ↓
-4. 预聚合大周期数据到缓存 (ict 策略需要 4h/1h/15m)
+4. 预加载全部 1m CSV 到缓存 + 预聚合大周期
    ↓
-5. 实例化策略 (StrategyClass)
+5. 实例化真实策略 (与实盘同一个类)
    ↓
-6. 创建 backtrader Cerebro 引擎
+6. 创建 backtrader Cerebro 引擎，加载 1m PandasData
    ↓
-7. 加载 CSV 数据 (1m 逐 bar 推送)
+7. 每个 bar:
+   - set_backtest_timestamp(ts)        → 设置"当前时间"，屏蔽未来数据
+   - _on_kline_received(kline)         → 模拟实盘 WS 推送
+   - strategy.on_kline()               → 返回 Signal → 映射为订单
    ↓
-8. 每个 bar:
-   - set_backtest_timestamp(ts) → 设置当前时间
-   - _on_kline_received → 跳过缓存更新（优化：数据已预加载）
-   - on_kline() → 获取 Signal → 映射为订单
+8. 提取分析器指标 (DrawDown / TradeAnalyzer / SharpeRatio)
    ↓
-9. 运行回测
-   ↓
-10. 提取分析器指标 (DrawDown / TradeAnalyzer / SharpeRatio)
-   ↓
-11. 生成报告 (TXT + JSON + CSV)
+9. 生成报告 (TXT + JSON + CSV + PNG)
 ```
 
-## 性能优化
+`backtest_timestamp` 是防未来函数的物理机制：任何 `get_closed_data()` 调用都
+只能看到 ≤ 当前 bar 时间的已闭合 K 线。
 
-回测框架已内置多项性能优化，保持与实盘逻辑一致：
+## 成交模型的简化（必读）
 
-### 1. 预加载优化
+回测结果**乐观于实盘**，已知简化项：
 
-回测启动时预加载全部数据到内存缓存，避免每个 bar 重复读取 CSV。
+| 简化 | 影响 |
+|------|------|
+| 无滑点 | 实盘成交价差于回测 |
+| 按信号价成交 | 实盘按下一 bar 开盘或盘口成交 |
+| 假设流动性充足 | 大单实盘会打穿盘口 |
+| 固定 taker 费率 0.04% | 未区分 maker/taker、未计资金费率 |
+| 期末权益含浮动盈亏 | 未平仓头寸按最后价计入 |
 
-### 2. 跳过冗余缓存更新
-
-回测模式下 `_on_kline_received` 跳过缓存更新和大周期聚合：
-- 数据已预加载到缓存
-- 通过 `backtest_timestamp` 过滤实现与实盘相同效果
-- 显著减少每个 bar 的 DataFrame 操作
-
-### 3. 合并相同周期调用
-
-策略 `analyze()` 中多个指标使用相同周期时，自动合并 `_get_closed_data` 调用。
-
-### 4. 日志级别优化
-
-回测模式下高频模块自动降为 WARNING 级别：
-- `data_manager.manager`
-- `backtest.bt_strategy`
-
-### 推荐命令
-
-```bash
-# 使用 WARNING 日志级别获得最佳性能
-python -m backtest.run_backtest --strategy obv --start 20260501 --end 20260514 --symbol ETHUSDT --log-level WARNING
-```
-
-## 自定义回测
-
-### 修改参数
-
-```python
-from backtest.run_backtest import run_backtest
-
-run_backtest(
-    strategy_dir_name="cta_rbreaker",  # 或 cta_trend, cta_ict
-    symbol="ETHUSDT",
-    start_date="20260201",
-    end_date="20260401",
-    timeframe="1m",
-    data_dir="./data/strategies/cta_rbreaker",
-    output_dir="./custom_output",
-    cash=50000,
-    commission=0.0005,  # 更低手续费
-    days=60,            # 预加载天数
-)
-```
-
-### 多标的回测
-
-回测框架当前每次只支持单个交易对。如需多标的回测，需要分别运行多次：
-
-```bash
-python -m backtest.run_backtest --strategy ict --start 20260101 --end 20260331 --symbol btcusdt
-python -m backtest.run_backtest --strategy ict --start 20260101 --end 20260331 --symbol ethusdt
-```
+评估策略时请把这些当作**已知偏差**，不要把回测收益当预期收益。
 
 ## 批量回测
 
-`batch_runner.py` 支持并发执行多个回测任务，通过 subprocess 调用 `run_backtest.py`。
-
-### 使用方式
+`batch_runner.py` 按 `config/strategies.yaml`（**与实盘共用的编排层**）
+并发执行多个 `策略 × symbol` 任务。
 
 ```bash
-# 使用配置文件中的时间范围
+# 用 profile 中的时间范围
 python3 -m backtest.batch_runner
 
 # CLI 覆盖时间
-python3 -m backtest.batch_runner --start 20260101 --end 20260331
+python3 -m backtest.batch_runner --start 20260610 --end 20260708
 
 # 后台运行
 python3 -m backtest.batch_runner --daemon
 ```
+
+### 只跑部分标的：`--run`
+
+不想改 `config/strategies.yaml`（那是实盘共用的登记表）时，用 `--run` 直接给清单，
+格式与实盘 `run_strategies_manager.py --run` 完全一致：
+
+```bash
+# 多标的
+python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
+
+# 多策略多标的
+python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,obv_atr_v2:ETHUSDT
+```
+
+`--run` 优先于 `--config` 登记表。symbol 小写自动转大写。
+
+**与登记表路径的一处刻意差异** —— overrides 文件缺失时：
+
+| 来源 | 缺文件 | 为什么 |
+|------|--------|--------|
+| `--config` 登记表 | warn + 跳过 | 长期清单，个别标的没配好不该阻断整批 |
+| `--run` 清单 | **报错退出** | 既然点名指定，静默跳过等于给出一份不完整的结果却不告知 |
+
+三个入口的清单协议是同一个（共用 `parse_explicit_strategies`）：
+
+| 入口 | 参数 | 数量 |
+|------|------|------|
+| `run_strategies_manager.py` | `--run` | 不限 |
+| `backtest.batch_runner` | `--run` | 不限 |
+| `backtest.run_backtest` | `--strategies` | **仅 1 个**（多个请用 batch_runner） |
 
 ### CLI 参数
 
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
-| `--config` | `backtest/config/strategies.yaml` | 策略配置文件路径 |
-| `--backtest-config` | `backtest/config/main.yaml` | 回测参数配置文件路径 |
-| `--start` | 配置文件中的值 | 覆盖开始时间（优先级高于配置文件） |
-| `--end` | 配置文件中的值 | 覆盖结束时间（优先级高于配置文件） |
+| `--config` | `config/strategies.yaml` | 策略登记表（与实盘共用） |
+| `--run` | 无 | 显式清单 `name:symbol,...`，优先于 `--config` |
+| `--profile` | `backtest` | run-profile，读 `config/<name>.yaml` |
+| `--start` | profile 中的值 | 覆盖开始时间 |
+| `--end` | profile 中的值 | 覆盖结束时间 |
 | `--daemon` | `False` | 后台运行模式 |
-| `--status` | - | 查看运行状态（待实现） |
+| `--batch-id` | 自动生成 | 批次 ID（内部使用） |
 
-### 时间格式支持
+时间格式：`20260610`（YYYYMMDD）/ `1735689600`（秒）/ `1735689600000`（毫秒）。
 
-| 格式 | 示例 | 说明 |
-|------|------|------|
-| YYYYMMDD | `20260101` | 日期格式 |
-| 秒时间戳 | `1735689600` | 10 位数字 |
-| 毫秒时间戳 | `1735689600000` | 13 位数字 |
+### 编排层格式
 
-### 配置文件格式
-
-`batch_runner.py` 支持两种配置格式，**推荐使用新格式**：
-
-#### 新格式（推荐）
-
-配置分离为两个文件：
-
-**`backtest/config/strategies.yaml`** - 定义策略列表：
+`config/strategies.yaml` —— 回测与实盘读的是同一个文件：
 
 ```yaml
 strategies:
-  dolphin_trading_v2:
+  sar_snt3_v3:
     trading_mode: "live"
-    config_dir: "backtest/config"
     symbols:
       - BTCUSDT
       - ETHUSDT
-      - SOLUSDT
-
-  cta_ict_v3:
-    trading_mode: "live"
-    config_dir: "backtest/config"
-    symbols:
-      - BTCUSDT
 ```
 
-**`backtest/config/main.yaml`** - 定义回测参数：
+策略参数不写在这里，只声明"跑什么"。参数从
+`strategies/sar_snt3_v3/overrides/BTCUSDT.yaml` 读取——回测与实盘同一份。
 
-```yaml
-start: "20260601"
-end: "20260710"
-data_dir: "./data/strategies"
-output_dir: "./backtest_output"
-max_workers: 15
-log_level: "INFO"
-use_today_as_output_date: true
-```
+并发数从 `config/backtest.yaml` 的 `max_workers` 读取。
 
-**运行命令**：
+### 定时批量
 
 ```bash
-python3 -m backtest.batch_runner
-# 等同于
-python3 -m backtest.batch_runner --config backtest/config/strategies.yaml --backtest-config backtest/config/main.yaml
-```
-
-#### 旧格式（完全支持）
-
-所有配置在一个文件中，`strategies` 为列表格式。运行时需通过 `--config` 指定配置文件。
-
-**`backtest/config/main.yaml`**：
-
-```yaml
-# 完整示例见 backtest/config/main.legacy.example.yaml
-start: "20250101"
-end: "20260301"
-data_dir: "./data/strategies"
-output_dir: "./backtest_output"
-max_workers: 4
-log_level: "INFO"
-use_today_as_output_date: true
-
-strategies:
-  - name: cta_ict_v3
-    symbols: ["BTCUSDT", "ETHUSDT"]
-    enabled: true
-  - name: dolphin_trading_v2
-    symbols: ["BTCUSDT"]
-    enabled: true
-    overrides:
-      signal:
-        min_strength: 0.5
-```
-
-**运行命令**：
-
-```bash
-python3 -m backtest.batch_runner --config backtest/config/main.yaml
-```
-
-#### 格式自动检测
-
-代码根据 `strategies` 字段类型自动检测格式：
-
-| `strategies` 类型 | 格式 | 配置来源 |
-|-------------------|------|----------|
-| `dict`（对象） | 新格式 | 策略从 `--config`，回测参数从 `--backtest-config` |
-| `list`（数组）或不存在 | 旧格式 | 所有配置从 `--config` |
-
-#### 两种格式对比
-
-| 特性 | 新格式 | 旧格式 |
-|------|--------|--------|
-| 配置分离 | 策略与回测参数分离 | 合并在一起 |
-| 实盘/回测共用 | ✅ 可与 `run_strategies_manager.py` 共用 | ❌ 仅回测使用 |
-| 维护性 | 高（职责分离） | 低（配置耦合） |
-| 推荐度 | ⭐⭐⭐ 推荐 | 兼容保留 |
-
-### 配置路径组合
-
-策略配置文件路径按以下规则组合：
-
-```
-{config_dir}/{strategy_name}/{symbol}.yaml
-```
-
-示例：
-- `backtest/config/dolphin_trading_v2/BTCUSDT.yaml`
-- `backtest/config/cta_ict_v3/ETHUSDT.yaml`
-
-### 示例
-
-```bash
-# 使用配置文件中的时间范围
-python3 -m backtest.batch_runner
-
-# CLI 覆盖 start（YYYYMMDD）
-python3 -m backtest.batch_runner --start 20260101
-
-# CLI 覆盖 start（时间戳）
-python3 -m backtest.batch_runner --start 1735689600
-
-# 同时覆盖 start 和 end
-python3 -m backtest.batch_runner --start 20260101 --end 20260331
-
-# 定时任务：每天回测最近 30 天
+# 每天回测最近 30 天
 python3 -m backtest.batch_runner --start $(date -d "-30 days" +%Y%m%d) --end $(date +%Y%m%d)
-
-# 后台运行
-python3 -m backtest.batch_runner --daemon
 ```
 
 ## 常见问题
 
-### 回测速度慢
-
-回测已内置多项优化（预加载、跳过冗余更新、日志级别）。如仍需加速：
-
-1. **使用 WARNING 日志级别**：减少高频模块的日志输出
-   ```bash
-   python -m backtest.run_backtest --strategy obv --start 20260501 --end 20260514 --symbol ETHUSDT --log-level WARNING
-   ```
-
-2. **缩短回测周期**：先用短周期验证策略逻辑，再用长周期验证稳定性
-
 ### 未找到 CSV 数据文件
 
 ```
-ERROR: 未找到 CSV 数据文件: data/strategies/cta_ict/1m/BTCUSDT_1m.csv
+ERROR: 未找到 CSV 数据文件: data/klines/1m/BTCUSDT_1m.csv
 ```
 
-需要先下载数据到 `data/strategies/<策略名>/1m/` 目录。确保 `klines_service` 运行中，或使用 `DataManager.batch_download_history()` 下载。
+用 `python scripts/download_data.py --symbol BTCUSDT --interval 1m --days 30` 下载，
+或确认 `config/backtest.yaml` 的 `data_dir` 指向了实际数据目录。
 
-### ICT 策略信号太少
+### profile 文件不存在
 
-ICT 策略依赖 4h 级别的市场结构分析，短周期内信号稀少：
-- 建议至少 60-90 天数据
-- 可调整 `config.yaml` 中 `signal.min_strength` 降低阈值（默认 0.4）
-- 检查 `direction` 配置：`neutral` 允许多空，`bullish` 只做多，`bearish` 只做空
+```
+ERROR: 无法加载 profile: xxx（config/xxx.yaml 不存在）
+```
+
+`--profile` 传的名字要对应 `config/<name>.yaml`。默认 `backtest`。
+
+### 回测速度慢
+
+1. **降日志级别**：`--log-level WARNING` 显著减少高频 IO
+2. **缩短回测周期**：先短周期验逻辑，再长周期验稳定性
+3. 回测已内置预加载与跳过冗余缓存更新，1m 数据量大时（>100 万条）仍会较慢
+
+### 信号太少
+
+- 多周期策略依赖大周期结构，短窗口内信号稀疏，建议至少 60-90 天数据
+- 调低 `overrides/<SYM>.yaml` 中 `signal.min_strength` 阈值
+- 检查 `direction`：`neutral` 允许多空 / `bullish` 只做多 / `bearish` 只做空
 
 ### backtrader 未安装
 
 ```bash
 pip install backtrader
-# 或使用系统包管理器
-pip install --break-system-packages backtrader
 ```
+
+## 相关文档
+
+- [配置统一规范](../docs/CONFIG_UNIFICATION_SPEC.md) —— 三层模型与收敛理由
+- [策略开发指南](../docs/strategy/DEVELOPMENT_GUIDE.md)
+- [AI 编码约束](../docs/strategy/AI_CONSTRAINTS.md) —— 含防未来函数红线

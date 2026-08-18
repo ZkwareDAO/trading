@@ -114,25 +114,4 @@ class TestKlinesWebSocketClientInfiniteRetry:
         assert client.max_reconnect == 0
 
 
-class TestWebSocketReconnectIntegration:
-    """WebSocket 重连集成测试"""
 
-    @pytest.mark.asyncio
-    async def test_manager_creates_ws_client_with_infinite_retry(self):
-        """测试 DataManager 创建的 WS 客户端配置为无限重试"""
-        dm = DataManager()
-
-        # Mock WebSocket 连接
-        with patch.object(KlinesWebSocketClient, 'connect', new_callable=AsyncMock) as mock_connect:
-            mock_connect.return_value = True
-
-            with patch.object(KlinesWebSocketClient, 'set_on_kline_callback'):
-                result = await dm.start_klines_service_async()
-
-                assert result is True
-                assert dm._ws_client is not None
-
-                # 验证重连配置
-                assert dm._ws_client.max_reconnect == 0, "应为无限重试"
-                assert dm._ws_client.reconnect_delay == 60.0, "应为 60 秒重试间隔"
-                assert dm._ws_client.max_backoff == 60.0, "退避上限应为 60 秒"

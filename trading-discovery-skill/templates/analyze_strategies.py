@@ -35,8 +35,8 @@ def main():
                         help="代币列表，逗号分隔 (可选，不指定则从配置读取)")
     parser.add_argument("--start", default="", help="回测开始日期 (YYYYMMDD)")
     parser.add_argument("--end", default="", help="回测结束日期 (YYYYMMDD)")
-    parser.add_argument("--kline-data-dir", default="./data/strategies/1m",
-                        help="K线数据目录 (默认: ./data/strategies/1m)")
+    parser.add_argument("--kline-data-dir", default="./data/klines",
+                        help="K线数据目录 (默认: ./data/klines)")
     parser.add_argument("--output", default="",
                         help="JSON 输出路径 (默认: logs/discovery-analysis-{date}.json)")
 

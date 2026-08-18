@@ -79,24 +79,25 @@ class FactoryClient:
 
     def __init__(
         self,
-        factory_endpoint: str = "http://127.0.0.1:8888",
+        factory_endpoint: Optional[str] = None,
         callback_url: str = "http://127.0.0.1:8892",
         engine: Optional[Any] = None,
         global_config_path: str = "config/settings.yaml",
         log_level: str = "INFO",
-        position_proxy_url: str = "http://127.0.0.1:8889",
+        position_proxy_url: Optional[str] = None,
         position_api_path: str = "/api/position/user-order-positions",
     ):
         """
         初始化 FactoryClient
 
         Args:
-            factory_endpoint: factory RPC 地址
+            factory_endpoint: factory RPC 地址；为 None 时禁用所有 factory 注册/RPC 功能，
+                              仅保留本地子进程管理能力
             callback_url: 本地回调地址（用于接收 factory 控制）
             engine: StrategyEngine 实例（用于执行回调指令）
             global_config_path: 全局配置路径（用于启动子进程）
             log_level: 日志级别（用于启动子进程）
-            position_proxy_url: Position 代理地址（端口 8889）
+            position_proxy_url: Position 代理地址（端口 8889）；为 None 时远程仓位查询不可用
             position_api_path: 仓位查询 API 路径（默认 /api/position/user-order-positions）
         """
         self.factory_endpoint = factory_endpoint
@@ -115,8 +116,18 @@ class FactoryClient:
         self._subprocesses: Dict[str, subprocess.Popen] = {}
         self._strategy_configs: Dict[str, Dict[str, Any]] = {}
 
+        if not factory_endpoint:
+            logger.info("factory_endpoint 未配置，FactoryClient 禁用 RPC 注册功能（仅本地子进程管理）")
+
+    @property
+    def factory_enabled(self) -> bool:
+        """factory RPC 功能是否启用（endpoint 非空且非占位符）"""
+        return bool(self.factory_endpoint)
+
     def _get_factory_proxy(self) -> xmlrpc.client.ServerProxy:
         """获取 factory RPC 代理（延迟创建）"""
+        if not self.factory_enabled:
+            raise RuntimeError("factory_endpoint 未配置，无法创建 RPC 代理")
         if self._factory_proxy is None:
             self._factory_proxy = xmlrpc.client.ServerProxy(
                 self.factory_endpoint,
@@ -149,8 +160,13 @@ class FactoryClient:
         if not strategy_id:
             return {"status": "error", "message": "缺少 strategy_id"}
 
-        # 保存配置到本地
+        # 保存配置到本地（本地子进程管理需要，不依赖 factory）
         self._strategy_configs[strategy_id] = config.copy()
+
+        # factory 未配置：跳过 RPC，返回 skipped（不报错，不刷 unsupported protocol 警告）
+        if not self.factory_enabled:
+            logger.debug(f"factory 未配置，跳过注册策略 {strategy_id}（本地子进程模式）")
+            return {"status": "skipped", "message": "factory_endpoint 未配置"}
 
         try:
             proxy = self._get_factory_proxy()
@@ -172,6 +188,9 @@ class FactoryClient:
         Returns:
             状态信息
         """
+        if not self.factory_enabled:
+            logger.debug(f"factory 未配置，跳过查询策略 {strategy_id} 状态")
+            return {"status": "skipped", "message": "factory_endpoint 未配置"}
         try:
             proxy = self._get_factory_proxy()
             result = proxy.status(strategy_id)
@@ -195,6 +214,9 @@ class FactoryClient:
         Returns:
             是否成功
         """
+        if not self.factory_enabled:
+            logger.debug(f"factory 未配置，跳过上报策略 {strategy_id} 状态: {status}")
+            return True
         try:
             proxy = self._get_factory_proxy()
             # factory 目前没有专门的 report 接口
@@ -218,6 +240,9 @@ class FactoryClient:
         Returns:
             factory 返回结果
         """
+        if not self.factory_enabled:
+            logger.debug(f"factory 未配置，跳过请求启动策略 {strategy_id}")
+            return {"status": "skipped", "message": "factory_endpoint 未配置"}
         try:
             proxy = self._get_factory_proxy()
             result = proxy.start(strategy_id)
@@ -237,6 +262,9 @@ class FactoryClient:
         Returns:
             factory 返回结果
         """
+        if not self.factory_enabled:
+            logger.debug(f"factory 未配置，跳过请求停止策略 {strategy_id}")
+            return {"status": "skipped", "message": "factory_endpoint 未配置"}
         try:
             proxy = self._get_factory_proxy()
             result = proxy.stop(strategy_id)
@@ -581,11 +609,13 @@ class FactoryClient:
             "strategy_name": strategy_name,
             "user_id": user_id,
         }
-        if symbol:
-            query_params["symbol"] = symbol
+        # if symbol:
+        #     query_params["symbol"] = symbol
 
         encoded_params = urllib.parse.urlencode(query_params)
         url = f"{self.position_proxy_url}{self.position_api_path}?{encoded_params}"
+
+        logger.info(f"[query_order_positions] 请求 URL: {url}")
 
         try:
             req = urllib.request.Request(url)

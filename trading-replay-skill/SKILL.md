@@ -33,8 +33,8 @@ origin: trading
 | `/trading-replay sync --date YYYYMMDD` | 备份到指定日期目录 |
 | `/trading-replay sync --skip-discovery` | 跳过远程发现，直接备份全部策略 |
 | `/trading-replay discover` | 只执行远程策略发现（不备份） |
-| `/trading-replay replay` | 只执行回放回测（replay.sh），默认回测近 30 天 |
-| `/trading-replay replay --date YYYYMMDD` | 回放指定日期的快照，默认回测近 30 天 |
+| `/trading-replay replay` | 只执行回放回测（replay.sh），默认只回测前一天 |
+| `/trading-replay replay --date YYYYMMDD` | 回放指定日期的快照，默认回测该日期前一天 |
 | `/trading-replay replay --start 20260101 --end 20260801` | 自定义回测时间范围 |
 | `/trading-replay replay --skip-analysis` | 跳过策略分析阶段，直接回测 |
 | `/trading-replay summary` | 查看最近回测结果摘要 |
@@ -75,7 +75,7 @@ Step 1: 问子命令（run / sync / replay / discover / summary）
 Step 2: 问日期（--date）
         → 子命令需要日期时才问
         → 给默认：今天
-        → replay 额外问是否自定义 --start/--end（默认近30天）
+        → replay 额外问是否自定义 --start/--end（默认前一天）
        ↓
 Step 3: 问可选参数
         → sync: 是否 --skip-discovery
@@ -92,7 +92,7 @@ Step 4: 汇总确认 → 用户确认后进 Phase 0
 
   1. run       ← 完整流程（备份 + 回测，默认当日）
   2. sync      ← 只备份策略代码
-  3. replay    ← 只回放回测（默认近 30 天）
+  3. replay    ← 只回放回测（默认前一天）
   4. discover  ← 只发现远程策略（不备份）
   5. summary   ← 查看回测结果摘要
 
@@ -112,9 +112,9 @@ Step 4: 汇总确认 → 用户确认后进 Phase 0
 **replay 子命令额外提示**：
 
 ```
-replay 默认回测近 30 天。是否自定义范围？留空 = 默认近30天，或输入 start end：
+replay 默认只回测前一天。是否自定义范围？留空 = 默认前一天，或输入 start end：
   > 20260101 20260801   ← 自定义
-  > 留空                  ← 默认近 30 天
+  > 留空                  ← 默认前一天
 ```
 
 ### Step 3 话术模板：问可选参数
@@ -135,7 +135,7 @@ replay 默认回测近 30 天。是否自定义范围？留空 = 默认近30天�
 
   操作:    run（完整流程）
   日期:    20260811（今天）
-  回测范围: 近 30 天
+  回测范围: 前一天（20260810）
 
 确认执行？
   > y / 回车   ← 进 Phase 0
@@ -152,7 +152,7 @@ replay 默认回测近 30 天。是否自定义范围？留空 = 默认近30天�
 | 场景 | 旧行为 | 新行为 |
 |------|--------|--------|
 | `/trading-replay` 无参数 | 不明确 | 进引导，问子命令→日期→可选参数 |
-| `/trading-replay replay` | 默认近30天直接跑 | 跳过引导直接跑（默认值明确） |
+| `/trading-replay replay` | 默认前一天直接跑 | 跳过引导直接跑（默认值明确） |
 | `/trading-replay run --date XXX` | 直接跑 | 跳过引导直接跑（参数齐全） |
 
 ---
@@ -174,17 +174,25 @@ else
     echo "⚠ SCP_HOST 未配置（策略备份不可用）"
 fi
 
-# 2. 检查回测引擎
-PYTHON_CMD="${PYTHON_CMD:-python3}"
-if $PYTHON_CMD -m backtest.run_backtest --help &>/dev/null; then
-    echo "✅ 回测引擎可用"
-else
-    echo "❌ 回测引擎不可用（阻塞项）"
+# 2. 探测 Python（快照排除了 .venv，用本机 Replay 项目的 .venv 跑快照代码）
+if [ -z "${PYTHON_CMD:-}" ]; then
+    if [ -x "./.venv/bin/python" ]; then
+        PYTHON_CMD="./.venv/bin/python"
+    elif command -v python3 &>/dev/null; then
+        PYTHON_CMD="python3"
+    else
+        PYTHON_CMD="python"
+    fi
 fi
+$PYTHON_CMD -c 'import yaml' &>/dev/null \
+    && echo "✅ Python 可用: $PYTHON_CMD" \
+    || echo "❌ Python 依赖缺失（需要 PyYAML）"
 
 # 3. 检查 K 线数据
-KLINE_DIR="${KLINE_DATA_DIR:-./data/strategies/1m}"
-if [ -d "$KLINE_DIR" ] && [ -f "$KLINE_DIR/BTCUSDT_1m.csv" ]; then
+#    必须与快照 config/settings.yaml 的 data_manager.csv_dir 一致，
+#    否则 run-profile 的 data_dir 校验不通过、回测启动即退出。
+KLINE_DIR="${KLINE_DATA_DIR:-./data/klines}"
+if [ -d "$KLINE_DIR" ] && [ -n "$(find "$KLINE_DIR" -name '*.csv' -print -quit 2>/dev/null)" ]; then
     echo "✅ K 线数据就绪: $KLINE_DIR"
 else
     echo "⚠ K 线数据未就绪（回测将失败）"
@@ -241,7 +249,7 @@ fi
 | `SCP_USER` | .env / config.yaml | sync | 无 |
 | `SCP_STRATEGY_DIR` | .env / config.yaml | sync | 无 |
 | `DATA_PATH` | .env | replay | ./data |
-| `KLINE_DATA_DIR` | .env | replay | ./data/strategies/1m |
+| `KLINE_DATA_DIR` | .env | replay | ./data/klines |
 | `SNAPSHOT_DIR` | config.yaml | 全流程 | ./snapshot |
 | `LOGS_DIR` | config.yaml | 全流程 | ./logs |
 | `REPLAY_OUTPUTS_DIR` | config.yaml | replay | ./replay_outputs |
@@ -265,7 +273,7 @@ mkdir -p "${REPLAY_OUTPUTS_DIR:-./replay_outputs}/${REPLAY_DATE}"
 在备份之前，先 SSH 到远程机器列出当前运行的策略，让用户知道实盘在跑什么。
 
 ```bash
-python3 discover_remote.py --config config.yaml
+$PYTHON_CMD discover_remote.py --config config.yaml
 ```
 
 **discover_remote.py 行为**：
@@ -297,7 +305,7 @@ python3 discover_remote.py --config config.yaml
 **JSON 输出**（`--json` 标志）：
 
 ```bash
-python3 discover_remote.py --config config.yaml --json --output logs/remote-discovery-${REPLAY_DATE}.json
+$PYTHON_CMD discover_remote.py --config config.yaml --json --output logs/remote-discovery-${REPLAY_DATE}.json
 ```
 
 ```json
@@ -366,7 +374,7 @@ Phase 1.5 输出远程策略清单后，等待用户确认备份范围。
 /trading-replay sync --skip-discovery
 
 # 方式 2：直接调用 sync-exee.py
-python3 sync-exee.py --date 20260801
+$PYTHON_CMD sync-exee.py --date 20260801
 ```
 
 ---
@@ -376,7 +384,7 @@ python3 sync-exee.py --date 20260801
 ### Step 1: 从实盘机器拉取策略代码
 
 ```bash
-python3 sync-exee.py --date "${REPLAY_DATE}" --config config.yaml
+$PYTHON_CMD sync-exee.py --date "${REPLAY_DATE}" --config config.yaml
 ```
 
 **sync-exee.py 行为**：
@@ -430,7 +438,7 @@ snapshot/
 在回测前先分析已同步的策略，确定哪些策略可以回测、配置是否完整、K线数据是否覆盖回测范围。
 
 ```bash
-python3 analyze_snapshot.py \
+$PYTHON_CMD analyze_snapshot.py \
     --snapshot-dir "${SNAPSHOT_DIR}/${REPLAY_DATE}" \
     --start "${BT_START}" \
     --end "${BT_END}" \
@@ -444,7 +452,7 @@ python3 analyze_snapshot.py \
 |--------|------|----------|
 | strategy.py | 策略入口文件是否存在 | 标记 skip |
 | *_core.py | 策略核心逻辑文件 | 警告，不阻塞 |
-| config.yaml | 策略配置文件（config.test.yaml → config.yaml → config*.yaml） | 标记 skip |
+| overrides/<SYMBOL>.yaml | 策略参数文件（v3.7 单一事实来源） | 标记 skip |
 | symbols | 配置中定义的代币列表 | 无 symbols 标记 partial |
 | timeframes | 配置中定义的时间框架 | 信息展示 |
 | K线数据 | 每个 symbol 的 CSV 是否存在、日期范围是否覆盖回测区间 | 缺失标记 partial |
@@ -466,10 +474,10 @@ python3 analyze_snapshot.py \
   Source: replay
   Path:   ./snapshot/20260801
   Range:  20260702 ~ 20260801
-  Data:   ./data/strategies/1m
+  Data:   ./data/klines
 
 [READY]   ema_rsi (product)
-  Config: /path/to/config.test.yaml
+  Config: /path/to/snapshot/20260801/ema_rsi-product/strategies/ema_rsi/overrides/BTCUSDT.yaml
   Symbols: BTCUSDT, ETHUSDT, SOLUSDT
   Timeframes: 4h, 1h | Direction: neutral
   Params: obv_period=20, atr_multiplier=2.0
@@ -500,13 +508,13 @@ Summary: 1 ready, 1 partial, 1 skip | 2 of 3 can proceed
   "source_path": "./snapshot/20260801",
   "start_date": "20260702",
   "end_date": "20260801",
-  "kline_data_dir": "./data/strategies/1m",
+  "kline_data_dir": "./data/klines",
   "strategies": [
     {
       "strategy_name": "ema_rsi",
       "model": "product",
       "status": "ready",
-      "config_path": "/path/to/config.test.yaml",
+      "config_path": "/path/to/strategies/ema_rsi/overrides/BTCUSDT.yaml",
       "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
       "timeframes": ["4h", "1h"],
       "direction": "neutral",
@@ -563,34 +571,68 @@ done
 
 ```bash
 for snapshot in "${STRATEGY_SNAPSHOTS[@]}"; do
-    # 解析 strategy 和 model
-    strategy_name=$(echo "$snapshot" | rev | cut -d'-' -f2- | rev)
-    model=$(echo "$snapshot" | rev | cut -d'-' -f1 | rev)
+    # 解析 strategy 和 model（最后一个 - 分隔）
+    strategy_name="${snapshot%-*}"
+    model="${snapshot##*-}"
 
     echo "🔄 回测: ${strategy_name} (${model})"
 
-    # 回测输出目录
+    SNAPSHOT_ABS="$(cd "snapshot/${REPLAY_DATE}/${snapshot}" && pwd)"
     OUTPUT_DIR="${REPLAY_OUTPUTS_DIR:-./replay_outputs}/${REPLAY_DATE}/${snapshot}"
     mkdir -p "$OUTPUT_DIR"
 
-    # 执行回测（默认: snapshot 日期前 30 天 ~ 当天，可通过 --start/--end 覆盖）
-    $PYTHON_CMD -m backtest.run_backtest \
-        --strategy "$strategy_name" \
+    # 代币清单来自快照自带的 overrides/ —— 文件名即当天实盘跑的 symbol 全集。
+    # 读这份参数就是"回放当天真实配置"的含义所在。
+    SYMS=""
+    for f in "${SNAPSHOT_ABS}/strategies/${strategy_name}/overrides"/*.yaml; do
+        [ -f "$f" ] || continue
+        sym="$(basename "$f" .yaml)"
+        SYMS="${SYMS:+$SYMS,}${sym}"
+    done
+
+    # 在快照内生成 run-profile（output_dir 指向快照之外，避免污染快照）
+    $PYTHON_CMD make_profile.py \
+        --project-dir "$SNAPSHOT_ABS" \
+        --name replay \
+        --output-dir "$(cd "$OUTPUT_DIR" && pwd)" \
+        --max-workers "${PARALLEL:-1}"
+
+    # 转调【快照自带】的 wrapper —— 不是当前项目的那份。
+    # 快照是当天项目的完整副本，用它自己的 scripts/ 才是真正
+    # "回放当天的执行路径"；用当前项目的脚本等于拿今天的代码跑昨天的参数。
+    # 默认区间 = 前一天（BT_START = BT_END = snapshot 日期 - 1）
+    (cd "$SNAPSHOT_ABS" && bash scripts/run_backtest_batch.sh \
+        --strategies "$strategy_name" \
+        --symbols "$SYMS" \
         --start "${BT_START}" \
         --end "${BT_END}" \
-        --config "snapshot/${REPLAY_DATE}/${snapshot}/config.yaml" \
-        --output "$OUTPUT_DIR" \
+        --profile replay \
         --log-level INFO \
-        2>&1 | tee -a "${LOGS_DIR:-./logs}/replay-${REPLAY_DATE}.log"
+        --yes) 2>&1 | tee -a "${LOGS_DIR:-./logs}/replay-${REPLAY_DATE}.log"
 
-    # 检查回测结果
-    if [ -f "$OUTPUT_DIR/backtest_result.json" ]; then
-        echo "✅ ${snapshot}: 回测完成"
+    # 检查回测结果（产物在 {output_dir}/{strategy}/{date}/{time}/{symbol}/）
+    RESULT_COUNT=$(find "$OUTPUT_DIR" -name "backtest_result.json" 2>/dev/null | wc -l)
+    if [ "$RESULT_COUNT" -gt 0 ]; then
+        echo "✅ ${snapshot}: 回测完成 (${RESULT_COUNT} 个结果)"
     else
         echo "⚠ ${snapshot}: 回测未产出结果"
     fi
 done
 ```
+
+**快照之间串行**：每个快照有自己的 `config/`，并行会互相踩生成的 profile。
+单快照内的多个 (策略, 代币) 由 `profile.max_workers` 并发。
+
+**⚠ 不要用 `--daemon`**：`batch_runner` 该模式重建子命令时只传
+`--profile` 和 `--batch-id`，会丢掉 `--run/--start/--end`，
+等于跑成空清单。需要后台执行请在外层 `nohup` 本脚本。
+
+**`--yes` 是必须的**：wrapper 在任务数 > 6 时会 `read` 等待确认，
+replay 通常由 crontab 触发，不传 `--yes` 会卡死在无人应答的提示上。
+
+**跳过无 K 线数据的标的**：Phase 2.5 的分析结果里 `csv_exists=false`
+的 symbol 必然回测失败，提交给 wrapper 只会把整批退出码染红，
+掩盖真正的异常 —— 构建清单时应先剔除。
 
 **回测输出目录结构**：
 
@@ -691,7 +733,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Replay Summary - ${REPLAY_DATE}" > "$SUMMAR
 
 ```cron
 # 每日 00:15 执行策略代码备份
-15 0 * * * cd /path/to/replay && python3 sync-exee.py --date $(date +\%Y\%m\%d) >> logs/cron-sync.log 2>&1
+15 0 * * * cd /path/to/replay && $PYTHON_CMD sync-exee.py --date $(date +\%Y\%m\%d) >> logs/cron-sync.log 2>&1
 
 # 每日 00:30 执行回放回测
 30 0 * * * cd /path/to/replay && bash replay.sh --date $(date +\%Y\%m\%d) >> logs/cron-replay.log 2>&1
@@ -712,7 +754,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Replay Summary - ${REPLAY_DATE}" > "$SUMMAR
 | `SNAPSHOT_DIR` | `./snapshot` | 策略代码快照目录 |
 | `LOGS_DIR` | `./logs` | 日志输出目录 |
 | `REPLAY_OUTPUTS_DIR` | `./replay_outputs` | 回测结果输出目录 |
-| `PYTHON_CMD` | `python3` | Python 命令路径 |
+| `PYTHON_CMD` | 自动探测 | Python 命令路径（留空则探测 `./.venv/bin/python`） |
 
 ### SCP 配置（sync 需要）
 
@@ -731,11 +773,11 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Replay Summary - ${REPLAY_DATE}" > "$SUMMAR
 ```bash
 # ===== 必需配置 =====
 DATA_PATH=./data
-KLINE_DATA_DIR=./data/strategies/1m
+KLINE_DATA_DIR=./data/klines
 SNAPSHOT_DIR=./snapshot
 LOGS_DIR=./logs
 REPLAY_OUTPUTS_DIR=./replay_outputs
-PYTHON_CMD=python3
+PYTHON_CMD=
 
 # ===== SCP 连接（sync 需要） =====
 SCP_HOST=your-server-ip

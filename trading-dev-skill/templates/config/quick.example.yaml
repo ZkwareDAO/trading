@@ -1,0 +1,41 @@
+# =============================================================================
+# run-profile 示例：快速调参
+# =============================================================================
+# 用途：证明 --profile 的价值 —— 换一套回测参数【不改动入库文件】。
+#
+#   python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT \
+#     --start 20260610 --end 20260708 --profile quick
+#
+# 为什么需要它：调参是量化开发的日常（试不同初始资金、手续费口径、并发数）。
+# 若直接改 config/backtest.yaml，(1) 容易误提交，(2) "上次那轮跑的什么参数"
+# 不可追溯。一个 profile 文件 = 一套有名字、可存档、可复现的参数集。
+#
+# 用法：复制本文件改名（config/<自定义名>.yaml），改你要试的键，
+#       用 --profile <自定义名> 运行。config/backtest.yaml 保持不动。
+#
+# 约束（与 config/backtest.yaml 相同）：
+#   - 绝不含策略参数（周期/阈值/止损 —— 唯一来源是
+#     strategies/<name>/overrides/<SYM>.yaml）
+#   - 只写有代码真实消费的键，当前共 9 个（见下）
+#   - data_dir 必须与 config/settings.yaml 的 data_manager.csv_dir 一致，
+#     启动时由 verify_data_dir_consistency() 校验，不一致直接退出
+#   - 文件名不能用 settings / strategies（那是系统层与编排层配置，会被守卫拦截）
+# =============================================================================
+
+# 时间范围（CLI --start/--end 可覆盖，通常在命令行指定，这里留空）
+start: "20260601"
+end: ""
+
+# 本示例与 config/backtest.yaml 的差异：更大的初始资金 + 更高的手续费口径，
+# 用于观察策略在不同资金规模与费率假设下的表现
+cash: 100000          # 默认 5000
+commission: 0.001     # 默认 0.0004（币安合约 taker）
+
+# 数据与输出
+data_dir: "./data/klines"          # 必须与 settings.yaml 的 csv_dir 一致
+output_dir: "./backtest_output"
+use_today_as_output_date: true
+log_level: "INFO"
+
+# 并发（仅 batch_runner 使用）
+max_workers: 4

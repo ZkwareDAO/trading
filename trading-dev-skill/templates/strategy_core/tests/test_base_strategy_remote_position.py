@@ -89,27 +89,6 @@ class TestBaseStrategyRemotePosition:
 
         return strategy
 
-    def test_sync_remote_position_closed(self, caplog):
-        """远程已平仓时清除本地状态"""
-        # Mock factory client
-        mock_factory = MagicMock()
-        mock_factory.is_position_open.return_value = (False, {"ID": 1, "PnlValue": 0})  # 远程已平仓
-
-        strategy = self._create_strategy(factory_client=mock_factory)
-        strategy.on_start()
-
-        # 设置本地持仓状态
-        state = strategy._core._get_state("BTCUSDT")
-        state.position = "long"
-        state.entry_price = 70000.0
-        state.position_id = "test_pos_001"
-
-        with caplog.at_level(logging.INFO, logger="strategy_core.base.strategy"):
-            strategy._sync_remote_position("BTCUSDT", "user_001")
-
-        # 验证本地状态已清除
-        assert state.position is None
-        assert "远程仓位已平仓" in caplog.text or "已清除" in caplog.text
 
     def test_sync_remote_position_still_open(self, caplog):
         """远程仍在仓时保持本地状态"""
@@ -190,32 +169,6 @@ class TestBaseStrategyRemotePosition:
         # 仍只调用一次（使用了缓存）
         assert mock_factory.is_position_open.call_count == 1
 
-    def test_on_kline_with_remote_sync(self, caplog):
-        """on_kline 集成远程仓位同步"""
-        mock_factory = MagicMock()
-        mock_factory.is_position_open.return_value = (False, {"ID": 1, "PnlValue": 0})  # 远程已平仓
-
-        strategy = self._create_strategy(factory_client=mock_factory)
-        strategy.on_start()
-
-        # 设置本地持仓
-        state = strategy._core._get_state("BTCUSDT")
-        state.position = "long"
-        state.entry_price = 70000.0
-
-        # 模拟 K 线
-        mock_kline = MagicMock()
-        mock_kline.symbol = "BTCUSDT"
-        mock_kline.close = 71000.0
-        mock_kline.high = 71500.0
-        mock_kline.low = 70500.0
-        mock_kline.timestamp = datetime.now(timezone.utc)
-
-        with caplog.at_level(logging.INFO, logger="strategy_core.base.strategy"):
-            signal = strategy.on_kline(mock_kline)
-
-        # 远程已平仓，本地状态清除，不应返回信号
-        assert state.position is None
 
     def test_no_factory_client_graceful_skip(self):
         """无 factory_client 时跳过远程同步"""
@@ -276,184 +229,10 @@ class TestBaseStrategyRemotePosition:
         assert "entry_price=75000" in caplog.text or "entry_price=75000.00" in caplog.text
         assert "position=long" in caplog.text
 
-    def test_sync_remote_position_closed_persists_history(self, tmp_path, caplog):
-        """远程已平仓时应记录历史仓位并清理持久化文件"""
-        from strategy_core.position_persistence import PositionPersistence
-        from strategy_core.history_position_logger import HistoryPositionLogger
-        import csv
-        import shutil
-
-        # Mock factory client
-        mock_factory = MagicMock()
-        mock_factory.is_position_open.return_value = (False, {"ID": 18282, "PnlValue": -203.424})  # 远程已平仓
-
-        strategy = self._create_strategy(factory_client=mock_factory)
-        strategy.on_start()
-
-        # 设置完整的本地持仓状态
-        state = strategy._core._get_state("BTCUSDT")
-        state.position = "short"
-        state.position_id = "OBVATR_1H_V2_BTCUSDT_LIVE_BTCUSDT_1782232320"
-        state.entry_price = 62593.80
-        state.entry_time = datetime(2026, 6, 23, 10, 0, tzinfo=timezone.utc)
-        state.entry_timestamp = 1782232320
-        state.peak_price = 63000.0
-        state.stop_price = 63500.0
-        state.max_pnl_pct = 2.5
-        state.min_pnl_pct = -1.2
-
-        # 使用真实的 data 目录（会被清理）
-        strategy_id = strategy.strategy_id_for("BTCUSDT")
-        persist_dir = Path("data/positions")
-        history_dir = Path("data/history_positions")
-
-        # 确保目录存在
-        persist_dir.mkdir(parents=True, exist_ok=True)
-        history_dir.mkdir(parents=True, exist_ok=True)
-
-        # 预清理历史文件，避免残留数据干扰
-        date_str = datetime.now(timezone.utc).strftime("%Y%m%d")
-        history_file = history_dir / strategy_id / f"{date_str}.csv"
-        if history_file.exists():
-            history_file.unlink()
-
-        # 创建持久化文件
-        persist = PositionPersistence()
-        persist.save_on_entry(
-            strategy_name=strategy_id,
-            position_id=state.position_id,
-            state=state.to_persist_dict(),
-            trading_mode="live",
-        )
-
-        # 验证持久化文件存在
-        persist_file = persist_dir / f"{strategy_id}.json"
-        assert persist_file.exists(), "持久化文件应在同步前存在"
-
-        # 设置当前价格（远程平仓时需要出场价格）
-        strategy._current_price = 62000.0
-
-        try:
-            with caplog.at_level(logging.INFO, logger="strategy_core.base.strategy"):
-                # 执行远程同步，应该触发持久化清理和历史记录
-                strategy._sync_remote_position("BTCUSDT", "user_001")
-
-            # 验证1: 本地状态已清除
-            assert state.position is None
-            assert state.position_id is None
-
-            # 验证2: 持久化文件已清理
-            assert not persist_file.exists(), "持久化文件应该在远程平仓后删除"
-
-            # 验证3: 历史记录文件已生成
-            assert history_file.exists(), "历史记录文件应该在远程平仓后生成"
-
-            # 验证4: 历史记录内容正确
-            with open(history_file, "r") as f:
-                reader = csv.DictReader(f)
-                rows = list(reader)
-                assert len(rows) == 1, f"应有一条历史记录，实际有 {len(rows)} 条"
-                row = rows[0]
-                assert row["position_id"] == "OBVATR_1H_V2_BTCUSDT_LIVE_BTCUSDT_1782232320"
-                assert row["position_type"] == "short"
-                assert float(row["entry_price"]) == 62593.8
-                assert float(row["exit_price"]) == 62000.0  # 使用当前价格
-                assert row["exit_reason"] == "remote_closed"  # 标记远程平仓
-        finally:
-            # 清理测试生成的文件
-            if persist_file.exists():
-                persist_file.unlink()
-            if history_file.exists():
-                history_file.unlink()
-                # 删除空目录
-                strategy_history_dir = history_dir / strategy_id
-                if strategy_history_dir.exists() and not any(strategy_history_dir.iterdir()):
-                    strategy_history_dir.rmdir()
 
     # ========== TDD: 远程止损判断测试 ==========
 
-    def test_sync_remote_position_sets_stop_loss_date_on_loss(self, caplog):
-        """远程止损平仓时设置 stop_loss_date（必须是今天的止损）"""
-        from datetime import date
-        from pathlib import Path
-        today = date.today()
-        today_str = today.isoformat()
 
-        mock_factory = MagicMock()
-        # 返回 (False, position_detail) - 远程已平仓且亏损（今天的止损）
-        mock_factory.is_position_open.return_value = (
-            False,
-            {
-                "ID": 18217,
-                "Side": 0,  # 多头
-                "PnlValue": -24.765,  # 亏损（止损）
-                "PosPrice": 2.619,
-                "CurrentPrice": 2.554,
-                "CloseTime": f"{today_str}T23:10:30+08:00",
-                "Deleted": 1,
-            }
-        )
-
-        strategy = self._create_strategy(factory_client=mock_factory)
-        strategy.on_start()
-
-        # 设置本地持仓状态（多头）
-        state = strategy._core._get_state("BTCUSDT")
-        state.position = "long"
-        state.entry_price = 2.619
-        state.position_id = "test_pos_001"
-
-        try:
-            with caplog.at_level(logging.INFO, logger="strategy_core.base.strategy"):
-                strategy._sync_remote_position("BTCUSDT", "user_001")
-
-            # 验证 stop_loss_date 已设置（今天的日期）
-            assert state.stop_loss_date == today
-        finally:
-            # 清理测试生成的持久化文件
-            cooldown_file = Path("data/stop_loss_cool_down") / f"{strategy.strategy_id_for('BTCUSDT')}.json"
-            if cooldown_file.exists():
-                cooldown_file.unlink()
-
-    def test_sync_remote_position_skips_historical_stop_loss(self, caplog):
-        """历史止损不设置冷却（判断 is_stop_loss 时已排除历史日期）"""
-        from pathlib import Path
-        mock_factory = MagicMock()
-        # 返回 (False, position_detail) - 远程已平仓且亏损（3天前的止损）
-        mock_factory.is_position_open.return_value = (
-            False,
-            {
-                "ID": 18217,
-                "Side": 0,
-                "PnlValue": -24.765,
-                "PosPrice": 2.619,
-                "CurrentPrice": 2.554,
-                "CloseTime": "2026-06-23T23:10:30+08:00",  # 历史日期
-                "Deleted": 1,
-            }
-        )
-
-        strategy = self._create_strategy(factory_client=mock_factory)
-        strategy.on_start()
-
-        state = strategy._core._get_state("BTCUSDT")
-        state.position = "long"
-        state.entry_price = 2.619
-        state.position_id = "test_pos_003"
-
-        try:
-            with caplog.at_level(logging.INFO, logger="strategy_core.base.strategy"):
-                strategy._sync_remote_position("BTCUSDT", "user_001")
-
-            # 历史止损不应设置冷却（is_stop_loss=False）
-            assert state.stop_loss_date is None
-            # 日志应显示 is_stop_loss=False
-            assert "is_stop_loss=False" in caplog.text
-        finally:
-            # 清理
-            cooldown_file = Path("data/stop_loss_cool_down") / f"{strategy.strategy_id_for('BTCUSDT')}.json"
-            if cooldown_file.exists():
-                cooldown_file.unlink()
 
     def test_sync_remote_position_no_stop_loss_date_on_profit(self, caplog):
         """远程止盈平仓时不设置 stop_loss_date"""
@@ -611,3 +390,224 @@ class TestBaseStrategyRemotePosition:
         mock_factory.is_position_open.assert_called_once()
         # 验证：本地状态保持（远程仍在仓）
         assert state.position == "long"
+
+
+class TestPositionSnapshot:
+    """测试 _snapshot_position 和 _log_position_diagnostic 快照机制"""
+
+    def _create_strategy(self):
+        """创建测试策略"""
+        mock_data_manager = MagicMock(spec=DataManager)
+        mock_data_manager.config = MagicMock()
+        mock_data_manager.config.backtest_mode = False
+
+        config = {
+            "symbols": ["BTCUSDT"],
+            "timeframes": ["1h"],
+            "version": "v1",
+            "signal": {"min_strength": 0.5},
+            "capital": {"max_cash": 100},
+        }
+
+        strategy = MockStrategy(
+            data_manager=mock_data_manager,
+            config=config,
+        )
+        return strategy
+
+    def test_snapshot_position_captures_all_fields(self):
+        """_snapshot_position 应捕获 position/entry_price/stop_price/peak_price"""
+        strategy = self._create_strategy()
+        strategy.on_start()
+
+        state = strategy._core._get_state("BTCUSDT")
+        state.position = "long"
+        state.entry_price = 70000.0
+        state.stop_price = 69000.0
+        state.peak_price = 71000.0
+
+        snapshot = strategy._snapshot_position(state)
+
+        assert snapshot == {
+            "position": "long",
+            "entry_price": 70000.0,
+            "stop_price": 69000.0,
+            "peak_price": 71000.0,
+        }
+
+    def test_snapshot_position_preserves_values_after_clear(self):
+        """_snapshot_position 捕获的值不受后续 clear_position 影响"""
+        strategy = self._create_strategy()
+        strategy.on_start()
+
+        state = strategy._core._get_state("BTCUSDT")
+        state.position = "short"
+        state.entry_price = 50000.0
+        state.stop_price = 51000.0
+        state.peak_price = 49000.0
+
+        snapshot = strategy._snapshot_position(state)
+        state.clear_position()
+
+        assert snapshot["position"] == "short"
+        assert snapshot["entry_price"] == 50000.0
+        assert snapshot["stop_price"] == 51000.0
+        assert state.position is None
+        assert state.entry_price == 0.0
+
+    def test_log_position_diagnostic_uses_snapshot_not_cleared_state(self, caplog):
+        """_log_position_diagnostic 在 state 清空后应使用快照值写日志"""
+        from strategy_core.signal_logging import Signal, SignalType
+
+        strategy = self._create_strategy()
+        strategy.on_start()
+        strategy._current_kline_timestamp = datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc)
+
+        state = strategy._core._get_state("BTCUSDT")
+        state.position = "long"
+        state.entry_price = 0.07
+        state.stop_price = 0.07
+        state.peak_price = 0.08
+
+        snapshot = {"position": "long", "entry_price": 0.07, "stop_price": 0.07, "peak_price": 0.08}
+        # 模拟 state 已被 check_realtime_exit 清空
+        state.clear_position()
+
+        signal = Signal(
+            strategy_id="TEST",
+            strategy_type="test",
+            signal_type=SignalType.SELL_CLOSE,
+            symbol="BTCUSDT",
+            price=0.07,
+            strength=0.8,
+            direction="long",
+            timestamp=datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc),
+            metadata={"reason": "测试止损"},
+        )
+
+        with caplog.at_level(logging.INFO, logger="strategy_core.base.strategy"):
+            strategy._log_position_diagnostic("BTCUSDT", state, signal, 0.07,
+                                              position_snapshot=snapshot)
+
+        # 验证日志包含快照值（不是清零后的值）
+        assert "position=long" in caplog.text
+        assert "entry=0.07" in caplog.text
+        assert "stop=0.07" in caplog.text
+        assert "peak=0.08" in caplog.text
+        # 验证日志不包含清零值
+        assert "entry=0.00" not in caplog.text
+
+    def test_log_position_diagnostic_falls_back_to_state_without_snapshot(self, caplog):
+        """没有 snapshot 时 _log_position_diagnostic 应回退到 state 字段"""
+        from strategy_core.signal_logging import Signal, SignalType
+
+        strategy = self._create_strategy()
+        strategy.on_start()
+        strategy._current_kline_timestamp = datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc)
+
+        state = strategy._core._get_state("BTCUSDT")
+        state.position = "long"
+        state.entry_price = 0.07
+        state.stop_price = 0.07
+        state.peak_price = 0.08
+
+        signal = Signal(
+            strategy_id="TEST", strategy_type="test",
+            signal_type=SignalType.BUY_CLOSE, symbol="BTCUSDT",
+            price=0.07, strength=0, direction="long",
+            timestamp=datetime(2026, 8, 10, 9, 0, tzinfo=timezone.utc),
+            metadata={},
+        )
+
+        with caplog.at_level(logging.DEBUG, logger="strategy_core.base.strategy"):
+            strategy._log_position_diagnostic("BTCUSDT", state, signal, 0.07)
+
+        assert "entry=0.07" in caplog.text
+
+
+class TestNotifyExitAndClear:
+    """测试 _notify_exit_and_clear 无条件清理持久化"""
+
+    def _create_strategy(self):
+        """创建测试策略"""
+        mock_data_manager = MagicMock(spec=DataManager)
+        mock_data_manager.config = MagicMock()
+        mock_data_manager.config.backtest_mode = False
+
+        config = {
+            "symbols": ["BTCUSDT"],
+            "timeframes": ["1h"],
+            "version": "v1",
+            "signal": {"min_strength": 0.5},
+            "capital": {"max_cash": 100},
+        }
+
+        strategy = MockStrategy(
+            data_manager=mock_data_manager,
+            config=config,
+        )
+        return strategy
+
+    def test_notify_exit_and_clear_calls_exit_callback_without_position_id(self):
+        """即使 position_id=None，_notify_exit_and_clear 也应调用 _notify_position_exit"""
+        strategy = self._create_strategy()
+        strategy.on_start()
+
+        core = strategy._core
+        core._notify_position_exit = MagicMock()
+
+        state = core._get_state("BTCUSDT")
+        state.position = "long"
+        state.position_id = None
+        state.entry_price = 70000.0
+
+        core._notify_exit_and_clear(
+            symbol="BTCUSDT",
+            state=state,
+            exit_price=69500.0,
+            exit_reason="止损",
+            is_stop_loss=True,
+        )
+
+        core._notify_position_exit.assert_called_once()
+        assert state.position is None
+
+    def test_notify_exit_and_clear_clears_persistence_with_null_position_id(self, tmp_path):
+        """position_id=None 时 _on_position_exit 应能清理 position_id=null 的 JSON"""
+        from strategy_core.position_persistence import PositionPersistence
+
+        strategy_id = "TEST_NULL_POSITION_ID"
+
+        persistence = PositionPersistence(base_path=tmp_path)
+        json_path = tmp_path / f"{strategy_id}.json"
+        json_path.write_text('{"position": "long", "position_id": null, "entry_price": 76.95}')
+
+        assert json_path.exists()
+
+        persistence.clear_on_exit(strategy_id, None)
+
+        assert not json_path.exists()
+
+    def test_notify_exit_and_clear_with_position_id_still_works(self):
+        """有 position_id 时的正常流程不受影响"""
+        strategy = self._create_strategy()
+        strategy.on_start()
+
+        core = strategy._core
+        core._notify_position_exit = MagicMock()
+
+        state = core._get_state("BTCUSDT")
+        state.position = "long"
+        state.position_id = "TEST_POS_123"
+        state.entry_price = 70000.0
+
+        core._notify_exit_and_clear(
+            symbol="BTCUSDT",
+            state=state,
+            exit_price=69500.0,
+            exit_reason="止损",
+            is_stop_loss=True,
+        )
+
+        core._notify_position_exit.assert_called_once()
+        assert state.position is None

@@ -7,6 +7,12 @@
 #   discover.sh --symbols BTCUSDT --strategies ema_rsi --start 1748736000 --end 1751328000
 #   discover.sh --all-strategies --symbols BTCUSDT,ETHUSDT --start 20260101
 #   discover.sh --symbols BTCUSDT --strategies ema_rsi --start 20260601 --parallel 3
+#
+# 依赖模板 v3.7 的批量回测入口:
+#   scripts/run_backtest_batch.sh --strategies N --symbols S --start D --end D --profile P --yes
+# 该脚本内部转调 python -m backtest.batch_runner，本 skill 不直连 Python 入口。
+# 策略参数唯一来源: strategies/<name>/overrides/<SYMBOL>.yaml
+# 回测运行参数（输出目录/并发/资金/费率）: config/<profile>.yaml，本脚本自动生成
 
 set -euo pipefail
 
@@ -23,9 +29,23 @@ LOGS_DIR="${LOGS_DIR:-./logs}"
 PROJECT_DIR="${PROJECT_DIR:-.}"
 # 策略目录（相对于 PROJECT_DIR 或绝对路径）
 STRATEGIES_DIR="${STRATEGIES_DIR:-./strategies}"
-PYTHON_CMD="${PYTHON_CMD:-python3}"
+# Python 命令：默认留空，稍后按 PROJECT_DIR/.venv → python3 → python 自动探测
+PYTHON_CMD="${PYTHON_CMD:-}"
 PARALLEL="${PARALLEL:-1}"
 SKIP_ANALYSIS="${SKIP_ANALYSIS:-false}"
+# 是否为缺 overrides 的代币自动创建配置（Phase 0.55）
+# 默认 false：创建配置是写盘动作，且新配置的参数需要用户复核，
+# 不该在用户没要求时静默发生。缺配置时给出明确提示和修复命令。
+INIT_CONFIGS="${INIT_CONFIGS:-false}"
+# K 线数据目录（analyze_strategies.py 用于数据可用性检查）
+KLINE_DATA_DIR="${KLINE_DATA_DIR:-./data/klines}"
+# run-profile 名：生成 PROJECT_DIR/config/<name>.yaml
+PROFILE_NAME="${DISCOVERY_PROFILE:-discovery}"
+# 回测资金与费率（写入 profile，不影响策略参数）
+BT_CASH="${BT_CASH:-5000}"
+BT_COMMISSION="${BT_COMMISSION:-0.0004}"
+# 是否保留生成的 profile 文件（调试用）
+KEEP_PROFILE="${KEEP_PROFILE:-false}"
 
 # ===== 参数解析 =====
 while [[ $# -gt 0 ]]; do
@@ -62,12 +82,24 @@ while [[ $# -gt 0 ]]; do
             PARALLEL="$2"
             shift 2
             ;;
+        --profile)
+            PROFILE_NAME="$2"
+            shift 2
+            ;;
+        --keep-profile)
+            KEEP_PROFILE=true
+            shift
+            ;;
         --python)
             PYTHON_CMD="$2"
             shift 2
             ;;
         --skip-analysis)
             SKIP_ANALYSIS=true
+            shift
+            ;;
+        --init-configs)
+            INIT_CONFIGS=true
             shift
             ;;
         -h|--help)
@@ -79,11 +111,14 @@ while [[ $# -gt 0 ]]; do
             echo "  --all-strategies        使用策略目录下所有策略"
             echo "  --start DATE            回测开始时间（YYYYMMDD 或时间戳）"
             echo "  --end DATE              回测结束时间（默认: 当天）"
-            echo "  --config FILE           配置文件路径（默认: config.yaml）"
+            echo "  --config FILE           Discovery 自身配置文件（默认: config.yaml）"
             echo "  --output-dir DIR        输出目录（默认: ./discovery_outputs）"
-            echo "  --parallel N            并行回测数（默认: 1）"
+            echo "  --parallel N            并发回测数（写入 profile.max_workers，默认: 1）"
+            echo "  --profile NAME          run-profile 名（默认: discovery）"
+            echo "  --keep-profile          保留生成的 config/<NAME>.yaml（默认运行后删除）"
             echo "  --skip-analysis         跳过策略分析阶段 (Phase 1.5)"
-            echo "  --python CMD            Python 命令（默认: python3）"
+            echo "  --init-configs          为缺 overrides/<SYMBOL>.yaml 的代币自动创建配置"
+            echo "  --python CMD            Python 命令（默认: 自动探测 .venv/bin/python）"
             exit 0
             ;;
         *)
@@ -126,6 +161,38 @@ if [ -f "${DISCOVER_WORK_DIR}/.env" ]; then
     done < "${DISCOVER_WORK_DIR}/.env"
 fi
 
+# ===== 验证项目目录 =====
+if [ ! -d "${PROJECT_DIR}/backtest" ]; then
+    echo "❌ 项目目录不包含 backtest/ 模块: $PROJECT_DIR"
+    echo "  请设置 PROJECT_DIR 指向完整的 CTA 项目根目录"
+    echo "  如: export PROJECT_DIR=/path/to/your/cta_project"
+    exit 1
+fi
+
+PROJECT_ABS="$(cd "$PROJECT_DIR" && pwd)"
+
+# ===== 探测 Python =====
+# 模板依赖装在 .venv 里，且很多环境没有 python3 这个名字（EXIT 127）。
+# 优先级: --python/$PYTHON_CMD > PROJECT_DIR/.venv/bin/python > python3 > python
+if [ -z "$PYTHON_CMD" ]; then
+    if [ -x "${PROJECT_ABS}/.venv/bin/python" ]; then
+        PYTHON_CMD="${PROJECT_ABS}/.venv/bin/python"
+    elif command -v python3 &>/dev/null; then
+        PYTHON_CMD="python3"
+    elif command -v python &>/dev/null; then
+        PYTHON_CMD="python"
+    else
+        echo "❌ 未找到可用的 Python（尝试过 ${PROJECT_ABS}/.venv/bin/python, python3, python）"
+        echo "  用 --python /path/to/python 显式指定"
+        exit 1
+    fi
+fi
+
+if ! "$PYTHON_CMD" -c 'import sys' &>/dev/null; then
+    echo "❌ Python 命令不可用: $PYTHON_CMD"
+    exit 1
+fi
+
 # ===== 时间格式转换 =====
 parse_date() {
     local date_str="$1"
@@ -145,12 +212,19 @@ START_DATE=$(parse_date "$START_DATE")
 END_DATE="${END_DATE:-$(date +%Y%m%d)}"
 END_DATE=$(parse_date "$END_DATE")
 
+# 解析 STRATEGIES_DIR 为绝对路径（基于 PROJECT_DIR，避免 cd 后相对路径断裂）
+if [[ "$STRATEGIES_DIR" != /* ]]; then
+    STRATEGIES_DIR="${PROJECT_ABS}/${STRATEGIES_DIR#./}"
+fi
+
 # ===== 自动发现策略 =====
 if [ "$ALL_STRATEGIES" = true ]; then
     STRATEGIES=""
     for dir in "${STRATEGIES_DIR}"/*/; do
         if [ -d "$dir" ]; then
             name=$(basename "$dir")
+            # 跳过非策略目录
+            [[ "$name" == "__pycache__" || "$name" == .* ]] && continue
             if [ -z "$STRATEGIES" ]; then
                 STRATEGIES="$name"
             else
@@ -164,20 +238,11 @@ if [ "$ALL_STRATEGIES" = true ]; then
     fi
 fi
 
-# ===== 验证项目目录 =====
-if [ ! -d "${PROJECT_DIR}/backtest" ]; then
-    echo "❌ 项目目录不包含 backtest/ 模块: $PROJECT_DIR"
-    echo "  请设置 PROJECT_DIR 指向完整的 CTA 项目根目录"
-    echo "  如: export PROJECT_DIR=/path/to/your/cta_project"
-    exit 1
-fi
-
-# 解析 STRATEGIES_DIR 为绝对路径（基于 PROJECT_DIR，避免 cd 后相对路径断裂）
-if [[ "$STRATEGIES_DIR" != /* ]]; then
-    STRATEGIES_DIR="$(cd "$PROJECT_DIR" 2>/dev/null && pwd)/${STRATEGIES_DIR#./}"
-fi
-
 # ===== 创建目录 =====
+# OUTPUT_DIR 必须是绝对路径：回测在 PROJECT_DIR 下运行，相对路径会落错地方
+if [[ "$OUTPUT_DIR" != /* ]]; then
+    OUTPUT_DIR="${DISCOVER_WORK_DIR}/${OUTPUT_DIR#./}"
+fi
 mkdir -p "$OUTPUT_DIR"
 mkdir -p "$LOGS_DIR"
 
@@ -224,14 +289,14 @@ if [ "$SKIP_ANALYSIS" = false ] && [ -f "${SCRIPT_DIR}/analyze_strategies.py" ];
         2>&1 | tee -a "$LOG_FILE"; then
 
         # 从 JSON 提取 ready/partial 策略及其 symbols
-        if [ -f "$ANALYSIS_JSON" ] && command -v python3 &>/dev/null; then
+        if [ -f "$ANALYSIS_JSON" ]; then
             # 更新 STRATEGY_LIST（过滤 skip）和 SYMBOLS（从配置读取或保持用户指定）
             ANALYSIS_RESULT=$($PYTHON_CMD -c "
 import json
 with open('$ANALYSIS_JSON') as f:
     data = json.load(f)
 proceed = [s for s in data.get('strategies', []) if s.get('status') in ('ready', 'partial')]
-# 输出: strategy_name,symbol1|symbol2
+# 输出: strategy_name,symbol1,symbol2
 for s in proceed:
     syms = s.get('symbols', [])
     print(f\"{s['strategy_name']},{','.join(syms)}\")
@@ -247,7 +312,7 @@ for s in proceed:
                     sname="${line%%,*}"
                     ssyms="${line#*,}"
                     NEW_STRATEGY_LIST+=("$sname")
-                    if [ -n "$ssyms" ]; then
+                    if [ -n "$ssyms" ] && [ "$ssyms" != "$sname" ]; then
                         STRATEGY_SYMBOLS_MAP["$sname"]="$ssyms"
                     fi
                 done <<< "$ANALYSIS_RESULT"
@@ -290,79 +355,25 @@ else
     log "⚠ analyze_strategies.py 不存在，跳过策略分析"
 fi
 
-# ===== 列出回测组合 =====
-if [ -n "$ANALYSIS_JSON" ] && [ -f "$ANALYSIS_JSON" ]; then
-    # 从分析结果计算组合数
-    TOTAL_COMBINATIONS=$($PYTHON_CMD -c "
-import json
-with open('$ANALYSIS_JSON') as f:
-    data = json.load(f)
-total = sum(len(s.get('symbols', [])) for s in data.get('strategies', []) if s.get('status') in ('ready', 'partial'))
-print(total)
-" 2>/dev/null || echo "0")
-else
-    TOTAL_COMBINATIONS=$((${#STRATEGY_LIST[@]} * ${#SYMBOL_LIST[@]}))
-fi
-
-log "📋 Discovery 回测计划:"
-log "  代币: ${SYMBOLS}"
-log "  策略: ${STRATEGIES}"
-log "  时间: ${START_DATE} - ${END_DATE}"
-log "  回测组合: ${TOTAL_COMBINATIONS}"
-
-# ===== 执行回测 =====
-log "START discover.sh"
-
-# 临时文件记录并行结果
-RESULTS_DIR=$(mktemp -d)
-trap "rm -rf $RESULTS_DIR" EXIT
-
-COMBINATION_INDEX=0
-
-# run_backtest: 执行单个 (策略, 代币) 回测
-# 全局依赖: START_DATE, END_DATE, PYTHON_CMD, PROJECT_DIR, LOG_FILE, RESULTS_DIR, TOTAL_COMBINATIONS
-run_backtest() {
-    local strategy="$1"
-    local symbol="$2"
-    local bt_output_dir="$3"
-    local strategy_config="$4"
-    local idx="$5"
-
-    log "🔄 [${idx}/${TOTAL_COMBINATIONS}] ${strategy} × ${symbol}"
-
-    mkdir -p "$bt_output_dir"
-
-    # 在项目根目录下运行回测，确保 backtest/strategy_core 等模块可被找到
-    if (cd "$PROJECT_DIR" && $PYTHON_CMD -m backtest.run_backtest \
-        --strategy "$strategy" \
-        --start "$START_DATE" \
-        --end "$END_DATE" \
-        --symbol "$symbol" \
-        --config "$strategy_config" \
-        --output "$bt_output_dir" \
-        --log-level INFO) \
-        2>&1 | tee -a "$LOG_FILE"; then
-
-        if [ -f "${bt_output_dir}/backtest_result.json" ]; then
-            log "✅ ${strategy} × ${symbol}: 回测完成"
-            echo "success" > "${RESULTS_DIR}/${idx}.result"
-            return 0
-        else
-            log "⚠ ${strategy} × ${symbol}: 未产出结果"
-            echo "fail" > "${RESULTS_DIR}/${idx}.result"
-            return 1
-        fi
-    else
-        log "❌ ${strategy} × ${symbol}: 回测失败"
-        echo "fail" > "${RESULTS_DIR}/${idx}.result"
-        return 1
-    fi
-}
+# ===== 构建回测清单 =====
+# 最终由模板自带的 scripts/run_backtest_batch.sh 执行。该脚本只支持
+# 「策略 × 代币」笛卡尔积，无法表达"每个策略配不同代币"，因此这里按策略
+# 分组：每个策略一次调用，传该策略实际可回测的代币子集。
+# 策略参数唯一来源: strategies/<name>/overrides/<SYMBOL>.yaml，
+# 缺文件 wrapper 的 precheck_overrides 会直接拒绝，故这里预先过滤并解释原因。
+RUN_LIST=""
+SKIPPED_PAIRS=()
+CREATED_CONFIGS=()
+TOTAL_COMBINATIONS=0
+# 与 BATCH_STRATEGIES 下标一一对应：BATCH_SYMBOLS[i] 是该策略的代币 CSV
+BATCH_STRATEGIES=()
+BATCH_SYMBOLS=()
 
 for strategy in "${STRATEGY_LIST[@]}"; do
+    # 每个策略独立累积，避免代币串到下一个策略
+    STRATEGY_RUNNABLE=""
     # 确定当前策略的 symbols 列表
     if [ -n "$ANALYSIS_JSON" ] && [ -f "$ANALYSIS_JSON" ]; then
-        # 从分析 JSON 提取该策略的 symbols
         STRATEGY_SYMBOLS=$($PYTHON_CMD -c "
 import json
 with open('$ANALYSIS_JSON') as f:
@@ -382,55 +393,157 @@ for s in data.get('strategies', []):
     fi
 
     for symbol in "${CURRENT_SYMBOL_LIST[@]}"; do
-        COMBINATION_INDEX=$((COMBINATION_INDEX + 1))
+        [ -z "$symbol" ] && continue
+        # v3.7 单一事实来源: strategies/<name>/overrides/<SYMBOL>.yaml
+        OVERRIDE_FILE="${STRATEGIES_DIR}/${strategy}/overrides/${symbol}.yaml"
 
-        BT_OUTPUT_DIR="${OUTPUT_DIR}/${strategy}/${symbol}/${START_DATE}-${END_DATE}"
-
-        STRATEGY_CONFIG=""
-        # 优先使用分析结果中的 config_path
-        if [ -n "$ANALYSIS_JSON" ] && [ -f "$ANALYSIS_JSON" ]; then
-            STRATEGY_CONFIG=$($PYTHON_CMD -c "
-import json
-with open('$ANALYSIS_JSON') as f:
-    data = json.load(f)
-for s in data.get('strategies', []):
-    if s['strategy_name'] == '$strategy':
-        print(s.get('config_path', ''))
-        break
-" 2>/dev/null || true)
-        fi
-        if [ -z "$STRATEGY_CONFIG" ] || [ ! -f "$STRATEGY_CONFIG" ]; then
-            # Fallback: 原有配置解析逻辑
-            STRATEGY_CONFIG="${STRATEGIES_DIR}/${strategy}/config/${symbol}.yaml"
-            if [ ! -f "$STRATEGY_CONFIG" ]; then
-                STRATEGY_CONFIG="${STRATEGIES_DIR}/${strategy}/config.test.yaml"
+        # 缺配置时：--init-configs 则创建（Phase 0.55），否则记账待汇总提示。
+        # 不静默跳过 —— 用户指定了这个币却不回测它，必须说清原因和怎么修。
+        if [ ! -f "$OVERRIDE_FILE" ] && [ "$INIT_CONFIGS" = true ]; then
+            if [ -f "${SCRIPT_DIR}/init_overrides.py" ]; then
+                log "🔧 ${strategy}:${symbol} 缺配置，尝试创建..."
+                $PYTHON_CMD "${SCRIPT_DIR}/init_overrides.py" \
+                    --strategy-dir "${STRATEGIES_DIR}/${strategy}" \
+                    --symbols "$symbol" 2>&1 | tee -a "$LOG_FILE" || true
+                CREATED_CONFIGS+=("${strategy}:${symbol}")
+            else
+                log "⚠ 缺 init_overrides.py，无法自动创建配置"
             fi
         fi
 
-        if [ "$PARALLEL" -gt 1 ]; then
-            run_backtest "$strategy" "$symbol" "$BT_OUTPUT_DIR" "$STRATEGY_CONFIG" "$COMBINATION_INDEX" &
-            # 严格控制并发数：等待任意一个后台任务完成
-            while [ $(jobs -r | wc -l) -ge "$PARALLEL" ]; do
-                wait -n 2>/dev/null || sleep 1
-            done
-        else
-            run_backtest "$strategy" "$symbol" "$BT_OUTPUT_DIR" "$STRATEGY_CONFIG" "$COMBINATION_INDEX"
+        if [ ! -f "$OVERRIDE_FILE" ]; then
+            SKIPPED_PAIRS+=("${strategy}:${symbol} (缺 overrides/${symbol}.yaml)")
+            continue
         fi
+        if [ -z "$RUN_LIST" ]; then
+            RUN_LIST="${strategy}:${symbol}"
+        else
+            RUN_LIST="${RUN_LIST},${strategy}:${symbol}"
+        fi
+        if [ -z "$STRATEGY_RUNNABLE" ]; then
+            STRATEGY_RUNNABLE="$symbol"
+        else
+            STRATEGY_RUNNABLE="${STRATEGY_RUNNABLE},${symbol}"
+        fi
+        TOTAL_COMBINATIONS=$((TOTAL_COMBINATIONS + 1))
     done
+
+    # 该策略有可回测代币才登记为一次 wrapper 调用
+    if [ -n "$STRATEGY_RUNNABLE" ]; then
+        BATCH_STRATEGIES+=("$strategy")
+        BATCH_SYMBOLS+=("$STRATEGY_RUNNABLE")
+    fi
 done
 
-# 等待所有后台任务完成
-wait
+if [ ${#CREATED_CONFIGS[@]} -gt 0 ]; then
+    log "🔧 已为 ${#CREATED_CONFIGS[@]} 个组合创建 per-symbol 配置:"
+    for p in "${CREATED_CONFIGS[@]}"; do
+        log "    + $p"
+    done
+    log "  ⚠ 新建配置的 trading_mode 均为 paper_trading，参数需复核后再用于实盘决策"
+fi
 
-# 统计结果
-SUCCESS_COUNT=$(find "$RESULTS_DIR" -name "*.result" -exec cat {} \; 2>/dev/null | grep -c "success" || echo 0)
-FAIL_COUNT=$(find "$RESULTS_DIR" -name "*.result" -exec cat {} \; 2>/dev/null | grep -c "fail" || echo 0)
+if [ ${#SKIPPED_PAIRS[@]} -gt 0 ]; then
+    log "⚠ 跳过 ${#SKIPPED_PAIRS[@]} 个组合（缺少 per-symbol overrides）:"
+    for p in "${SKIPPED_PAIRS[@]}"; do
+        log "    - $p"
+    done
+    log "  说明: v3.7 策略参数唯一来源是 strategies/<name>/overrides/<SYMBOL>.yaml"
+    if [ "$INIT_CONFIGS" = false ]; then
+        log "  修复: 加 --init-configs 自动创建，或手工执行:"
+        log "        $PYTHON_CMD ${SCRIPT_DIR}/init_overrides.py \\"
+        log "            --strategy-dir ${STRATEGIES_DIR}/<策略名> --symbols <代币>"
+    fi
+fi
 
-# ===== 汇总 =====
-log "END discover.sh: ${TOTAL_COMBINATIONS} combinations, ${SUCCESS_COUNT} success, ${FAIL_COUNT} failed"
+if [ -z "$RUN_LIST" ]; then
+    log "❌ 无可回测组合（全部缺少 overrides 文件）"
+    exit 1
+fi
+
+log "📋 Discovery 回测计划:"
+log "  代币: ${SYMBOLS}"
+log "  策略: ${STRATEGIES}"
+log "  时间: ${START_DATE} - ${END_DATE}"
+log "  回测组合: ${TOTAL_COMBINATIONS}"
+log "  运行清单: ${RUN_LIST}"
+
+# ===== 生成 run-profile =====
+# v3.7 把 output_dir/cash/commission/并发数下放到 config/<profile>.yaml。
+# data_dir 由 make_profile.py 照抄 settings.yaml 的 csv_dir（模板启动时强校验）。
+PROFILE_PATH="${PROJECT_ABS}/config/${PROFILE_NAME}.yaml"
+PROFILE_PREEXISTED=false
+[ -f "$PROFILE_PATH" ] && PROFILE_PREEXISTED=true
+
+if [ ! -f "${SCRIPT_DIR}/make_profile.py" ]; then
+    log "❌ 缺少 make_profile.py（应与 discover.sh 同目录）"
+    exit 1
+fi
+
+if ! $PYTHON_CMD "${SCRIPT_DIR}/make_profile.py" \
+    --project-dir "$PROJECT_ABS" \
+    --name "$PROFILE_NAME" \
+    --output-dir "$OUTPUT_DIR" \
+    --cash "$BT_CASH" \
+    --commission "$BT_COMMISSION" \
+    --max-workers "$PARALLEL" \
+    2>&1 | tee -a "$LOG_FILE"; then
+    log "❌ 生成 run-profile 失败: $PROFILE_PATH"
+    exit 1
+fi
+
+log "🧩 run-profile: ${PROFILE_PATH} (output_dir=${OUTPUT_DIR}, max_workers=${PARALLEL})"
+
+# 运行结束后清理生成的 profile（除非用户要求保留或文件本来就存在）
+cleanup_profile() {
+    if [ "$KEEP_PROFILE" = false ] && [ "$PROFILE_PREEXISTED" = false ]; then
+        rm -f "$PROFILE_PATH"
+    fi
+}
+trap cleanup_profile EXIT
+
+# ===== 执行回测 =====
+# 转调模板自带 scripts/run_backtest_batch.sh，而不是直接调 backtest.batch_runner。
+# 理由: 该 wrapper 承载了 overrides 预检、笛卡尔积展开、PYTHONPATH 设置、
+# exec 移交退出码等逻辑；skill 自己再实现一遍会与模板形成两套执行路径，
+# 模板升级时必然漂移。
+# --yes: skill 是非交互环境，wrapper 在任务数 > 6 时会 read 提示，必须跳过。
+# 并发仍由 profile.max_workers 控制（wrapper 不接受并发参数）。
+# 注意: 刻意不用 --daemon —— batch_runner 该模式重建子命令时会丢掉
+# --run/--start/--end，等于跑成空清单。需要后台请在外层 nohup 本脚本。
+log "START discover.sh"
+
+BATCH_SCRIPT="${PROJECT_ABS}/scripts/run_backtest_batch.sh"
+if [ ! -f "$BATCH_SCRIPT" ]; then
+    log "❌ 模板批量回测脚本不存在: $BATCH_SCRIPT"
+    log "  说明: 本 skill 依赖模板 v3.7 的 scripts/run_backtest_batch.sh"
+    exit 1
+fi
+
+BATCH_EXIT=0
+for i in "${!BATCH_STRATEGIES[@]}"; do
+    bs="${BATCH_STRATEGIES[$i]}"
+    bsym="${BATCH_SYMBOLS[$i]}"
+    log "▶ 回测 ${bs} → ${bsym}"
+    (cd "$PROJECT_ABS" && bash "$BATCH_SCRIPT" \
+        --strategies "$bs" \
+        --symbols "$bsym" \
+        --start "$START_DATE" \
+        --end "$END_DATE" \
+        --profile "$PROFILE_NAME" \
+        --log-level INFO \
+        --yes) 2>&1 | tee -a "$LOG_FILE" || BATCH_EXIT=1
+done
+
+# ===== 统计结果 =====
+# 产物结构（backtest_reporter.py）: {output_dir}/{strategy}/{date}/{time}/{symbol}/
+SUCCESS_COUNT=$(find "$OUTPUT_DIR" -name "backtest_result.json" -newermt "-1 day" 2>/dev/null | wc -l | tr -d ' ')
+FAIL_COUNT=$((TOTAL_COMBINATIONS - SUCCESS_COUNT))
+[ "$FAIL_COUNT" -lt 0 ] && FAIL_COUNT=0
+
+log "END discover.sh: ${TOTAL_COMBINATIONS} combinations, ${SUCCESS_COUNT} results, ${FAIL_COUNT} missing"
 
 # ===== 生成对比报告 =====
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPORT_FILE="${OUTPUT_DIR}/discovery-report-${START_DATE}-${END_DATE}.md"
 
 if [ -f "${SCRIPT_DIR}/generate_report.py" ]; then
@@ -438,12 +551,12 @@ if [ -f "${SCRIPT_DIR}/generate_report.py" ]; then
         --output-dir "$OUTPUT_DIR" \
         --start "$START_DATE" \
         --end "$END_DATE" \
-        2>/dev/null || log "⚠ 报告生成失败"
+        2>&1 | tee -a "$LOG_FILE" || log "⚠ 报告生成失败"
     log "📊 报告已输出: ${REPORT_FILE}"
 else
     log "⚠ generate_report.py 不存在，跳过报告生成"
 fi
 
-if [ $FAIL_COUNT -gt 0 ]; then
+if [ "$BATCH_EXIT" -ne 0 ] || [ "$FAIL_COUNT" -gt 0 ]; then
     exit 1
 fi

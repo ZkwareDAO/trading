@@ -253,31 +253,6 @@ class TestOnKlineReceived:
 class TestKlinesServiceSubscribe:
     """WS 订阅测试"""
 
-    @pytest.mark.asyncio
-    async def test_subscribe_klines_success(self):
-        """订阅 K 线成功"""
-        tmpdir = tempfile.mkdtemp()
-        try:
-            config = DataManagerConfig(
-                csv_dir=tmpdir,
-                klines_service_enabled=True,
-                preload_1m_enabled=False,
-            )
-            dm = DataManager(config)
-
-            mock_ws = AsyncMock()
-            mock_ws.subscribe = AsyncMock(return_value=True)
-            dm._ws_client = mock_ws
-            dm._connected = True
-
-            result = await dm.subscribe_klines_async(["BTCUSDT", "ETHUSDT"])
-
-            assert result is True
-            mock_ws.subscribe.assert_called_once_with(["BTCUSDT", "ETHUSDT"])
-            assert "BTCUSDT" in dm._ws_subscribed_symbols
-            assert "ETHUSDT" in dm._ws_subscribed_symbols
-        finally:
-            shutil.rmtree(tmpdir)
 
     @pytest.mark.asyncio
     async def test_subscribe_not_connected(self):

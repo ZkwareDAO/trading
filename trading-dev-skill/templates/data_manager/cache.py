@@ -103,7 +103,8 @@ class ShardCache:
             trimmed = df
             max_rows = self.config.default_1m_rows_limit
             if len(trimmed) > max_rows:
-                trimmed = trimmed.tail(max_rows).copy()
+                # iloc 切片是惰性视图（pandas CoW），避免 50 万行 eager copy
+                trimmed = trimmed.iloc[-max_rows:]
                 logger.debug(f"{sym}: 1m 数据裁剪为 {max_rows} 行")
             self._1m_cache[sym] = trimmed
 

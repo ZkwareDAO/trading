@@ -9,11 +9,11 @@ Execute the trading-discovery skill with the user's arguments. Route to the SKIL
 
 | Command | Description |
 |---------|-------------|
-| `/trading-discover run --symbols S1,S2 --strategies ST1,ST2 --start DATE --end DATE` | Run discovery backtest with specified symbols, strategies, and date range |
-| `/trading-discover run --all-strategies --symbols S1,S2 --start DATE` | All strategies × specified symbols |
-| `/trading-discover compare --date YYYYMMDD` | View discovery results comparison |
-| `/trading-discover report --date YYYYMMDD` | Generate discovery comparison report |
+| `/trading-discovery run --symbols S1,S2 --strategies ST1,ST2 --start DATE --end DATE` | Run discovery backtest with specified symbols, strategies, and date range |
+| `/trading-discovery run --all-strategies --symbols S1,S2 --start DATE` | All strategies × specified symbols |
+| `/trading-discovery compare --date YYYYMMDD` | View discovery results comparison |
+| `/trading-discovery report --date YYYYMMDD` | Generate discovery comparison report |
 
 Time format: `YYYYMMDD` (e.g. `20260601`) or Unix timestamp (e.g. `1748736000`).
 
-Pass any arguments after `/trading-discover` directly to the skill execution.
+Pass any arguments after `/trading-discovery` directly to the skill execution.

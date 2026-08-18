@@ -1,4 +1,3 @@
-# NOTE: IP addresses in this test are mock values, not real endpoints
 #!/usr/bin/env python3
 """
 测试 HTTP 信号发送器日志功能
@@ -35,7 +34,7 @@ class TestHttpSenderLogging:
 
     def test_log_request_params_on_send(self, caplog):
         """发送请求时应记录请求参数"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
 
         signal = self._make_signal()
 
@@ -53,12 +52,12 @@ class TestHttpSenderLogging:
         # 验证请求日志
         assert "HTTP 信号发送请求" in log_text, f"应记录请求日志，实际：{log_text}"
         assert "signal_id=test_001" in log_text, f"应记录 signal_id，实际：{log_text}"
-        assert "url=http://127.0.0.1:18888/api/v1/kafka/message" in log_text, f"应记录 URL，实际：{log_text}"
+        assert "url=http://203.0.113.23:18888/api/v1/kafka/message" in log_text, f"应记录 URL，实际：{log_text}"
         assert "symbol=BTCUSDT" in log_text, f"应记录 symbol，实际：{log_text}"
 
     def test_log_response_on_success(self, caplog):
         """收到成功响应时应记录响应结果"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
 
         signal = self._make_signal()
 
@@ -80,7 +79,7 @@ class TestHttpSenderLogging:
 
     def test_log_response_on_failure(self, caplog):
         """收到失败响应时应记录 WARNING 日志"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
 
         signal = self._make_signal()
 
@@ -102,7 +101,7 @@ class TestHttpSenderLogging:
 
     def test_log_on_exception(self, caplog):
         """发生异常时应记录 WARNING 日志"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
 
         signal = self._make_signal()
 

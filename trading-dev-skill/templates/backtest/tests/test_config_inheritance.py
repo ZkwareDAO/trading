@@ -1,59 +1,17 @@
 #!/usr/bin/env python3
 """
-测试配置继承和覆盖功能
+测试配置覆盖合并功能
 
 覆盖：
-- resolve_strategy_config_path: 配置路径解析
 - merge_config_with_overrides: 深度合并配置
+
+注：原 TestResolveStrategyConfigPath 已随 legacy 配置路径解析函数
+（resolve_strategy_config_path）一并删除——per-symbol 路径现由
+StrategiesLoader 统一生成为 strategies/<name>/overrides/<SYMBOL>.yaml。
 """
 
 import pytest
-from backtest.config_loader import (
-    resolve_strategy_config_path,
-    merge_config_with_overrides,
-)
-
-
-class TestResolveStrategyConfigPath:
-    """测试配置路径解析"""
-
-    def test_default_path(self):
-        """测试默认路径解析"""
-        path = resolve_strategy_config_path("cta_ict_v3", "BTCUSDT")
-        assert path == "config/strategies/cta_ict_v3/BTCUSDT.yaml"
-
-    def test_global_config_path(self):
-        """测试全局 config_path"""
-        path = resolve_strategy_config_path(
-            "cta_ict_v3",
-            "BTCUSDT",
-            global_config_path="config/zktrading",
-        )
-        assert path == "config/zktrading/cta_ict_v3/BTCUSDT.yaml"
-
-    def test_strategy_level_config_path(self):
-        """测试策略级 config_path 优先级最高"""
-        path = resolve_strategy_config_path(
-            "cta_ict_v3",
-            "BTCUSDT",
-            global_config_path="config/strategies",
-            strategy_config_path="config/zktrading",
-        )
-        assert path == "config/zktrading/cta_ict_v3/BTCUSDT.yaml"
-
-    def test_relative_path_with_dot_slash(self):
-        """测试相对路径（带 ./ 前缀）"""
-        path = resolve_strategy_config_path(
-            "cta_ict_v3",
-            "BTCUSDT",
-            global_config_path="./config/strategies",
-        )
-        assert path == "./config/strategies/cta_ict_v3/BTCUSDT.yaml"
-
-    def test_lowercase_symbol(self):
-        """测试小写 symbol（应转为大写）"""
-        path = resolve_strategy_config_path("cta_ict_v3", "btcusdt")
-        assert path == "config/strategies/cta_ict_v3/BTCUSDT.yaml"
+from backtest.config_loader import merge_config_with_overrides
 
 
 class TestMergeConfigWithOverrides:

@@ -1,5 +1,9 @@
 # Trading Deploy Skill — 全局配置模板
 # 复制为 config.yaml 并根据实际环境修改
+#
+# 注意：策略参数（周期/阈值/止损/资金/杠杆）不在本文件配置。
+# 唯一来源是 strategies/<name>/overrides/<SYMBOL>.yaml 的 params / capital /
+# risk 段 —— 实盘与回测读的都是那一份。在这里写策略参数不会有任何效果。
 
 strategies:
   git_url: ${STRATEGIES_GIT_URL}
@@ -15,14 +19,12 @@ deploy:
     key: ${DEPLOY_KEY:-~/.ssh/id_rsa}
   default_strategy: ""
   default_symbols: []
-
-runtime:
-  capital: ${DEFAULT_CAPITAL:-10000}
-  leverage: ${DEFAULT_LEVERAGE:-1}
-  max_positions: ${MAX_POSITIONS:-3}
-  position_size_pct: ${POSITION_SIZE_PCT:-0.1}
-  stop_loss_pct: 0.05
-  take_profit_pct: 0.15
+  # 运行模式：留空则由 overrides/<SYMBOL>.yaml 决定，
+  # 而该文件缺省 trading_mode 时框架按 live 处理（会下真单）。
+  # 首次部署建议显式 paper_trading 或 smoking。
+  trading_mode: ${TRADING_MODE:-}
+  # 是否把策略登记进项目的 config/strategies.yaml（编排层，实盘回测共用）
+  register: false
 
 websocket:
   ws_url: ${WS_URL:-wss://stream.binance.com:9443/ws}
@@ -31,8 +33,10 @@ websocket:
   reconnect_delay: ${WS_RECONNECT_DELAY:-5}
 
 paths:
+  # CTA 项目根目录（含 run_strategy.py / config/ / strategies/）
+  project_dir: ${PROJECT_DIR:-.}
   strategies_dir: ${STRATEGIES_DIR:-./strategies}
   data_dir: ${DATA_PATH:-./data}
-  kline_data_dir: ${KLINE_DATA_DIR:-./data/strategies/1m}
+  kline_data_dir: ${KLINE_DATA_DIR:-./data/klines}
   logs_dir: ${LOGS_DIR:-./logs}
   deploy_outputs_dir: ${DEPLOY_OUTPUTS_DIR:-./deploy_outputs}

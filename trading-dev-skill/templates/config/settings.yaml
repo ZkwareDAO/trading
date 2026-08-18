@@ -1,0 +1,84 @@
+# =============================================================================
+# 系统配置 - 实盘/回测共用（开源示例配置）
+# =============================================================================
+# 此文件包含系统级配置（数据管理、信号日志、策略引擎等）
+# 策略运行配置在 strategies/<name>/overrides/<symbol>.yaml 中（per-symbol）
+#
+# 使用方式：
+#   实盘: python run_strategies_manager.py
+#   单策略: python run_strategy.py --name <name> --symbol <SYMBOL>
+#   回测: python -m backtest.run_backtest
+#
+# 注意：外部服务地址均用 ${ENV_VAR} 占位，未设置时对应功能自动降级：
+#   - KLINES_WS_URL / KLINES_HTTP_URL 未设 → 回退 Binance 公共源
+#   - FACTORY_ENDPOINT / POSITION_PROXY_URL 未设 → 跳过 factory 注册与远程仓位
+#   - KAFKA_BOOTSTRAP_SERVERS 未设 → kafka.enabled=false 已禁用
+#   - SIGNAL_HUB_ENDPOINT 未设 → signal_hub.enabled 应置 false
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# 策略引擎配置
+# -----------------------------------------------------------------------------
+strategy_engine:
+  # factory-service RPC 端点与仓位代理。未配置（环境变量未设）时：
+  #   - 跳过 factory-service 注册/心跳/回调
+  #   - 远程仓位查询不可用，策略以本地持久化仓位为准
+  factory_endpoint: "${FACTORY_ENDPOINT}"
+  position_proxy_url: "${POSITION_PROXY_URL}"
+  strategies_dir: "./strategies"
+
+  # 回调服务配置（仅 factory_endpoint 配置时生效）
+  # factory-service 通过此端口反向通知策略启停/暂停/参数变更
+  callback_port: 8892
+  callback_host: "0.0.0.0"  # 局域网访问 0.0.0.0，仅本机 127.0.0.1
+
+  # 止损止盈检测模式
+  # true:  使用 bar_high/bar_low（闭合 K 线的最高/最低价，更准确检测 K 线内价格波动）
+  # false: 使用 current_price（K 线收盘价，简单但可能遗漏 K 线内的止损触发）
+  use_bar_high_low_for_exit: false
+
+# -----------------------------------------------------------------------------
+# 数据管理器配置
+# -----------------------------------------------------------------------------
+data_manager:
+  csv_dir: "./data/klines"
+  csv_filename_pattern: "{symbol}_{timeframe}.csv"
+  cache_max_size: 10000
+  auto_load: true
+
+  # 实时数据源（WebSocket）。未配置时回退 Binance 公共 WS + fapi
+  klines_service_enabled: true
+  klines_service_ws_url: "${KLINES_WS_URL}"
+  klines_service_http_url: "${KLINES_HTTP_URL}"
+
+  # 启动时补齐历史数据的天数上限（run_strategy.py 读取）
+  sync_history_days: 30
+
+# -----------------------------------------------------------------------------
+# 信号日志配置
+# -----------------------------------------------------------------------------
+signal_logging:
+  storage:
+    type: "csv"
+    path: "./data/signals"
+  retention_days: 90
+  enable_realtime_push: true
+  kafka:
+    enabled: false
+    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"
+    topic: "strategy_signals"
+    max_retries: 3
+    retry_backoff_ms: 1000
+    acks: "all"
+    compression: "gzip"
+    dedup_file: "./data/signals/.kafka_sent_ids"
+    dedup_max_size: 10000
+
+# -----------------------------------------------------------------------------
+# Signal Hub 配置（HTTP 推送信号到 Kafka 入口）
+# -----------------------------------------------------------------------------
+signal_hub:
+  enabled: true
+  endpoint: "${SIGNAL_HUB_ENDPOINT}"
+  # API 路径（v1 包装结构 / v2 直接序列化，由 http_sender 按版本号决定 payload）
+  api_path: "/api/v1/kafka/message"

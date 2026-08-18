@@ -28,10 +28,6 @@ Data Manager 是量化交易策略系统的数据接入层，为策略层提供�
 │  │KlineRepo     │  │ WS Client    │             │
 │  │(多TF聚合)    │  │ (实时推送)    │             │
 │  └──────────────┘  └──────────────┘             │
-│  ┌──────────────┐  ┌──────────────┐             │
-│  │BacktestLoader│  │ MarketChart  │             │
-│  │(回测数据)    │  │ (图表数据)    │             │
-│  └──────────────┘  └──────────────┘             │
 └────────────────────┬────────────────────────────┘
                      ↓
 ┌─────────────────────────────────────────────────┐
@@ -52,10 +48,7 @@ Data Manager 是量化交易策略系统的数据接入层，为策略层提供�
 | `klines_ws_client.py` | WebSocket 实时 K 线接收（无限重连、退避上限 120s） |
 | `klines_loader.py` | K 线数据加载、重采样、CSV 持久化 |
 | `klines_data.py` | 共享 Kline 数据类 |
-| `backtest_data_loader.py` | 回测数据智能加载器 |
 | `indicators.py` | 技术指标计算（ADX, EMA, RSI, MACD, BOLL, ATR, KD, Envelope） |
-| `market_chart.py` | 市场图表数据 |
-| `market_judgment_engine.py` | 市场判断引擎 |
 
 ---
 
@@ -128,8 +121,8 @@ data_manager:
   cache_max_size: 10000
   auto_load: true
   klines_service_enabled: true
-  klines_service_ws_url: "ws://127.0.0.1:17081/ws/klines"
-  klines_service_http_url: "http://127.0.0.1:17081"
+  klines_service_ws_url: "${KLINES_WS_URL}"
+  klines_service_http_url: "${KLINES_HTTP_URL}"
 ```
 
 DataManagerConfig 字段:

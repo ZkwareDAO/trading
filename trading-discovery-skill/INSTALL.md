@@ -50,11 +50,11 @@ claude plugin install trading-discovery@trading-skills --scope local
 ln -s /path/to/trading/trading-discovery-skill ~/.claude/skills/trading-discovery
 ```
 
-无需重启，下次对话自动加载。symlink 模式不注册斜杠命令，需 `/trading-discover` 时用方式 1/2。
+无需重启，下次对话自动加载。symlink 模式不注册斜杠命令，需 `/trading-discovery` 时用方式 1/2。
 
 ## 验证安装
 
-在 Claude Code 中输入 `/trading-discover`，应看到 skill 被激活。
+在 Claude Code 中输入 `/trading-discovery`，应看到 skill 被激活。
 
 或 CLI 查询：
 
@@ -97,8 +97,8 @@ trading-discovery-skill/
 ## 使用流程
 
 ```
-/trading-discover run --symbols BTCUSDT,ETHUSDT --strategies ema_rsi,ict_v4 --start 20260601 --end 20260701
-/trading-discover run --all-strategies --symbols BTCUSDT --start 20260101
+/trading-discovery run --symbols BTCUSDT,ETHUSDT --strategies ema_rsi,ict_v4 --start 20260601 --end 20260701
+/trading-discovery run --all-strategies --symbols BTCUSDT --start 20260101
 ```
 
 详细流程见 SKILL.md。

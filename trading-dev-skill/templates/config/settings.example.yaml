@@ -1,104 +1,178 @@
 # =============================================================================
-# 系统配置模板 - 实盘/回测共用
+# 系统配置示例 - 实盘/回测共用
 # =============================================================================
-# 复制此文件到 config/settings.yaml 并根据需要修改
-# 所有部署相关配置通过环境变量注入，不硬编码 IP 或密钥
+# 复制此文件到 config/settings.yaml 并根据实际环境填写
+#
+# 本文件说明系统级配置（数据管理、信号日志、策略引擎等）。
+# 策略运行配置在 strategies/<name>/overrides/<symbol>.yaml 中（per-symbol）。
 #
 # 使用方式：
-#   实盘: python run_strategies_manager.py
-#   回测: python -m backtest.batch_runner
-# =============================================================================
-# 环境变量支持：
-#   - 使用 ${VAR_NAME} 语法引用环境变量
-#   - 启动前需设置对应环境变量（参见 .env.example）
+#   多策略: python run_strategies_manager.py
+#   单策略: python run_strategy.py --name <name> --symbol <SYMBOL>
+#   回测:   python -m backtest.run_backtest
+#
+# 模块说明：
+#   - strategy_engine: 策略引擎（factory 连接、止损检测模式）
+#   - data_manager:    数据管理器（K线 CSV + WebSocket 实时推送）
+#   - signal_logging:  信号日志（CSV 持久化 + Kafka 推送）
+#   - signal_hub:      Signal Hub（HTTP 推送信号到 Kafka 入口）
+#
+# 环境变量：用 ${VAR_NAME} 引用，未设置时该值为 None，对应功能自动降级：
+#   - KLINES_WS_URL / KLINES_HTTP_URL 未设 → 回退 Binance 公共 WS + fapi
+#   - FACTORY_ENDPOINT / POSITION_PROXY_URL 未设 → 跳过 factory 注册/心跳/回调、远程仓位不可用
+#   - KAFKA_BOOTSTRAP_SERVERS 未设 → kafka.enabled 保持 false
+#   - SIGNAL_HUB_ENDPOINT 未设 → signal_hub.enabled 应置 false（否则 HTTP 推送失败）
 # =============================================================================
 
 # -----------------------------------------------------------------------------
 # 策略引擎配置
 # -----------------------------------------------------------------------------
+# 管理策略生命周期。factory_endpoint / position_proxy_url 未配置时，
+# 策略以本地持久化仓位（data/positions/{strategy_id}.json）为准，独立运行。
+#
+# 关键字段：
+#   - factory_endpoint:    factory-service RPC 地址（策略注册/心跳）。None → 跳过
+#   - position_proxy_url:  Position 代理地址（远程仓位查询）。None → 不可用
+#   - strategies_dir:      策略子模块目录
+#   - callback_port/host:  回调服务（仅 factory_endpoint 配置时生效）
+#   - use_bar_high_low_for_exit: 止损止盈检测价格源
+# -----------------------------------------------------------------------------
 strategy_engine:
+  # factory-service 地址（策略通过此端口注册和发送心跳）
+  # 未配置时：跳过 factory-service 注册/心跳/回调，策略独立本地运行
   factory_endpoint: "${FACTORY_ENDPOINT}"
+
+  # Position 代理地址（用于查询实时仓位）
+  # 未配置时：远程仓位查询不可用，策略以本地持久化仓位为准
   position_proxy_url: "${POSITION_PROXY_URL}"
-  heartbeat_interval_ms: 5000
-  auto_register: true
+
+  # 策略模块目录（存放各策略实现代码）
   strategies_dir: "./strategies"
-  callback_port: ${CALLBACK_PORT}
-  callback_host: "${CALLBACK_HOST}"
-  enable_callback: true
+
+  # 回调服务配置（仅 factory_endpoint 配置时生效）
+  # factory-service 通过此端口反向通知策略启停/暂停/参数变更
+  callback_port: 8892
+  callback_host: "0.0.0.0"  # 局域网访问 0.0.0.0，仅本机 127.0.0.1
+
+  # 止损止盈检测模式
+  # true:  使用 bar_high/bar_low（闭合 K 线最高/最低价，更准确检测 K 线内价格波动）
+  # false: 使用 current_price（K 线收盘价，简单但可能遗漏 K 线内的止损触发）
+  use_bar_high_low_for_exit: false
 
 # -----------------------------------------------------------------------------
 # 数据管理器配置
 # -----------------------------------------------------------------------------
+# K线数据源：CSV 本地文件 + WebSocket 实时推送。
+# klines_service_ws_url / klines_service_http_url 未配置时回退 Binance 公共源。
+#
+# 关键字段：
+#   - csv_dir:                K线 CSV 文件目录
+#   - csv_filename_pattern:   CSV 文件命名格式（变量: {symbol}, {timeframe}）
+#   - klines_service_ws_url:  实时 K线 WebSocket 地址（None → 回退 Binance fstream）
+#   - klines_service_http_url: 历史 K线 HTTP 地址（None → 回退 Binance fapi）
+#   - cache_max_size:         内存缓存最大条数
+#   - sync_history_days:      启动时补齐历史数据天数上限（run_strategy.py 读取）
+# -----------------------------------------------------------------------------
 data_manager:
-  csv_dir: "${DATA_PATH}/klines"
+  # K线 CSV 文件目录（历史数据）
+  csv_dir: "./data/klines"
+
+  # CSV 文件命名格式（支持变量: {symbol}, {timeframe}）
   csv_filename_pattern: "{symbol}_{timeframe}.csv"
+
+  # 内存缓存配置（避免重复读取 CSV）
   cache_max_size: 10000
+
+  # 启动时是否自动加载数据（建议开启）
   auto_load: true
 
   # klines_service 配置（实时 K线推送服务）
+  # 未配置时回退 Binance 公共 WS（fstream）+ fapi 历史下载
   klines_service_enabled: true
-  klines_service_ws_url: "${KLINES_WS_URL}"
-  klines_service_http_url: "${KLINES_HTTP_URL}"
+  klines_service_ws_url: "${KLINES_WS_URL}"      # WebSocket 地址
+  klines_service_http_url: "${KLINES_HTTP_URL}"  # HTTP 地址（历史下载备用）
+
+  # 启动时补齐历史数据的天数上限（run_strategy.py 读取，默认 30）
+  sync_history_days: 30
 
 # -----------------------------------------------------------------------------
 # 信号日志配置
 # -----------------------------------------------------------------------------
+# 信号存储：CSV 持久化 + Kafka 实时推送（可选）。
+# paper_trading 模式下不发 Kafka / HTTP，仅写 CSV。
+#
+# 关键字段：
+#   - storage.type: 存储类型（目前仅支持 csv）
+#   - storage.path: 信号 CSV 存储目录（按 strategy_id 分子目录）
+#   - retention_days: 信号保留天数（自动清理）
+#   - kafka.enabled: 是否启用 Kafka 推送
+# -----------------------------------------------------------------------------
 signal_logging:
+  # 存储配置
   storage:
-    type: "csv"
-    path: "${DATA_PATH}/signals"
+    type: "csv"                # 存储类型（目前仅支持 csv）
+    path: "./data/signals"     # 信号 CSV 存储目录（路径: {path}/{strategy_id}/{YYYYMMDD}.csv）
+
+  # 信号保留天数（超过此天数的信号会被自动清理）
   retention_days: 90
+
+  # 是否启用实时推送（Kafka/HTTP）
   enable_realtime_push: true
 
-  # Kafka 配置（可选）
+  # Kafka 配置（可选，用于推送信号到下游系统）
   kafka:
-    enabled: false
-    bootstrap_servers: "${KAFKA_BROKERS}"
-    topic: "${KAFKA_TOPIC}"
-    max_retries: 3
-    retry_backoff_ms: 1000
-    acks: "all"
-    compression: "gzip"
-    dedup_file: "${DATA_PATH}/signals/.kafka_sent_ids"
-    dedup_max_size: 10000
+    enabled: false                                    # 是否启用 Kafka 推送
+    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"   # Kafka 集群地址
+    topic: "strategy_signals"                         # 推送主题
+
+    # SASL 认证（如 Kafka 需要认证，取消注释并填写）
+    # sasl_mechanism: "PLAIN"
+    # sasl_username: ""
+    # sasl_password: ""
+
+    # SSL 配置（如 Kafka 需要 SSL，取消注释并填写）
+    # ssl_cafile: ""
+
+    # 生产者配置
+    max_retries: 3              # 最大重试次数
+    retry_backoff_ms: 1000      # 重试间隔（毫秒）
+    acks: "all"                 # 确认级别（all = 所有副本确认）
+    compression: "gzip"         # 压缩算法（gzip/snappy/lz4/zstd）
+
+    # 去重配置（避免重复推送相同信号）
+    dedup_file: "./data/signals/.kafka_sent_ids"    # 已推送信号 ID 文件
+    dedup_max_size: 10000                           # 去重文件最大条数
 
 # -----------------------------------------------------------------------------
-# Signal Hub 配置
+# Signal Hub 配置（HTTP 推送信号到 Kafka 入口）
+# -----------------------------------------------------------------------------
+# Signal Hub: 接收策略信号并转发到 Kafka 下游（下单/风控系统）。
+# 未配置 endpoint 时应置 enabled: false，否则 HTTP 推送会失败重试。
+#
+# 关键字段：
+#   - enabled:  是否启用 Signal Hub 推送
+#   - endpoint: Signal Hub 服务地址
+#   - api_path: API 路径（v1 包装结构 / v2 直接序列化，由 http_sender 按版本号决定 payload）
 # -----------------------------------------------------------------------------
 signal_hub:
-  enabled: false
-  endpoint: "${SIGNAL_HUB_ENDPOINT}"
+  enabled: true                              # 是否启用 Signal Hub 推送
+  endpoint: "${SIGNAL_HUB_ENDPOINT}"         # Signal Hub 服务地址
 
-# -----------------------------------------------------------------------------
-# OpenViking 同步配置
-# -----------------------------------------------------------------------------
-openviking_sync:
-  enabled: false
-  dedup:
-    file: "${DATA_PATH}/.ov_synced_records"
-  sources:
-    signal:
-      enabled: true
-      path: "${DATA_PATH}/signals"
-    backtest:
-      enabled: true
-      paths: ["./backtest_output", "./daily_backtest_output"]
-    position:
-      enabled: true
-      path: "${DATA_PATH}/positions"
-    history_position:
-      enabled: true
-      path: "${DATA_PATH}/history_positions"
+  # API 路径（v1 包装结构 / v2 直接序列化，由 http_sender 按版本号决定 payload）
+  api_path: "/api/v1/kafka/message"  # v1 版本
+  # api_path: "/api/v2/signals"      # v2 版本（切换时注释上面，启用这行）
 
-# -----------------------------------------------------------------------------
-# OpenViking 服务器配置
-# -----------------------------------------------------------------------------
-openviking:
-  server:
-    url: "${OPENVIKING_SERVER_URL}"
-    cli_path: "ov"
-    timeout: 60.0
-  account:
-    name: "trading"
-    root_api_key: "${OPENVIKING_ROOT_API_KEY}"
-    auto_create: true
+# =============================================================================
+# 配置加载与优先级说明
+# =============================================================================
+# 系统级配置：config/settings.yaml（本文件）
+#
+# 策略级配置（per-symbol）：strategies/<name>/overrides/<symbol>.yaml
+#   运行参数优先级（高 → 低）：
+#     1. CLI 参数（--interval / --version / --trading-mode）
+#     2. overrides/<symbol>.yaml
+#     3. 代码默认值
+#
+# 运行模式 trading_mode 进入 strategy_id 后缀（LIVE/PAPER/SMOKING），
+# live 与 paper_trading 的仓位/信号/日志天然隔离，互不覆盖。
+# =============================================================================

@@ -1,4 +1,3 @@
-# NOTE: IP addresses in this test are mock values, not real endpoints
 #!/usr/bin/env python3
 """
 测试 HTTP 信号发送器支持配置 API 路径
@@ -38,13 +37,13 @@ class TestHttpSenderApiPath:
 
     def test_default_api_path_is_v1(self):
         """默认 api_path 应为 /api/v1/kafka/message（向后兼容）"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
         assert sender.api_path == "/api/v1/kafka/message"
 
     def test_custom_api_path_v2(self, caplog):
         """支持自定义 api_path（v2 版本）"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v2/signals",
         )
 
@@ -64,12 +63,12 @@ class TestHttpSenderApiPath:
         call_args = mock_post.call_args
         assert call_args is not None
         called_url = call_args[1]["url"]
-        assert called_url == "http://127.0.0.1:18888/api/v2/signals"
+        assert called_url == "http://203.0.113.23:18888/api/v2/signals"
 
     def test_custom_api_path_v1(self, caplog):
         """显式指定 v1 路径"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v1/kafka/message",
         )
 
@@ -86,12 +85,12 @@ class TestHttpSenderApiPath:
 
         assert result is True
         called_url = mock_post.call_args[1]["url"]
-        assert called_url == "http://127.0.0.1:18888/api/v1/kafka/message"
+        assert called_url == "http://203.0.113.23:18888/api/v1/kafka/message"
 
     def test_url_construction_with_api_path(self, caplog):
         """验证 base_url + api_path 正确拼接"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888/",  # 末尾有斜杠
+            base_url="http://203.0.113.23:18888/",  # 末尾有斜杠
             api_path="/api/v2/signals",
         )
 
@@ -108,7 +107,7 @@ class TestHttpSenderApiPath:
         assert result is True
         called_url = mock_post.call_args[1]["url"]
         # 不应有双斜杠
-        assert called_url == "http://127.0.0.1:18888/api/v2/signals"
+        assert called_url == "http://203.0.113.23:18888/api/v2/signals"
 
 
 class TestRunStrategyReadsApiPath:
@@ -120,7 +119,7 @@ class TestRunStrategyReadsApiPath:
         global_config = {
             "signal_hub": {
                 "enabled": True,
-                "endpoint": "http://127.0.0.1:8891",
+                "endpoint": "http://203.0.113.100:8891",
                 "api_path": "/api/v2/signals",
             },
             "signal_logging": {
@@ -167,7 +166,7 @@ class TestRunStrategyReadsApiPath:
         global_config = {
             "signal_hub": {
                 "enabled": True,
-                "endpoint": "http://127.0.0.1:8891",
+                "endpoint": "http://203.0.113.100:8891",
                 # 无 api_path 配置
             },
             "signal_logging": {

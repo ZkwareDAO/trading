@@ -27,6 +27,7 @@ import argparse
 import asyncio
 import logging
 import os
+import re
 import signal as signal_lib
 import sys
 import yaml
@@ -34,8 +35,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List
 
 from strategy_core.factory_client import FactoryClient
-from strategy_core.utils.strategy_naming import build_strategy_id, build_strategy_name
-from strategy_core.utils.strategy_loader import get_strategy_name_params
+from strategy_core.utils.strategy_naming import build_strategy_id_from_overrides
 from strategy_core.utils.log_handlers import DailyDirectoryFileHandler
 from strategy_core.utils.strategies_loader import StrategiesLoader
 
@@ -44,18 +44,56 @@ logger = logging.getLogger(__name__)
 # 策略进程启动命令
 STRATEGY_PROCESS_CMD = [sys.executable, str(Path(__file__).parent / "run_strategy.py")]
 
+# ${VAR} 占位符正则
+_ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+
+def _resolve_env_placeholders(obj: Any) -> Any:
+    """递归解析配置中的 ${VAR} 占位符为环境变量值
+
+    环境变量未设置时替换为 None（而非保留字面量 ${VAR}），
+    让下游判断 None 走回退逻辑。
+    """
+    if isinstance(obj, dict):
+        return {k: _resolve_env_placeholders(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_resolve_env_placeholders(v) for v in obj]
+    if isinstance(obj, str):
+        m = _ENV_PATTERN.fullmatch(obj.strip())
+        if m:
+            return os.environ.get(m.group(1))
+        return _ENV_PATTERN.sub(
+            lambda mm: (os.environ.get(mm.group(1)) or ""), obj
+        )
+    return obj
+
+
 def load_yaml_config(config_path: str) -> Dict[str, Any]:
-    """加载 YAML 配置文件"""
+    """加载 YAML 配置文件，并解析 ${VAR} 占位符为环境变量值"""
     path = Path(config_path)
     if not path.exists():
         logging.warning(f"配置文件不存在：{config_path}")
         return {}
     with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        raw = yaml.safe_load(f) or {}
+    return _resolve_env_placeholders(raw)
+
+
+def load_engine_config(system_config_path: str = "config/settings.yaml") -> Dict[str, Any]:
+    """加载系统配置，返回 strategy_engine 段
+
+    manager 只需要 strategy_engine 段（factory_endpoint / position_proxy_url 等），
+    策略运行清单由 StrategiesLoader 从 strategies.yaml 独立读取，无需合并。
+    """
+    system_config = load_yaml_config(system_config_path)
+    return system_config.get("strategy_engine", {}) or {}
 
 
 def merge_configs(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """合并两个配置字典（override 覆盖 base）"""
+    """合并两个配置字典（override 覆盖 base）
+
+    仅供 load_merged_config（向后兼容）使用。
+    """
     result = dict(base)
     for key, value in override.items():
         if key in result and isinstance(result[key], dict) and isinstance(value, dict):
@@ -66,23 +104,52 @@ def merge_configs(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, A
     return result
 
 
+def parse_explicit_strategies(raw: Optional[str]) -> List[tuple]:
+    """解析运行清单字符串为 (name, symbol) 列表
+
+    三个入口共用：manager --run / run_backtest --strategies / batch_runner --run。
+    因调用方的 flag 名不同，报错信息不写具体 flag 名。
+
+    格式: name:symbol,name:symbol
+    示例: sar_snt3_v3:BTCUSDT,obv_atr_v2:ETHUSDT
+
+    Args:
+        raw: CLI 传入的原始字符串
+
+    Returns:
+        [(strategy_name, symbol), ...]，输入为空返回 []
+    """
+    if not raw or not raw.strip():
+        return []
+
+    pairs: List[tuple] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError(
+                f"运行清单格式错误: '{item}'，应为 name:symbol（用逗号分隔多个）"
+            )
+        name, symbol = item.split(":", 1)
+        name = name.strip()
+        symbol = symbol.strip().upper()
+        if not name or not symbol:
+            raise ValueError(f"运行清单格式错误: '{item}'，name 和 symbol 不能为空")
+        pairs.append((name, symbol))
+    return pairs
+
+
 def load_merged_config(
     system_config_path: str = "config/settings.yaml",
     strategies_config_path: str = "config/strategies.yaml",
 ) -> Dict[str, Any]:
-    """加载并合并系统配置和策略配置
+    """已废弃：manager 现用 load_engine_config 只读 strategy_engine 段
 
-    Args:
-        system_config_path: 系统配置文件路径
-        strategies_config_path: 策略配置文件路径
-
-    Returns:
-        合并后的完整配置
+    保留仅为向后兼容（外部可能 import），内部不再调用。
     """
     system_config = load_yaml_config(system_config_path)
     strategies_config = load_yaml_config(strategies_config_path)
-
-    # 合并：策略配置覆盖系统配置
     return merge_configs(system_config, strategies_config)
 
 
@@ -100,42 +167,21 @@ def parse_strategies_from_loader(loader: StrategiesLoader) -> List[Dict[str, Any
     enabled = []
 
     for instance in instances:
-        # 动态加载策略命名参数（用于构建 strategy_name）
-        try:
-            name_params = get_strategy_name_params(instance.name)
-        except Exception as e:
-            logger.warning(f"加载策略命名参数失败 {instance.name}: {e}")
-            name_params = None
-
-        # 从 config_path 读取 user_id
-        user_id = ""
+        # user_id 仅从 per-symbol overrides 读取，缺失置 "0"
+        user_id = "0"
         try:
             config_path = Path(instance.config_path)
             if config_path.exists():
                 full = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-                user_id = str(full.get(instance.name, {}).get("user_id", ""))
+                uid = full.get(instance.name, {}).get("user_id")
+                user_id = str(uid) if uid not in (None, "") else "0"
         except Exception as e:
-            logger.debug(f"从 config_path 读取 user_id 失败 {instance.config_path}: {e}")
+            logger.debug(f"从 overrides 读取 user_id 失败 {instance.config_path}: {e}")
 
-        # 回退到共享配置
-        if not user_id and name_params:
-            user_id = name_params.get("user_id", "")
-
-        strategy_id = build_strategy_id(
-            instance.name, instance.interval, instance.version,
-            instance.symbol, instance.trading_mode
+        strategy_id = build_strategy_id_from_overrides(
+            instance.name, instance.symbol, instance.trading_mode,
+            interval=instance.interval, version=instance.version,
         )
-
-        if name_params:
-            s_name = build_strategy_name(
-                name_params["prefix"],
-                name_params["version"],
-                name_params["interval"],
-                instance.symbol,
-            )
-        else:
-            prefix = instance.name.upper().split("_")[0]
-            s_name = build_strategy_name(prefix, instance.version, instance.interval, instance.symbol)
 
         enabled.append({
             "name": instance.name,
@@ -143,11 +189,10 @@ def parse_strategies_from_loader(loader: StrategiesLoader) -> List[Dict[str, Any
             "interval": instance.interval,
             "version": instance.version,
             "trading_mode": instance.trading_mode,
-            "config": "config.yaml",
             "config_path": instance.config_path,
             "params": {},
             "strategy_id": strategy_id,
-            "strategy_name": s_name,
+            "strategy_name": strategy_id,
             "user_id": user_id,
         })
 
@@ -164,7 +209,7 @@ def parse_strategies_config(
 
     支持两种配置格式：
     1. 新格式（推荐）: 使用 StrategiesLoader 加载 config/strategies.yaml
-    2. 旧格式（兼容）: 从 settings.yaml 或 zktrading.yaml 的 strategies 段解析
+    2. 旧格式（兼容）: 从 settings.yaml 的 strategies 段解析
 
     旧配置格式（列表）：
     strategies:
@@ -211,41 +256,22 @@ def parse_strategies_config(
 
         # 处理 symbol / symbols
         symbols = item.get("symbols", [item.get("symbol")])
-        # 动态加载策略命名参数（用于构建 strategy_name）
-        try:
-            name_params = get_strategy_name_params(name)
-        except Exception as e:
-            logger.warning(f"加载策略命名参数失败 {name}: {e}")
-            name_params = None
 
-        # 优先从 config_path 读取 user_id（与子进程保持一致）
-        config_user_id = ""
+        # user_id 仅从 per-symbol overrides 读取，缺失置 "0"
+        user_id = "0"
         if config_path:
             try:
                 full = yaml.safe_load(Path(config_path).read_text(encoding="utf-8")) or {}
-                config_user_id = str(full.get(name, {}).get("user_id", ""))
+                uid = full.get(name, {}).get("user_id")
+                user_id = str(uid) if uid not in (None, "") else "0"
             except Exception as e:
-                logger.debug(f"从 config_path 读取 user_id 失败 {config_path}: {e}")
-
-        # 回退到共享配置
-        fallback_user_id = name_params.get("user_id", "") if name_params else ""
-        user_id = config_user_id or fallback_user_id
+                logger.debug(f"从 overrides 读取 user_id 失败 {config_path}: {e}")
 
         for symbol in symbols:
-            strategy_id = build_strategy_id(
-                name, interval, version, symbol, trading_mode
+            strategy_id = build_strategy_id_from_overrides(
+                name, symbol, trading_mode,
+                interval=interval, version=version,
             )
-
-            if name_params:
-                s_name = build_strategy_name(
-                    name_params["prefix"],
-                    name_params["version"],
-                    name_params["interval"],
-                    symbol,
-                )
-            else:
-                prefix = name.upper().split("_")[0]
-                s_name = build_strategy_name(prefix, version, interval, symbol)
 
             enabled.append({
                 "name": name,
@@ -257,7 +283,7 @@ def parse_strategies_config(
                 "config_path": config_path,
                 "params": params,
                 "strategy_id": strategy_id,
-                "strategy_name": s_name,
+                "strategy_name": strategy_id,
                 "user_id": user_id,
             })
 
@@ -378,11 +404,12 @@ class StrategyRuntime:
         system_config_path: str = "config/settings.yaml",
         strategies_config_path: str = "config/strategies.yaml",
         strategies_dir: str = "./strategies",
-        factory_endpoint: str = "http://127.0.0.1:8888",
+        factory_endpoint: Optional[str] = None,
         callback_port: int = 8892,
         callback_host: str = "0.0.0.0",
         log_level: str = "INFO",
         engine: Optional[Any] = None,
+        explicit_strategies: Optional[str] = None,
     ):
         self.system_config_path = system_config_path
         self.strategies_config_path = strategies_config_path
@@ -391,11 +418,19 @@ class StrategyRuntime:
         self.callback_port = callback_port
         self.callback_host = callback_host
 
-        # 加载并合并配置
-        self.merged_config = load_merged_config(system_config_path, strategies_config_path)
+        # 只读 strategy_engine 段（factory_endpoint / position_proxy_url 等）
+        # 策略运行清单由 StrategiesLoader 独立读取，不与 settings.yaml 合并
+        engine_config = load_engine_config(system_config_path)
 
         # 解析策略配置（使用 StrategiesLoader）
         loader = StrategiesLoader(strategies_config_path).load()
+
+        # CLI --strategies 优先于 config/strategies.yaml 登记表
+        explicit_pairs = parse_explicit_strategies(explicit_strategies)
+        if explicit_pairs:
+            logger.info(f"使用 CLI --strategies 指定运行清单: {explicit_pairs}")
+            loader.set_explicit_pairs(explicit_pairs)
+
         self.strategy_configs: List[Dict[str, Any]] = parse_strategies_from_loader(loader)
 
         # 转换为 dict 格式
@@ -407,13 +442,18 @@ class StrategyRuntime:
         # Factory client
         callback_url = f"http://{callback_host}:{callback_port}"
 
-        # 从配置读取 position_proxy_url 和 position_api_path
-        engine_config = self.merged_config.get("strategy_engine", {})
-        position_proxy_url = engine_config.get("position_proxy_url", "http://127.0.0.1:8889")
+        # engine_config 已在 __init__ 顶部加载（strategy_engine 段）
+        # 地址来自 settings.yaml 的 ${ENV_VAR} 占位；缺失时管理器仍可运行，仅对应功能不可用
+        resolved_factory_endpoint = factory_endpoint or engine_config.get("factory_endpoint")
+        if not resolved_factory_endpoint:
+            logger.warning("未配置 strategy_engine.factory_endpoint，跳过 factory-service 连接")
+        position_proxy_url = engine_config.get("position_proxy_url")
+        if not position_proxy_url:
+            logger.warning("未配置 strategy_engine.position_proxy_url，远程仓位查询不可用")
         position_api_path = engine_config.get("position_api_path", "/api/position/user-order-positions")
 
         self.factory_client = FactoryClient(
-            factory_endpoint=factory_endpoint,
+            factory_endpoint=resolved_factory_endpoint,
             callback_url=callback_url,
             engine=engine,
             global_config_path=system_config_path,
@@ -440,7 +480,7 @@ class StrategyRuntime:
                 "strategy_id": strategy_id,
                 "strategy_name": cfg["strategy_name"],
                 "name": cfg["name"],
-                "user_id": cfg.get("user_id", ""),
+                "user_id": cfg.get("user_id", "0"),
                 "interval": cfg.get("interval", "4h"),
                 "version": cfg.get("version", "v2"),
                 "symbol": cfg["symbol"],
@@ -449,9 +489,12 @@ class StrategyRuntime:
                 "config_path": cfg.get("config_path"),
             })
 
-            results[strategy_id] = result.get("status") == "success"
+            results[strategy_id] = result.get("status") in ("success", "skipped")
             if results[strategy_id]:
-                logger.info(f"策略 {strategy_id} 注册成功")
+                if result.get("status") == "skipped":
+                    logger.info(f"策略 {strategy_id} 跳过 factory 注册（endpoint 未配置，本地模式）")
+                else:
+                    logger.info(f"策略 {strategy_id} 注册成功")
             else:
                 logger.warning(f"策略 {strategy_id} 注册失败: {result}")
         return results
@@ -551,10 +594,19 @@ class StrategyRuntime:
         """
         新流程：初始化（注册 + 恢复状态 + 回调 server）
 
+        factory 未配置时降级为本地自主管理：注册返回 skipped，
+        跳过回调 server 与状态恢复，直接启动所有策略子进程。
+
         Returns:
             是否成功初始化
         """
         self._running = True
+
+        # factory 未配置：跳过 RPC 流程，直接本地启动
+        if not self.factory_client.factory_enabled:
+            logger.info("factory_endpoint 未配置，跳过 factory 注册/回调，直接本地启动策略进程")
+            await self.start_all_processes()
+            return True
 
         # 1. 注册所有策略到 factory
         reg_results = self._register_all_to_factory()
@@ -583,18 +635,48 @@ class StrategyRuntime:
 
         while self._running:
             for strategy_id, proc in list(self.processes.items()):
-                if proc.returncode is not None or proc.poll() is not None:
-                    try:
-                        returncode = proc.returncode
-                        if returncode is None:
-                            returncode = await proc.wait()
-                    except Exception:
-                        returncode = -1
-
+                # asyncio.subprocess.Process 无 poll()，直接检查 returncode
+                if proc.returncode is not None:
+                    returncode = proc.returncode
                     self._handle_strategy_exit(strategy_id, returncode)
                     del self.processes[strategy_id]
 
             await asyncio.sleep(2)
+
+    async def _terminate_process(self, strategy_id: str, proc: asyncio.subprocess.Process) -> None:
+        """SIGTERM 优雅停止，超时则 SIGKILL 并确认进程回收
+
+        asyncio.subprocess.Process 无 poll()，用 returncode 判断存活。
+        """
+        if proc.returncode is not None:
+            return
+
+        logger.info(f"向策略进程 {strategy_id} (PID={proc.pid}) 发送 SIGTERM")
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=10.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+        except ProcessLookupError:
+            return
+
+        # SIGTERM 超时 → SIGKILL，并 await 确认进程真正回收
+        logger.warning(f"策略进程 {strategy_id} 未响应 SIGTERM，发送 SIGKILL (PID={proc.pid})")
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.error(f"策略进程 {strategy_id} SIGKILL 后仍超 5s 未退出 (PID={proc.pid})")
+        except ProcessLookupError:
+            pass
 
     async def stop_all(self) -> None:
         """优雅停止所有策略进程"""
@@ -613,39 +695,26 @@ class StrategyRuntime:
         # 停止所有子进程（通过 FactoryClient）
         self.factory_client.stop_all_subprocesses()
 
-        # 停止本地管理的子进程（如果有）
-        for strategy_id, proc in self.processes.items():
-            if proc.returncode is None:
-                logger.info(f"向策略进程 {strategy_id} (PID={proc.pid}) 发送 SIGTERM")
-                try:
-                    proc.terminate()
-                except ProcessLookupError:
-                    pass
-
+        # 停止本地管理的子进程：每个进程独立 SIGTERM→SIGKILL，并发回收避免单个卡死阻塞全部
         if self.processes:
-            done, pending = await asyncio.wait(
-                [proc.wait() for proc in self.processes.values()],
-                timeout=10.0,
+            await asyncio.gather(
+                *(self._terminate_process(sid, proc) for sid, proc in self.processes.items()),
+                return_exceptions=True,
             )
-
-            for strategy_id, proc in self.processes.items():
-                if proc.returncode is None:
-                    logger.warning(f"策略进程 {strategy_id} 未响应 SIGTERM，发送 SIGKILL")
-                    try:
-                        proc.kill()
-                    except ProcessLookupError:
-                        pass
 
         self._shutdown_event.set()
         logger.info("策略运行时已停止")
 
     async def run_forever(self) -> None:
-        """运行直到收到停止信号"""
-        await asyncio.gather(
-            self.monitor_loop(),
-            self._heartbeat_loop(),
-            self._shutdown_event.wait(),
-        )
+        """运行直到收到停止信号
+
+        factory 未配置时跳过心跳循环（report_status 直接 skip，
+        get_running_strategies 遍历空 dict，本地模式下纯空转）。
+        """
+        tasks = [self.monitor_loop(), self._shutdown_event.wait()]
+        if self.factory_client.factory_enabled:
+            tasks.append(self._heartbeat_loop())
+        await asyncio.gather(*tasks)
 
 
 async def main():
@@ -668,8 +737,8 @@ async def main():
     )
     parser.add_argument(
         "--factory-endpoint",
-        default="http://127.0.0.1:8888",
-        help="factory-service RPC 端点",
+        default=None,
+        help="factory-service RPC 端点（默认读 settings.yaml 的 ${FACTORY_ENDPOINT}）",
     )
     parser.add_argument(
         "--callback-port",
@@ -687,6 +756,15 @@ async def main():
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="日志级别",
+    )
+    parser.add_argument(
+        "--run",
+        default=None,
+        help=(
+            "直接指定运行清单，格式 name:symbol,name:symbol。"
+            "优先于 config/strategies.yaml 登记表；指定的 overrides 文件不存在则报错。"
+            "示例: --run sar_snt3_v3:BTCUSDT,obv_atr_v2:ETHUSDT"
+        ),
     )
     args = parser.parse_args()
 
@@ -720,6 +798,7 @@ async def main():
         callback_port=args.callback_port,
         callback_host=args.callback_host,
         log_level=args.log_level,
+        explicit_strategies=args.run,
     )
 
     if not runtime.enabled_strategies:

@@ -14,6 +14,7 @@ origin: trading
 
 ## When to Activate
 
+- 用户执行 `/trading-dev`（无参数）-> **进入交互式引导**
 - 用户执行 `/trading-dev new` — 创建新 CTA 策略项目（交互模式）
 - 用户执行 `/trading-dev new --from <source>` — 从指定来源自动开发策略（全自动模式）
 - 用户说"新建策略项目"、"创建交易项目"、"开发新策略"
@@ -22,10 +23,13 @@ origin: trading
 - 用户执行 `/trading-dev backtest` — 只跑回测
 - 用户已有策略项目，想执行回测验证
 
+**首要原则：无参数或子命令不明确时，必须一步一步引导用户，不要报错让用户自己补命令。**
+
 ## Commands
 
 | 命令 | 模式 | 说明 |
 |------|------|------|
+| `/trading-dev` | 引导 | 无参数 -> 进入交互式引导 |
 | `/trading-dev new` | 交互 | 逐步确认策略信息、环境变量、每步执行 |
 | `/trading-dev new --from <source>` | 全自动 | 从文件/目录/URL/描述提取策略信息，零交互跑到底 |
 | `/trading-dev new <描述文本>` | 全自动 | 从自然语言提取策略信息，零交互跑到底 |
@@ -44,6 +48,102 @@ origin: trading
 | URL | `--from https://...` | WebFetch 抓取 |
 | 自然语言 | `/trading-dev new 开发一个 EMA 交叉策略，4h，BTCUSDT` | 从描述提取 |
 | 省略 | `/trading-dev new` | 进入多轮对话收集策略信息 |
+
+---
+
+## Phase -1: 交互式引导（无参数时） ← NEW
+
+### 触发条件
+
+| 条件 | 说明 |
+|------|------|
+| 无任何参数 | 用户只敲了 `/trading-dev` |
+
+**不进入引导**（直接走原流程）：
+
+- `/trading-dev new [参数]` / `scaffold` / `develop` / `backtest` / `benchmark`（子命令明确）
+- 参数齐全的单步命令
+
+### 引导核心原则
+
+1. **缺啥补啥**：用户已经给的参数跳过不问，只问缺失项
+2. **一步一问**：每次只问一个问题，给默认值 + 示例
+3. **每步可改**：用户随时能修改前面给过的值
+4. **不报错**：宁可多问一轮，也不要扔"参数不全"给用户
+5. **引导完汇总**：参数收齐后输出执行计划让用户确认，确认后才进 Phase 0
+
+### 引导顺序
+
+```
+Step 1: 问子命令（new / scaffold / develop / backtest / benchmark）
+        -> 给默认：new
+       ↓
+Step 2: 问策略来源（new 子命令）
+        -> 已有项目？-> 引导单步子命令（develop / backtest）
+        -> 无项目？-> 问策略描述 / 文件路径 / URL / 已有策略目录
+       ↓
+Step 3: 汇总确认 -> 用户确认后进 Phase 0
+```
+
+### Step 1 话术模板：问子命令
+
+```
+🧭 交互式引导 - 第 1 步（共 3 步）：要执行什么操作？
+
+  1. new        ← 新策略全流程（脚手架->编码->回测->benchmark）
+  2. scaffold   ← 只创建脚手架
+  3. develop    ← 只生成策略代码（需已有项目）
+  4. backtest   ← 只跑回测验证（需已有项目）
+  5. benchmark  ← 只输出 benchmark 报告（需已有项目）
+
+请选择（输入编号或命令名）。默认：1（new）
+```
+
+### Step 2 话术模板：问策略来源（new 子命令）
+
+```
+🧭 交互式引导 - 第 2 步（共 3 步）：策略来源
+
+请描述新策略（任选一种方式）：
+  1. 直接描述   ← 一句话策略逻辑，如"EMA20/EMA60 交叉，4h，BTCUSDT"
+  2. 文件路径   ← 如 --from /path/to/strategy_doc.md
+  3. 已有策略   ← 如 --from /path/to/cta_ict_v4/（逆向提取 spec）
+  4. URL        ← 如 --from https://...
+
+请输入（默认进入多轮对话逐步收集）：
+```
+
+**若用户选了 2/3/4 之一**：按 `--from <source>` 全自动模式执行。
+**若用户选 1 或直接描述**：按自然语言提取执行。**若回车**：进交互模式多轮收集（Phase 0 Step 1）。
+
+**单步子命令（develop/backtest/benchmark）时**：列出当前目录下候选项目（含 `strategy_core/` 的目录）供选择；无候选则提示先跑 `new`。
+
+### Step 3 话术模板：汇总确认
+
+```
+📋 引导完成 - 执行计划确认
+
+  操作:     new（全流程）
+  模式:     交互 / 全自动
+  策略来源: <描述或 --from 来源>
+
+确认执行？
+  > y / 回车   ← 进 Phase 0
+  > n          ← 取消
+  > 改 XX      ← 修改某项
+```
+
+### 引导收尾
+
+用户确认后：把引导参数组装成等效命令行 -> **进入 Phase 0 环境预检 + 策略信息获取**。
+
+### 引导 vs 原流程对照
+
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| `/trading-dev` 无参数 | 不明确 | 进引导，问子命令->策略来源 |
+| `/trading-dev new` | 交互式多轮收集 | 跳过引导（子命令明确，走 Phase 0 交互） |
+| `/trading-dev new --from X` | 全自动直接跑 | 跳过引导直接跑（参数齐全） |
 
 ---
 
@@ -138,15 +238,14 @@ strategy_dir = source_path
 files_to_read = [
     f"{strategy_dir}/strategy.py",        # STRATEGY_TYPE, STRATEGY_PREFIX, DEFAULT_TIMEFRAME
     f"{strategy_dir}/*_core.py",          # State fields, analyze() logic, check_realtime_exit()
-    f"{strategy_dir}/config.yaml",        # symbols, timeframes, params
-    f"{strategy_dir}/config.test.yaml",   # 回测参数
+    f"{strategy_dir}/overrides/*.yaml",   # per-symbol 参数（v3.7 单一事实来源）
 ]
 
 # 提取映射
 STRATEGY_TYPE → strategy_name
 STRATEGY_PREFIX → prefix
 DEFAULT_TIMEFRAME → timeframes[0]
-config.yaml → symbols, params, direction
+overrides/<SYMBOL>.yaml → symbols(取文件名全集), params, direction
 *_core.py → State fields, entry/exit logic (从 analyze() 代码逆向)
 ```
 
@@ -233,7 +332,7 @@ default_params: {}
   出场: 止损 2x ATR, 移动止盈 1.5x ATR
 
 🔧 环境变量（可修改）:
-  KLINE_DATA_DIR = ./data/strategies/1m
+  KLINE_DATA_DIR = ./data/klines
   BENCHMARK_OUTPUT_PATH = ./benchmark_output
   DATA_PATH = ./data
 
@@ -320,10 +419,12 @@ fi
 | `backtest_output*/` | 运行产物 |
 | `arbitrage/` | 套利模块，非 CTA 必需 |
 | `signal_comparison/` | 高级功能，可后置 |
-| `config/settings.yaml` | 含内网 IP，用 settings.example.yaml 替代 |
-| `config/openviking_sync.yaml` | 含内网 IP，从 .env 生成 |
-| `backtest/config/main.yaml` | 运行时文件，从 main.example.yaml 复制生成 |
-| `backtest/config/strategies.yaml` | 运行时文件，从 strategies.example.yaml 复制生成 |
+| `.env` | 含真实服务地址与私有值，用 .env.example 替代 |
+
+> `config/settings.yaml` 与 `config/strategies.yaml` **入库**：前者的外部地址
+> 全部是 `${ENV_VAR}` 占位（未设置时功能自动降级），后者是编排登记表。
+> v3.7 已删除 `backtest/config/` 整个配置族（配置分叉源头），
+> 配置收敛为 `config/` 三层模型 + `config/backtest.yaml`（run-profile），全部入库。
 
 **复制命令**：
 
@@ -352,9 +453,10 @@ cp $TEMPLATE_DIR/run_strategy.py $PROJECT_DIR/
 cp $TEMPLATE_DIR/start.sh $PROJECT_DIR/
 cp $TEMPLATE_DIR/stop.sh $PROJECT_DIR/
 
-# 从 .example 生成回测运行时配置
-cp $TEMPLATE_DIR/backtest/config/main.example.yaml $PROJECT_DIR/backtest/config/main.yaml
-cp $TEMPLATE_DIR/backtest/config/strategies.example.yaml $PROJECT_DIR/backtest/config/strategies.yaml
+# config/ 已随上面整体复制（含 settings.yaml / strategies.yaml /
+# backtest.yaml run-profile），无需再从 .example 生成。
+# 私有值走 .env：
+cp $TEMPLATE_DIR/.env.example $PROJECT_DIR/.env    # 再按需填写
 
 # 创建策略空壳目录
 mkdir -p $PROJECT_DIR/strategies
@@ -492,27 +594,29 @@ Python 环境: .venv (Python 3.x)
   │       ├── strategy.py
   │       ├── {prefix}_core.py
   │       ├── __init__.py
-  │       ├── config.yaml
-  │       ├── config.dev.yaml
-  │       ├── config.test.yaml
-  │       ├── config/                # ⬅ Per-Symbol 回测配置
+  │       ├── overrides/             # ⬅ 策略参数唯一来源（实盘回测共用）
   │       │   ├── BTCUSDT.yaml
   │       │   ├── ETHUSDT.yaml
   │       │   └── SOLUSDT.yaml
   │       ├── .strategy-spec.yaml
   │       └── tests/
-  ├── config/
-  │   └── settings.example.yaml   # 系统配置模板
+  ├── config/                     # ⬅ 三层配置模型，全部入库
+  │   ├── settings.yaml           # 系统层（外部地址用 ${ENV_VAR} 占位）
+  │   ├── settings.example.yaml
+  │   ├── strategies.yaml         # 编排层（实盘回测共用登记表）
+  │   ├── strategies.example.yaml
+  │   ├── backtest.yaml           # 回测 run-profile（默认 --profile）
+  │   └── quick.example.yaml      # 调参用 profile 示例
   ├── docs/strategy/              # 开发规范文档
   │   ├── QUICKSTART.md
   │   ├── DEVELOPMENT_GUIDE.md
   │   ├── AI_CONSTRAINTS.md
   │   ├── REVIEW_CHECKLIST.md
   │   └── EXAMPLES.md
-  ├── data/strategies/1m/         # ⬅ 1m K线数据（symlink 或下载）
-  │   ├── BTCUSDT_1m.csv
-  │   ├── ETHUSDT_1m.csv
-  │   └── SOLUSDT_1m.csv
+  ├── data/klines/                # ⬅ K线数据（按周期分目录）
+  │   ├── 1m/BTCUSDT_1m.csv
+  │   ├── 4h/BTCUSDT_4h.csv
+  │   └── 8h/BTCUSDT_8h.csv       # 须与 settings.yaml 的 csv_dir 一致
   ├── .env                        # 环境变量（从 .env.example 生成）
   ├── .env.example                # 环境变量模板
   ├── .gitignore
@@ -615,25 +719,27 @@ from .{prefix}_core import {Prefix}Core, {Prefix}State
 __all__ = ["Strategy", "{Prefix}Core", "{Prefix}State"]
 ```
 
-#### 1.4 配置文件
+#### 1.4 策略参数配置（per-symbol）
 
-生成三个配置文件，**必须有顶层策略名键**：
+v3.7 每个 (策略, 代币) 一份参数文件，**这是唯一事实来源** ——
+实盘 `run_strategy.py` 与回测 `run_backtest.py` 读的都是它。
+不再生成 `config.yaml` / `config.dev.yaml` / `config.test.yaml`：
+那套按环境分文件的做法会让回测与实盘读到两份参数（回测失真的根源），
+v3.7 已删除。
 
-- `config.yaml` — 默认配置（trading_mode: paper）
-- `config.dev.yaml` — 开发配置
-- `config.test.yaml` — 回测配置（trading_mode: backtest, cooldown_bars: 0）
+**路径**：`strategies/{strategy_name}/overrides/{SYMBOL}.yaml`
 
-#### 1.5 Per-Symbol 回测配置
-
-为每个交易对生成独立的回测配置文件，放在策略目录下的 `config/` 子目录：
-
-**路径**：`strategies/{strategy_name}/config/{SYMBOL}.yaml`
-
-**格式**（与 `config.test.yaml` 结构一致，但每个文件只包含单个 symbol）：
+**格式**（顶层必须是策略名键，`symbols` 只含自己那一个代币）：
 
 ```yaml
 {strategy_name}:
+  strategy:
+    name: {PREFIX}
   enabled: true
+  version: '1'
+  # 运行模式：live / paper_trading / smoking
+  # ⚠ 缺省时框架按 live 处理（会下真单），新策略务必显式写 paper_trading
+  trading_mode: "paper_trading"
   direction: {direction}
   symbols:
     - {SYMBOL}
@@ -641,14 +747,14 @@ __all__ = ["Strategy", "{Prefix}Core", "{Prefix}State"]
   params: {params}
   signal:
     min_strength: 0.5
-    cooldown_ms: 60000
+    cooldown_ms: 0
     order_type: 1
     slippage: 0
     exchange: binance
   capital:
     max_cash: 1000
     max_parts: 1
-    leverage: 5
+    leverage: 1
   risk:
     enabled: true
     fixed_stop_loss_pct: 2.0
@@ -657,31 +763,55 @@ __all__ = ["Strategy", "{Prefix}Core", "{Prefix}State"]
       activation_pct: 2.0
       drawdown_pct: 20.0
     fixed_take_profit_pct: 0.0
+  cooldown_timeframe: {timeframes[0]}
+  # 信号归属的用户 ID（下游下单系统用；单用户部署保持 1）
+  user_id: 1
 ```
 
 **生成规则**：
-- 为 `symbols` 列表中的每个交易对生成一个文件
-- 文件名 = `{SYMBOL}.yaml`（如 `BTCUSDT.yaml`、`ETHUSDT.yaml`）
-- `symbols` 字段只包含当前文件对应的单个交易对
-- `params` 从策略规格的 `default_params` 填充，不同交易对可后续独立调参
-- 回测时通过 `--config strategies/{strategy_name}/config/{SYMBOL}.yaml` 加载
-- 回测引擎自动将使用的配置复制到 `backtest_output/{strategy}/{date}/{time}/{SYMBOL}/config.yaml`
+- 为 `symbols` 列表中每个代币生成一个文件，文件名 = `{SYMBOL}.yaml`
+- `symbols` 字段只含当前文件对应的那一个代币
+- `params` 从 `.strategy-spec.yaml` 的 `default_params` 填充；
+  不同代币可各自独立调参（这正是拆成 per-symbol 的目的）
+- `interval` 与 `version` 由框架从本文件的 `timeframes[0]` / `version` 自动读取，
+  无需在命令行传
+- 回测通过 `--strategies {strategy_name}:{SYMBOL}` 自动定位本文件，
+  **不需要** `--config` 参数（v3.7 已删除）
+- 回测引擎会把实际生效的配置复制到
+  `{output_dir}/{strategy}/{date}/{time}/{SYMBOL}/config.yaml` 供复现
+
+#### 1.5 编排登记（config/strategies.yaml）
+
+参数文件只描述"某个代币怎么跑"，还需在**编排层**登记"跑哪些"：
+
+```yaml
+strategies:
+  {strategy_name}:
+    trading_mode: "paper_trading"
+    symbols:
+      - BTCUSDT
+      - ETHUSDT
+      - SOLUSDT
+```
+
+该文件实盘回测共用：`./start.sh` 按它拉起全部策略，
+`batch_runner` 不带 `--run` 时也按它批量回测。
 
 **目录结构**：
 
 ```
 strategies/{strategy_name}/
-├── config/
+├── overrides/                  # ⬅ 策略参数唯一来源
 │   ├── BTCUSDT.yaml
 │   ├── ETHUSDT.yaml
 │   └── SOLUSDT.yaml
 ├── strategy.py
 ├── {prefix}_core.py
 ├── __init__.py
-├── config.yaml
-├── config.dev.yaml
-├── config.test.yaml
+├── .strategy-spec.yaml         # 策略规格（供逆向提取与再生成）
 └── tests/
+    ├── test_{prefix}_core.py
+    └── test_strategy_logging.py
 ```
 
 #### 1.6 测试文件
@@ -699,18 +829,21 @@ strategies/{strategy_name}/
 python3 -c "
 import yaml
 from pathlib import Path
-config_path = Path('strategies/{strategy_name}/config.test.yaml')
+config_path = Path('strategies/{strategy_name}/overrides/BTCUSDT.yaml')
 with open(config_path) as f:
     full_config = yaml.safe_load(f)
 if '{strategy_name}' not in full_config:
     print(f'ERROR: 配置文件缺少顶层键: {strategy_name}')
     exit(1)
 config = full_config['{strategy_name}']
-required = ['timeframes', 'symbols', 'params']
+required = ['timeframes', 'symbols', 'params', 'trading_mode']
 for key in required:
     if key not in config:
         print(f'ERROR: 配置缺少必需字段: {key}')
         exit(1)
+# trading_mode 缺省时框架按 live 处理（会下真单），新策略必须显式声明
+if config.get('trading_mode') == 'live':
+    print('⚠ WARNING: trading_mode=live 会下真单，新策略建议 paper_trading')
 print('✅ 配置文件格式正确')
 "
 ```
@@ -750,39 +883,63 @@ print('✅ 配置文件格式正确')
 | 中期 | 20260101-20260709 | 至少一个代币费后收益 ≥ 20% |
 | 长期 | 20250101-20260709 | 至少一个代币费后收益 ≥ 20% |
 
+三个周期都用同一条批量命令，只换 `--start` / `--end`。
+经项目自带的 `scripts/run_backtest_batch.sh` 调用（它负责 overrides 预检、
+笛卡尔积展开、`PYTHONPATH`，再转调 `backtest.batch_runner`）。
+并发由 `config/backtest.yaml` 的 `max_workers` 控制；策略参数自动读
+`strategies/{strategy_name}/overrides/<SYMBOL>.yaml`。
+
+`--yes` 跳过任务数 > 6 时的交互确认，非交互环境必须带。
+
 ### Step 1: 短期回测
 
 ```bash
-python -m backtest.run_backtest --strategy {strategy_name} --start 20260601 --end 20260709 --symbol BTCUSDT --config strategies/{strategy_name}/config/BTCUSDT.yaml --log-level INFO
-python -m backtest.run_backtest --strategy {strategy_name} --start 20260601 --end 20260709 --symbol ETHUSDT --config strategies/{strategy_name}/config/ETHUSDT.yaml --log-level INFO
-python -m backtest.run_backtest --strategy {strategy_name} --start 20260601 --end 20260709 --symbol SOLUSDT --config strategies/{strategy_name}/config/SOLUSDT.yaml --log-level INFO
+bash scripts/run_backtest_batch.sh \
+    --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --start 20260601 --end 20260709 --log-level INFO --yes
 ```
 
 ### Step 2: 中期回测
 
 ```bash
-python -m backtest.run_backtest --strategy {strategy_name} --start 20260101 --end 20260709 --symbol BTCUSDT --config strategies/{strategy_name}/config/BTCUSDT.yaml --log-level INFO
-python -m backtest.run_backtest --strategy {strategy_name} --start 20260101 --end 20260709 --symbol ETHUSDT --config strategies/{strategy_name}/config/ETHUSDT.yaml --log-level INFO
-python -m backtest.run_backtest --strategy {strategy_name} --start 20260101 --end 20260709 --symbol SOLUSDT --config strategies/{strategy_name}/config/SOLUSDT.yaml --log-level INFO
+bash scripts/run_backtest_batch.sh \
+    --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --start 20260101 --end 20260709 --log-level INFO --yes
 ```
 
 ### Step 3: 长期回测
 
 ```bash
-python -m backtest.run_backtest --strategy {strategy_name} --start 20250101 --end 20260709 --symbol BTCUSDT --config strategies/{strategy_name}/config/BTCUSDT.yaml --log-level INFO
-python -m backtest.run_backtest --strategy {strategy_name} --start 20250101 --end 20260709 --symbol ETHUSDT --config strategies/{strategy_name}/config/ETHUSDT.yaml --log-level INFO
-python -m backtest.run_backtest --strategy {strategy_name} --start 20250101 --end 20260709 --symbol SOLUSDT --config strategies/{strategy_name}/config/SOLUSDT.yaml --log-level INFO
+bash scripts/run_backtest_batch.sh \
+    --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --start 20250101 --end 20260709 --log-level INFO --yes
 ```
 
-### Step 4: 手工命令行验证
+### Step 4: 单标的复核
 
-策略自带回测代码可能将输出写到 `.tmp/` 目录，需重跑确认结果一致：
+`batch_runner` 是 `run_backtest` 的批量外壳。要单独复核某个代币、
+或需要看完整 stdout 时用单次入口：
 
 ```bash
-python -m backtest.run_backtest --strategy {strategy_name} --start 20250101 --end 20260710 --symbol BTCUSDT --config strategies/{strategy_name}/config/BTCUSDT.yaml --log-level INFO
-python -m backtest.run_backtest --strategy {strategy_name} --start 20250101 --end 20260710 --symbol ETHUSDT --config strategies/{strategy_name}/config/ETHUSDT.yaml --log-level INFO
-python -m backtest.run_backtest --strategy {strategy_name} --start 20250101 --end 20260710 --symbol SOLUSDT --config strategies/{strategy_name}/config/SOLUSDT.yaml --log-level INFO
+python -m backtest.run_backtest \
+    --strategies {strategy_name}:BTCUSDT \
+    --start 20250101 --end 20260710 --log-level INFO
 ```
+
+CLI 已收敛为 7 个参数。`--symbol` / `--config` / `--output` / `--timeframe`
+等在 v3.7 已删除：symbol 唯一来源是 `--strategies` 的 `name:symbol`，
+参数来源是 `overrides/<SYMBOL>.yaml`，输出目录与资金费率由
+`--profile`（默认 `config/backtest.yaml`）提供。
+
+要换一套回测参数而不改动入库文件，复制 `config/quick.example.yaml`
+成 `config/<名字>.yaml`，用 `--profile <名字>` 运行。
+
+**⚠ 不要用 `--daemon`**：该模式重建子命令时只传 `--profile` 与
+`--batch-id`，会丢掉 `--run/--start/--end/--config`，等于跑成空清单。
+需要后台执行请在外层 `nohup`。
+
+**产物路径**：`{output_dir}/{strategy}/{date}/{time}/{symbol}/`，
+指标在 `backtest_result.json` 的 `metrics` 段（不在顶层）。
 
 ### Step 5: 输出 benchmark.md
 
@@ -961,7 +1118,7 @@ hardcoded_thresholds = [
       {threshold_1}: {current} → {suggested}（{reason}）
 
   修改方案:
-    1. 修改 strategies/{strategy_name}/config/{SYMBOL}.yaml: {具体参数变更}
+    1. 修改 strategies/{strategy_name}/overrides/{SYMBOL}.yaml: {具体参数变更}
     2. 修改 {prefix}_core.py: {具体代码变更}
     3. {其他修改}
 
@@ -1035,7 +1192,7 @@ Phase 1: 脚手架创建（一次性）
       {threshold_1}: {current} → {suggested}（{reason}）
 
   修改方案:
-    1. 修改 strategies/{strategy_name}/config/{SYMBOL}.yaml: {具体参数变更}
+    1. 修改 strategies/{strategy_name}/overrides/{SYMBOL}.yaml: {具体参数变更}
     2. 修改 {prefix}_core.py: {具体代码变更}
     3. {其他修改}
 
@@ -1091,7 +1248,7 @@ Phase 1: 脚手架创建（一次性）
 DATA_PATH=./data
 CTA_ENV=dev
 BENCHMARK_OUTPUT_PATH=./benchmark_output
-KLINE_DATA_DIR=./data/strategies/1m
+KLINE_DATA_DIR=./data/klines
 
 # ===== 策略引擎（实盘模式） =====
 FACTORY_ENDPOINT=http://127.0.0.1:8888
@@ -1227,9 +1384,15 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 
 ```
 用户输入:
+  无参数: /trading-dev                        ← 进引导
   全自动: /trading-dev new --from <source>
   交互:   /trading-dev new
   单步:   /trading-dev scaffold | develop | backtest | benchmark
+       ↓
+Phase -1: 交互式引导（仅无参数时）  ← NEW
+  ├── Step 1: 问子命令（默认 new）
+  ├── Step 2: 问策略来源（new 子命令）
+  └── Step 3: 汇总确认 -> 进 Phase 0
        ↓
 Phase 0: 环境预检 + 策略信息获取
   ├── Step 0: 环境预检（Python/ta-lib/pip/K线数据/磁盘）

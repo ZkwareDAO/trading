@@ -3,7 +3,7 @@
 
 功能：
 - 加载 strategies.yaml 配置文件
-- 从 zktrading 配置自动读取 interval/version
+- 从 per-symbol 覆盖配置自动读取 interval/version
 - 自动生成 config_path
 - 支持 overrides 参数覆盖
 - 支持 symbol 级别 trading_mode 覆盖
@@ -13,7 +13,7 @@
     strategies:
       cta_ict_v3:
         trading_mode: "live"
-        config_dir: "config/zktrading"
+        config_dir: "strategies"   # 默认，per-symbol 覆盖在 strategies/<name>/overrides/
         symbols:
           - BTCUSDT
           - name: SOLUSDT
@@ -113,10 +113,10 @@ class StrategiesLoader:
     # 默认配置（用于缺失字段时的回退值）
     DEFAULT_CONFIG = {
         "interval": "4h",
-        "version": "2",  # 与 zktrading 配置格式一致，不含 v 前缀
+        "version": "2",  # 与 per-symbol 配置格式一致，不含 v 前缀
         "trading_mode": "live",
         "enabled": True,
-        "config_dir": "config/zktrading",
+        "config_dir": "strategies",
     }
 
     def __init__(self, config_path: str = "config/strategies.yaml"):
@@ -129,6 +129,27 @@ class StrategiesLoader:
         self._strategies: Dict[str, Dict[str, Any]] = {}
         self._instance_map: Optional[Dict[tuple, StrategyInstance]] = None
         self._expanded_instances: Optional[List[StrategyInstance]] = None
+        # 外部传入的运行清单（CLI --strategies），格式: [(name, symbol), ...]
+        # 非空时优先于 config/strategies.yaml 的登记表
+        self._explicit_pairs: List[tuple] = []
+
+    def set_explicit_pairs(self, pairs: List[tuple]) -> "StrategiesLoader":
+        """设置外部传入的运行清单（来自 CLI --strategies）
+
+        优先级最高：非空时覆盖 config/strategies.yaml 的登记表。
+        每个 pair 的 overrides 文件必须存在，否则 expand 时报错。
+
+        Args:
+            pairs: [(strategy_name, symbol), ...]
+
+        Returns:
+            self（支持链式调用）
+        """
+        self._explicit_pairs = list(pairs) if pairs else []
+        # 清除缓存
+        self._instance_map = None
+        self._expanded_instances = None
+        return self
 
     @staticmethod
     def is_valid_strategy_name(name: str) -> bool:
@@ -160,20 +181,24 @@ class StrategiesLoader:
     def load(self) -> "StrategiesLoader":
         """加载配置文件
 
+        文件不存在或无 strategies 段时不报错——支持纯 CLI 模式
+        （只用 --strategies 参数，不依赖 strategies.yaml 登记表）。
+
         Returns:
             self（支持链式调用）
-
-        Raises:
-            FileNotFoundError: 配置文件不存在
         """
         if not self.config_path.exists():
-            raise FileNotFoundError(f"配置文件不存在: {self.config_path}")
+            # 文件不存在：允许，走 CLI explicit_pairs 或后续报错
+            self._strategies = {}
+            self._instance_map = None
+            self._expanded_instances = None
+            return self
 
         with open(self.config_path, "r", encoding="utf-8") as f:
             raw_config = yaml.safe_load(f) or {}
 
         # 只解析 strategies 字段（简化配置格式）
-        self._strategies = raw_config.get("strategies", {})
+        self._strategies = raw_config.get("strategies", {}) or {}
 
         # 清除缓存
         self._instance_map = None
@@ -203,28 +228,46 @@ class StrategiesLoader:
         strategy_name: str,
         symbol: str
     ) -> tuple:
-        """从 zktrading 配置文件读取 interval 和 version
+        """从 per-symbol 覆盖配置读取 interval 和 version
 
         Args:
-            config_path: zktrading 配置文件路径
+            config_path: per-symbol 配置文件路径（strategies/<name>/overrides/<symbol>.yaml）
             strategy_name: 策略名称
             symbol: 交易对
 
         Returns:
             (interval, version) 元组
         """
+        interval, version, _ = self._load_overrides_fields(
+            config_path, strategy_name, symbol
+        )
+        return interval, version
+
+    def _load_overrides_fields(
+        self,
+        config_path: str,
+        strategy_name: str,
+        symbol: str,
+    ) -> tuple:
+        """从 per-symbol 覆盖配置读取 interval / version / trading_mode
+
+        文件不存在时返回默认值（不报错），由调用方决定是否报错。
+
+        Returns:
+            (interval, version, trading_mode) 元组，trading_mode 为 None 表示未配置
+        """
         defaults = self.DEFAULT_CONFIG
 
         try:
             full_path = Path(config_path)
             if not full_path.exists():
-                logger.debug(f"zktrading 配置文件不存在: {config_path}, 使用默认值")
-                return defaults["interval"], defaults["version"]
+                logger.debug(f"per-symbol 配置文件不存在: {config_path}, 使用默认值")
+                return defaults["interval"], defaults["version"], None
 
             with open(full_path, "r", encoding="utf-8") as f:
-                zktrading_config = yaml.safe_load(f) or {}
+                per_symbol_config = yaml.safe_load(f) or {}
 
-            strategy_config = zktrading_config.get(strategy_name, {})
+            strategy_config = per_symbol_config.get(strategy_name, {})
 
             # interval 从 timeframes[0] 读取
             timeframes = strategy_config.get("timeframes", [])
@@ -233,11 +276,14 @@ class StrategiesLoader:
             # version 直接读取
             version = str(strategy_config.get("version", defaults["version"]))
 
-            return interval, version
+            # trading_mode：overrides 顶层字段，缺失返回 None
+            trading_mode = strategy_config.get("trading_mode")
+
+            return interval, version, trading_mode
 
         except Exception as e:
-            logger.warning(f"读取 zktrading 配置失败: {config_path}, 错误: {e}")
-            return defaults["interval"], defaults["version"]
+            logger.warning(f"读取 per-symbol 配置失败: {config_path}, 错误: {e}")
+            return defaults["interval"], defaults["version"], None
 
     def expand_strategies(self) -> List[StrategyInstance]:
         """展开策略配置为实例列表
@@ -250,8 +296,8 @@ class StrategiesLoader:
         2. 对象格式：[{name: BTCUSDT, trading_mode: "paper_trading"}]
 
         interval/version 来源：
-        - 从 zktrading/{strategy}/{symbol}.yaml 的 timeframes[0] 和 version 读取
-        - 如果 zktrading 配置缺失，使用默认值（"4h" 和 "v2")
+        - 从 strategies/<name>/overrides/<symbol>.yaml 的 timeframes[0] 和 version 读取
+        - 如果 per-symbol 覆盖配置缺失，使用默认值（"4h" 和 "v2")
 
         Returns:
             策略实例列表
@@ -259,6 +305,19 @@ class StrategiesLoader:
         # 返回缓存结果
         if self._expanded_instances is not None:
             return self._expanded_instances
+
+        # CLI explicit_pairs 优先于 strategies.yaml 登记表
+        if self._explicit_pairs:
+            instances = self._expand_explicit_pairs()
+            self._expanded_instances = instances
+            return instances
+
+        # 无 explicit_pairs 且登记表为空 → 报错（不默默全量扫描）
+        if not self._strategies:
+            raise ValueError(
+                "未指定运行策略：请用 CLI --strategies name:symbol,... 指定，"
+                "或在 config/strategies.yaml 的 strategies 段登记策略。"
+            )
 
         instances = []
         defaults = self.DEFAULT_CONFIG  # 提取到局部变量，避免重复访问
@@ -280,9 +339,10 @@ class StrategiesLoader:
                 # symbol 级 trading_mode 覆盖策略级
                 final_trading_mode = symbol_trading_mode or trading_mode
 
-                config_path = str(Path(config_dir) / strategy_name / f"{symbol}.yaml")
+                # per-symbol 覆盖配置路径：strategies/<name>/overrides/<symbol>.yaml
+                config_path = str(Path(config_dir) / strategy_name / "overrides" / f"{symbol}.yaml")
 
-                # interval/version 从 zktrading 配置文件读取
+                # interval/version 从 per-symbol 覆盖配置读取
                 interval, version = self._load_interval_version_from_zktrading(
                     config_path, strategy_name, symbol
                 )
@@ -301,6 +361,50 @@ class StrategiesLoader:
 
         # 缓存结果
         self._expanded_instances = instances
+        return instances
+
+    def _expand_explicit_pairs(self) -> List[StrategyInstance]:
+        """展开 CLI 传入的 (name, symbol) 清单为实例列表
+
+        每个 pair 的 overrides 文件必须存在，否则报错。
+        trading_mode 从 overrides 读取，缺失用默认值 live。
+        """
+        defaults = self.DEFAULT_CONFIG
+        config_dir = defaults["config_dir"]
+        instances = []
+
+        for strategy_name, symbol in self._explicit_pairs:
+            # 输入校验
+            if not self.is_valid_strategy_name(strategy_name):
+                raise ValueError(f"无效策略名: {strategy_name}（仅允许小写字母/数字/下划线）")
+            if not self.is_valid_symbol(symbol):
+                raise ValueError(f"无效交易对: {symbol}（仅允许大写字母/数字）")
+
+            config_path = str(Path(config_dir) / strategy_name / "overrides" / f"{symbol}.yaml")
+            if not Path(config_path).exists():
+                # 显式指定的 overrides 不存在 → 报错，不默默跳过
+                raise FileNotFoundError(
+                    f"策略 {strategy_name} 交易对 {symbol} 的 overrides 文件不存在: {config_path}"
+                )
+
+            interval, version, overrides_trading_mode = self._load_overrides_fields(
+                config_path, strategy_name, symbol
+            )
+            trading_mode = overrides_trading_mode or defaults["trading_mode"]
+
+            instance = StrategyInstance(
+                name=strategy_name,
+                symbol=symbol,
+                interval=interval,
+                version=version,
+                enabled=True,
+                trading_mode=trading_mode,
+                config_path=config_path,
+                overrides={},
+            )
+            instances.append(instance)
+
+        logger.info(f"CLI 指定运行清单展开完成，共 {len(instances)} 个策略进程")
         return instances
 
     def _parse_symbol_item(self, item: Any) -> tuple:
