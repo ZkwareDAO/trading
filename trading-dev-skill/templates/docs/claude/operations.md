@@ -42,7 +42,7 @@ cta_ict_v3:
 
 **API 路径优先级**: `signal.api_path`（策略级） > `signal_hub.api_path`（全局） > `/api/v1/kafka/message`（默认）
 
-**多环境配置**: `config.yaml` / `config.dev.yaml` / `config.test.yaml` / `config.prod.yaml`
+**配置层级**: `config/settings.yaml`（系统） > `config/strategies.yaml`（编排） > `strategies/<name>/overrides/<SYMBOL>.yaml`（策略参数，唯一事实来源）；回测运行方式走 `config/<profile>.yaml`。v3.7 已删除按环境分文件的 `config.yaml` / `config.dev.yaml` / `config.test.yaml` / `config.prod.yaml`
 
 **策略运行时命名**: `{PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}_{MODE}`，如 `ICT_4H_V2_BTCUSDT_LIVE`
 

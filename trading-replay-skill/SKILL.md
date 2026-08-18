@@ -33,8 +33,8 @@ origin: trading
 | `/trading-replay sync --date YYYYMMDD` | 备份到指定日期目录 |
 | `/trading-replay sync --skip-discovery` | 跳过远程发现，直接备份全部策略 |
 | `/trading-replay discover` | 只执行远程策略发现（不备份） |
-| `/trading-replay replay` | 只执行回放回测（replay.sh），默认回测近 30 天 |
-| `/trading-replay replay --date YYYYMMDD` | 回放指定日期的快照，默认回测近 30 天 |
+| `/trading-replay replay` | 只执行回放回测（replay.sh），默认只回测前一天 |
+| `/trading-replay replay --date YYYYMMDD` | 回放指定日期的快照，默认回测该日期前一天 |
 | `/trading-replay replay --start 20260101 --end 20260801` | 自定义回测时间范围 |
 | `/trading-replay replay --skip-analysis` | 跳过策略分析阶段，直接回测 |
 | `/trading-replay summary` | 查看最近回测结果摘要 |
@@ -75,7 +75,7 @@ Step 1: 问子命令（run / sync / replay / discover / summary）
 Step 2: 问日期（--date）
         → 子命令需要日期时才问
         → 给默认：今天
-        → replay 额外问是否自定义 --start/--end（默认近30天）
+        → replay 额外问是否自定义 --start/--end（默认前一天）
        ↓
 Step 3: 问可选参数
         → sync: 是否 --skip-discovery
@@ -92,7 +92,7 @@ Step 4: 汇总确认 → 用户确认后进 Phase 0
 
   1. run       ← 完整流程（备份 + 回测，默认当日）
   2. sync      ← 只备份策略代码
-  3. replay    ← 只回放回测（默认近 30 天）
+  3. replay    ← 只回放回测（默认前一天）
   4. discover  ← 只发现远程策略（不备份）
   5. summary   ← 查看回测结果摘要
 
@@ -112,9 +112,9 @@ Step 4: 汇总确认 → 用户确认后进 Phase 0
 **replay 子命令额外提示**：
 
 ```
-replay 默认回测近 30 天。是否自定义范围？留空 = 默认近30天，或输入 start end：
+replay 默认只回测前一天。是否自定义范围？留空 = 默认前一天，或输入 start end：
   > 20260101 20260801   ← 自定义
-  > 留空                  ← 默认近 30 天
+  > 留空                  ← 默认前一天
 ```
 
 ### Step 3 话术模板：问可选参数
@@ -135,7 +135,7 @@ replay 默认回测近 30 天。是否自定义范围？留空 = 默认近30天�
 
   操作:    run（完整流程）
   日期:    20260811（今天）
-  回测范围: 近 30 天
+  回测范围: 前一天（20260810）
 
 确认执行？
   > y / 回车   ← 进 Phase 0
@@ -152,7 +152,7 @@ replay 默认回测近 30 天。是否自定义范围？留空 = 默认近30天�
 | 场景 | 旧行为 | 新行为 |
 |------|--------|--------|
 | `/trading-replay` 无参数 | 不明确 | 进引导，问子命令→日期→可选参数 |
-| `/trading-replay replay` | 默认近30天直接跑 | 跳过引导直接跑（默认值明确） |
+| `/trading-replay replay` | 默认前一天直接跑 | 跳过引导直接跑（默认值明确） |
 | `/trading-replay run --date XXX` | 直接跑 | 跳过引导直接跑（参数齐全） |
 
 ---
@@ -581,13 +581,13 @@ for snapshot in "${STRATEGY_SNAPSHOTS[@]}"; do
     OUTPUT_DIR="${REPLAY_OUTPUTS_DIR:-./replay_outputs}/${REPLAY_DATE}/${snapshot}"
     mkdir -p "$OUTPUT_DIR"
 
-    # 运行清单来自快照自带的 overrides/ —— 文件名即当天实盘跑的 symbol 全集。
+    # 代币清单来自快照自带的 overrides/ —— 文件名即当天实盘跑的 symbol 全集。
     # 读这份参数就是"回放当天真实配置"的含义所在。
-    RUN_LIST=""
+    SYMS=""
     for f in "${SNAPSHOT_ABS}/strategies/${strategy_name}/overrides"/*.yaml; do
         [ -f "$f" ] || continue
         sym="$(basename "$f" .yaml)"
-        RUN_LIST="${RUN_LIST:+$RUN_LIST,}${strategy_name}:${sym}"
+        SYMS="${SYMS:+$SYMS,}${sym}"
     done
 
     # 在快照内生成 run-profile（output_dir 指向快照之外，避免污染快照）
@@ -597,13 +597,18 @@ for snapshot in "${STRATEGY_SNAPSHOTS[@]}"; do
         --output-dir "$(cd "$OUTPUT_DIR" && pwd)" \
         --max-workers "${PARALLEL:-1}"
 
-    # 一次调用跑完该快照的所有组合（默认 snapshot 日期前 30 天 ~ 当天）
-    (cd "$SNAPSHOT_ABS" && $PYTHON_CMD -m backtest.batch_runner \
-        --run "$RUN_LIST" \
+    # 转调【快照自带】的 wrapper —— 不是当前项目的那份。
+    # 快照是当天项目的完整副本，用它自己的 scripts/ 才是真正
+    # "回放当天的执行路径"；用当前项目的脚本等于拿今天的代码跑昨天的参数。
+    # 默认区间 = 前一天（BT_START = BT_END = snapshot 日期 - 1）
+    (cd "$SNAPSHOT_ABS" && bash scripts/run_backtest_batch.sh \
+        --strategies "$strategy_name" \
+        --symbols "$SYMS" \
         --start "${BT_START}" \
         --end "${BT_END}" \
         --profile replay \
-        --log-level INFO) 2>&1 | tee -a "${LOGS_DIR:-./logs}/replay-${REPLAY_DATE}.log"
+        --log-level INFO \
+        --yes) 2>&1 | tee -a "${LOGS_DIR:-./logs}/replay-${REPLAY_DATE}.log"
 
     # 检查回测结果（产物在 {output_dir}/{strategy}/{date}/{time}/{symbol}/）
     RESULT_COUNT=$(find "$OUTPUT_DIR" -name "backtest_result.json" 2>/dev/null | wc -l)
@@ -618,12 +623,15 @@ done
 **快照之间串行**：每个快照有自己的 `config/`，并行会互相踩生成的 profile。
 单快照内的多个 (策略, 代币) 由 `profile.max_workers` 并发。
 
-**⚠ 不要用 `batch_runner --daemon`**：该模式重建子命令时只传
-`--profile` 和 `--batch-id`，会丢掉 `--run/--start/--end/--config`，
+**⚠ 不要用 `--daemon`**：`batch_runner` 该模式重建子命令时只传
+`--profile` 和 `--batch-id`，会丢掉 `--run/--start/--end`，
 等于跑成空清单。需要后台执行请在外层 `nohup` 本脚本。
 
+**`--yes` 是必须的**：wrapper 在任务数 > 6 时会 `read` 等待确认，
+replay 通常由 crontab 触发，不传 `--yes` 会卡死在无人应答的提示上。
+
 **跳过无 K 线数据的标的**：Phase 2.5 的分析结果里 `csv_exists=false`
-的 symbol 必然回测失败，提交给 `batch_runner` 只会把整批退出码染红，
+的 symbol 必然回测失败，提交给 wrapper 只会把整批退出码染红，
 掩盖真正的异常 —— 构建清单时应先剔除。
 
 **回测输出目录结构**：

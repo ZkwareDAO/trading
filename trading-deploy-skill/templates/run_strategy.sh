@@ -1,5 +1,15 @@
 #!/bin/bash
-# run_strategy.sh — 策略启动脚本 (Phase 5)
+# run_strategy.sh — 单策略单标的启动（调试用途）
+#
+# ⚠ 正式部署不走这里。deploy.sh 的 Phase 5 转调模板自带的
+#   scripts/run_live_batch.sh —— 那条路径共用 cta_strategy_core.pid，
+#   能被模板 stop.sh 正常停掉。
+#
+#   本脚本用 --background 起的进程【不在 stop.sh 管辖范围内】，
+#   忘记手动 kill 就会变成继续下单的孤儿进程。因此仅建议：
+#     - 前台运行（不加 --background），观察单个标的的日志
+#     - 排查某个 symbol 单独启动是否报错
+#   实盘请用: cd <项目> && bash scripts/run_live_batch.sh --strategies N --symbols S --daemon
 #
 # 对接模板 v3.7 的实盘入口:
 #   单策略单标的: python run_strategy.py --name NAME --symbol SYMBOL

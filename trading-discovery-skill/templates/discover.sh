@@ -8,8 +8,9 @@
 #   discover.sh --all-strategies --symbols BTCUSDT,ETHUSDT --start 20260101
 #   discover.sh --symbols BTCUSDT --strategies ema_rsi --start 20260601 --parallel 3
 #
-# 依赖模板 v3.7 的回测入口:
-#   python -m backtest.batch_runner --run name:symbol,... --start D --end D --profile P
+# 依赖模板 v3.7 的批量回测入口:
+#   scripts/run_backtest_batch.sh --strategies N --symbols S --start D --end D --profile P --yes
+# 该脚本内部转调 python -m backtest.batch_runner，本 skill 不直连 Python 入口。
 # 策略参数唯一来源: strategies/<name>/overrides/<SYMBOL>.yaml
 # 回测运行参数（输出目录/并发/资金/费率）: config/<profile>.yaml，本脚本自动生成
 
@@ -32,6 +33,10 @@ STRATEGIES_DIR="${STRATEGIES_DIR:-./strategies}"
 PYTHON_CMD="${PYTHON_CMD:-}"
 PARALLEL="${PARALLEL:-1}"
 SKIP_ANALYSIS="${SKIP_ANALYSIS:-false}"
+# 是否为缺 overrides 的代币自动创建配置（Phase 0.55）
+# 默认 false：创建配置是写盘动作，且新配置的参数需要用户复核，
+# 不该在用户没要求时静默发生。缺配置时给出明确提示和修复命令。
+INIT_CONFIGS="${INIT_CONFIGS:-false}"
 # K 线数据目录（analyze_strategies.py 用于数据可用性检查）
 KLINE_DATA_DIR="${KLINE_DATA_DIR:-./data/klines}"
 # run-profile 名：生成 PROJECT_DIR/config/<name>.yaml
@@ -93,6 +98,10 @@ while [[ $# -gt 0 ]]; do
             SKIP_ANALYSIS=true
             shift
             ;;
+        --init-configs)
+            INIT_CONFIGS=true
+            shift
+            ;;
         -h|--help)
             echo "用法: discover.sh --symbols S1,S2 --strategies ST1,ST2 --start DATE [--end DATE]"
             echo ""
@@ -108,6 +117,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --profile NAME          run-profile 名（默认: discovery）"
             echo "  --keep-profile          保留生成的 config/<NAME>.yaml（默认运行后删除）"
             echo "  --skip-analysis         跳过策略分析阶段 (Phase 1.5)"
+            echo "  --init-configs          为缺 overrides/<SYMBOL>.yaml 的代币自动创建配置"
             echo "  --python CMD            Python 命令（默认: 自动探测 .venv/bin/python）"
             exit 0
             ;;
@@ -345,15 +355,23 @@ else
     log "⚠ analyze_strategies.py 不存在，跳过策略分析"
 fi
 
-# ===== 构建 batch_runner 运行清单 =====
-# 格式: name:symbol,name:symbol —— 与实盘 run_strategies_manager.py --run 一致。
-# batch_runner 自动按 strategies/<name>/overrides/<SYMBOL>.yaml 解析策略参数，
-# 文件不存在直接报错（显式清单不静默跳过），因此这里预先校验并给出可读提示。
+# ===== 构建回测清单 =====
+# 最终由模板自带的 scripts/run_backtest_batch.sh 执行。该脚本只支持
+# 「策略 × 代币」笛卡尔积，无法表达"每个策略配不同代币"，因此这里按策略
+# 分组：每个策略一次调用，传该策略实际可回测的代币子集。
+# 策略参数唯一来源: strategies/<name>/overrides/<SYMBOL>.yaml，
+# 缺文件 wrapper 的 precheck_overrides 会直接拒绝，故这里预先过滤并解释原因。
 RUN_LIST=""
 SKIPPED_PAIRS=()
+CREATED_CONFIGS=()
 TOTAL_COMBINATIONS=0
+# 与 BATCH_STRATEGIES 下标一一对应：BATCH_SYMBOLS[i] 是该策略的代币 CSV
+BATCH_STRATEGIES=()
+BATCH_SYMBOLS=()
 
 for strategy in "${STRATEGY_LIST[@]}"; do
+    # 每个策略独立累积，避免代币串到下一个策略
+    STRATEGY_RUNNABLE=""
     # 确定当前策略的 symbols 列表
     if [ -n "$ANALYSIS_JSON" ] && [ -f "$ANALYSIS_JSON" ]; then
         STRATEGY_SYMBOLS=$($PYTHON_CMD -c "
@@ -378,6 +396,21 @@ for s in data.get('strategies', []):
         [ -z "$symbol" ] && continue
         # v3.7 单一事实来源: strategies/<name>/overrides/<SYMBOL>.yaml
         OVERRIDE_FILE="${STRATEGIES_DIR}/${strategy}/overrides/${symbol}.yaml"
+
+        # 缺配置时：--init-configs 则创建（Phase 0.55），否则记账待汇总提示。
+        # 不静默跳过 —— 用户指定了这个币却不回测它，必须说清原因和怎么修。
+        if [ ! -f "$OVERRIDE_FILE" ] && [ "$INIT_CONFIGS" = true ]; then
+            if [ -f "${SCRIPT_DIR}/init_overrides.py" ]; then
+                log "🔧 ${strategy}:${symbol} 缺配置，尝试创建..."
+                $PYTHON_CMD "${SCRIPT_DIR}/init_overrides.py" \
+                    --strategy-dir "${STRATEGIES_DIR}/${strategy}" \
+                    --symbols "$symbol" 2>&1 | tee -a "$LOG_FILE" || true
+                CREATED_CONFIGS+=("${strategy}:${symbol}")
+            else
+                log "⚠ 缺 init_overrides.py，无法自动创建配置"
+            fi
+        fi
+
         if [ ! -f "$OVERRIDE_FILE" ]; then
             SKIPPED_PAIRS+=("${strategy}:${symbol} (缺 overrides/${symbol}.yaml)")
             continue
@@ -387,9 +420,28 @@ for s in data.get('strategies', []):
         else
             RUN_LIST="${RUN_LIST},${strategy}:${symbol}"
         fi
+        if [ -z "$STRATEGY_RUNNABLE" ]; then
+            STRATEGY_RUNNABLE="$symbol"
+        else
+            STRATEGY_RUNNABLE="${STRATEGY_RUNNABLE},${symbol}"
+        fi
         TOTAL_COMBINATIONS=$((TOTAL_COMBINATIONS + 1))
     done
+
+    # 该策略有可回测代币才登记为一次 wrapper 调用
+    if [ -n "$STRATEGY_RUNNABLE" ]; then
+        BATCH_STRATEGIES+=("$strategy")
+        BATCH_SYMBOLS+=("$STRATEGY_RUNNABLE")
+    fi
 done
+
+if [ ${#CREATED_CONFIGS[@]} -gt 0 ]; then
+    log "🔧 已为 ${#CREATED_CONFIGS[@]} 个组合创建 per-symbol 配置:"
+    for p in "${CREATED_CONFIGS[@]}"; do
+        log "    + $p"
+    done
+    log "  ⚠ 新建配置的 trading_mode 均为 paper_trading，参数需复核后再用于实盘决策"
+fi
 
 if [ ${#SKIPPED_PAIRS[@]} -gt 0 ]; then
     log "⚠ 跳过 ${#SKIPPED_PAIRS[@]} 个组合（缺少 per-symbol overrides）:"
@@ -397,6 +449,11 @@ if [ ${#SKIPPED_PAIRS[@]} -gt 0 ]; then
         log "    - $p"
     done
     log "  说明: v3.7 策略参数唯一来源是 strategies/<name>/overrides/<SYMBOL>.yaml"
+    if [ "$INIT_CONFIGS" = false ]; then
+        log "  修复: 加 --init-configs 自动创建，或手工执行:"
+        log "        $PYTHON_CMD ${SCRIPT_DIR}/init_overrides.py \\"
+        log "            --strategy-dir ${STRATEGIES_DIR}/<策略名> --symbols <代币>"
+    fi
 fi
 
 if [ -z "$RUN_LIST" ]; then
@@ -446,19 +503,37 @@ cleanup_profile() {
 trap cleanup_profile EXIT
 
 # ===== 执行回测 =====
-# 单次 batch_runner 调用：并发由 profile.max_workers 控制（ProcessPoolExecutor），
-# 不再用 shell 后台任务手工控制并发。
-# 注意: 刻意不用 batch_runner --daemon —— 该模式重建子命令时会丢掉
-# --run/--start/--end/--config，等于跑成空清单。需要后台请在外层 nohup 本脚本。
+# 转调模板自带 scripts/run_backtest_batch.sh，而不是直接调 backtest.batch_runner。
+# 理由: 该 wrapper 承载了 overrides 预检、笛卡尔积展开、PYTHONPATH 设置、
+# exec 移交退出码等逻辑；skill 自己再实现一遍会与模板形成两套执行路径，
+# 模板升级时必然漂移。
+# --yes: skill 是非交互环境，wrapper 在任务数 > 6 时会 read 提示，必须跳过。
+# 并发仍由 profile.max_workers 控制（wrapper 不接受并发参数）。
+# 注意: 刻意不用 --daemon —— batch_runner 该模式重建子命令时会丢掉
+# --run/--start/--end，等于跑成空清单。需要后台请在外层 nohup 本脚本。
 log "START discover.sh"
 
+BATCH_SCRIPT="${PROJECT_ABS}/scripts/run_backtest_batch.sh"
+if [ ! -f "$BATCH_SCRIPT" ]; then
+    log "❌ 模板批量回测脚本不存在: $BATCH_SCRIPT"
+    log "  说明: 本 skill 依赖模板 v3.7 的 scripts/run_backtest_batch.sh"
+    exit 1
+fi
+
 BATCH_EXIT=0
-(cd "$PROJECT_ABS" && $PYTHON_CMD -m backtest.batch_runner \
-    --run "$RUN_LIST" \
-    --start "$START_DATE" \
-    --end "$END_DATE" \
-    --profile "$PROFILE_NAME" \
-    --log-level INFO) 2>&1 | tee -a "$LOG_FILE" || BATCH_EXIT=1
+for i in "${!BATCH_STRATEGIES[@]}"; do
+    bs="${BATCH_STRATEGIES[$i]}"
+    bsym="${BATCH_SYMBOLS[$i]}"
+    log "▶ 回测 ${bs} → ${bsym}"
+    (cd "$PROJECT_ABS" && bash "$BATCH_SCRIPT" \
+        --strategies "$bs" \
+        --symbols "$bsym" \
+        --start "$START_DATE" \
+        --end "$END_DATE" \
+        --profile "$PROFILE_NAME" \
+        --log-level INFO \
+        --yes) 2>&1 | tee -a "$LOG_FILE" || BATCH_EXIT=1
+done
 
 # ===== 统计结果 =====
 # 产物结构（backtest_reporter.py）: {output_dir}/{strategy}/{date}/{time}/{symbol}/

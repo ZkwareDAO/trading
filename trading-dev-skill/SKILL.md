@@ -14,6 +14,7 @@ origin: trading
 
 ## When to Activate
 
+- 用户执行 `/trading-dev`（无参数）-> **进入交互式引导**
 - 用户执行 `/trading-dev new` — 创建新 CTA 策略项目（交互模式）
 - 用户执行 `/trading-dev new --from <source>` — 从指定来源自动开发策略（全自动模式）
 - 用户说"新建策略项目"、"创建交易项目"、"开发新策略"
@@ -22,10 +23,13 @@ origin: trading
 - 用户执行 `/trading-dev backtest` — 只跑回测
 - 用户已有策略项目，想执行回测验证
 
+**首要原则：无参数或子命令不明确时，必须一步一步引导用户，不要报错让用户自己补命令。**
+
 ## Commands
 
 | 命令 | 模式 | 说明 |
 |------|------|------|
+| `/trading-dev` | 引导 | 无参数 -> 进入交互式引导 |
 | `/trading-dev new` | 交互 | 逐步确认策略信息、环境变量、每步执行 |
 | `/trading-dev new --from <source>` | 全自动 | 从文件/目录/URL/描述提取策略信息，零交互跑到底 |
 | `/trading-dev new <描述文本>` | 全自动 | 从自然语言提取策略信息，零交互跑到底 |
@@ -44,6 +48,102 @@ origin: trading
 | URL | `--from https://...` | WebFetch 抓取 |
 | 自然语言 | `/trading-dev new 开发一个 EMA 交叉策略，4h，BTCUSDT` | 从描述提取 |
 | 省略 | `/trading-dev new` | 进入多轮对话收集策略信息 |
+
+---
+
+## Phase -1: 交互式引导（无参数时） ← NEW
+
+### 触发条件
+
+| 条件 | 说明 |
+|------|------|
+| 无任何参数 | 用户只敲了 `/trading-dev` |
+
+**不进入引导**（直接走原流程）：
+
+- `/trading-dev new [参数]` / `scaffold` / `develop` / `backtest` / `benchmark`（子命令明确）
+- 参数齐全的单步命令
+
+### 引导核心原则
+
+1. **缺啥补啥**：用户已经给的参数跳过不问，只问缺失项
+2. **一步一问**：每次只问一个问题，给默认值 + 示例
+3. **每步可改**：用户随时能修改前面给过的值
+4. **不报错**：宁可多问一轮，也不要扔"参数不全"给用户
+5. **引导完汇总**：参数收齐后输出执行计划让用户确认，确认后才进 Phase 0
+
+### 引导顺序
+
+```
+Step 1: 问子命令（new / scaffold / develop / backtest / benchmark）
+        -> 给默认：new
+       ↓
+Step 2: 问策略来源（new 子命令）
+        -> 已有项目？-> 引导单步子命令（develop / backtest）
+        -> 无项目？-> 问策略描述 / 文件路径 / URL / 已有策略目录
+       ↓
+Step 3: 汇总确认 -> 用户确认后进 Phase 0
+```
+
+### Step 1 话术模板：问子命令
+
+```
+🧭 交互式引导 - 第 1 步（共 3 步）：要执行什么操作？
+
+  1. new        ← 新策略全流程（脚手架->编码->回测->benchmark）
+  2. scaffold   ← 只创建脚手架
+  3. develop    ← 只生成策略代码（需已有项目）
+  4. backtest   ← 只跑回测验证（需已有项目）
+  5. benchmark  ← 只输出 benchmark 报告（需已有项目）
+
+请选择（输入编号或命令名）。默认：1（new）
+```
+
+### Step 2 话术模板：问策略来源（new 子命令）
+
+```
+🧭 交互式引导 - 第 2 步（共 3 步）：策略来源
+
+请描述新策略（任选一种方式）：
+  1. 直接描述   ← 一句话策略逻辑，如"EMA20/EMA60 交叉，4h，BTCUSDT"
+  2. 文件路径   ← 如 --from /path/to/strategy_doc.md
+  3. 已有策略   ← 如 --from /path/to/cta_ict_v4/（逆向提取 spec）
+  4. URL        ← 如 --from https://...
+
+请输入（默认进入多轮对话逐步收集）：
+```
+
+**若用户选了 2/3/4 之一**：按 `--from <source>` 全自动模式执行。
+**若用户选 1 或直接描述**：按自然语言提取执行。**若回车**：进交互模式多轮收集（Phase 0 Step 1）。
+
+**单步子命令（develop/backtest/benchmark）时**：列出当前目录下候选项目（含 `strategy_core/` 的目录）供选择；无候选则提示先跑 `new`。
+
+### Step 3 话术模板：汇总确认
+
+```
+📋 引导完成 - 执行计划确认
+
+  操作:     new（全流程）
+  模式:     交互 / 全自动
+  策略来源: <描述或 --from 来源>
+
+确认执行？
+  > y / 回车   ← 进 Phase 0
+  > n          ← 取消
+  > 改 XX      ← 修改某项
+```
+
+### 引导收尾
+
+用户确认后：把引导参数组装成等效命令行 -> **进入 Phase 0 环境预检 + 策略信息获取**。
+
+### 引导 vs 原流程对照
+
+| 场景 | 旧行为 | 新行为 |
+|------|--------|--------|
+| `/trading-dev` 无参数 | 不明确 | 进引导，问子命令->策略来源 |
+| `/trading-dev new` | 交互式多轮收集 | 跳过引导（子命令明确，走 Phase 0 交互） |
+| `/trading-dev new --from X` | 全自动直接跑 | 跳过引导直接跑（参数齐全） |
 
 ---
 
@@ -784,32 +884,35 @@ print('✅ 配置文件格式正确')
 | 长期 | 20250101-20260709 | 至少一个代币费后收益 ≥ 20% |
 
 三个周期都用同一条批量命令，只换 `--start` / `--end`。
-`--run name:symbol,...` 一次跑完多个代币，并发由 `config/backtest.yaml`
-的 `max_workers` 控制；策略参数自动读
+经项目自带的 `scripts/run_backtest_batch.sh` 调用（它负责 overrides 预检、
+笛卡尔积展开、`PYTHONPATH`，再转调 `backtest.batch_runner`）。
+并发由 `config/backtest.yaml` 的 `max_workers` 控制；策略参数自动读
 `strategies/{strategy_name}/overrides/<SYMBOL>.yaml`。
+
+`--yes` 跳过任务数 > 6 时的交互确认，非交互环境必须带。
 
 ### Step 1: 短期回测
 
 ```bash
-python -m backtest.batch_runner \
-    --run {strategy_name}:BTCUSDT,{strategy_name}:ETHUSDT,{strategy_name}:SOLUSDT \
-    --start 20260601 --end 20260709 --log-level INFO
+bash scripts/run_backtest_batch.sh \
+    --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --start 20260601 --end 20260709 --log-level INFO --yes
 ```
 
 ### Step 2: 中期回测
 
 ```bash
-python -m backtest.batch_runner \
-    --run {strategy_name}:BTCUSDT,{strategy_name}:ETHUSDT,{strategy_name}:SOLUSDT \
-    --start 20260101 --end 20260709 --log-level INFO
+bash scripts/run_backtest_batch.sh \
+    --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --start 20260101 --end 20260709 --log-level INFO --yes
 ```
 
 ### Step 3: 长期回测
 
 ```bash
-python -m backtest.batch_runner \
-    --run {strategy_name}:BTCUSDT,{strategy_name}:ETHUSDT,{strategy_name}:SOLUSDT \
-    --start 20250101 --end 20260709 --log-level INFO
+bash scripts/run_backtest_batch.sh \
+    --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
+    --start 20250101 --end 20260709 --log-level INFO --yes
 ```
 
 ### Step 4: 单标的复核
@@ -1281,9 +1384,15 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 
 ```
 用户输入:
+  无参数: /trading-dev                        ← 进引导
   全自动: /trading-dev new --from <source>
   交互:   /trading-dev new
   单步:   /trading-dev scaffold | develop | backtest | benchmark
+       ↓
+Phase -1: 交互式引导（仅无参数时）  ← NEW
+  ├── Step 1: 问子命令（默认 new）
+  ├── Step 2: 问策略来源（new 子命令）
+  └── Step 3: 汇总确认 -> 进 Phase 0
        ↓
 Phase 0: 环境预检 + 策略信息获取
   ├── Step 0: 环境预检（Python/ta-lib/pip/K线数据/磁盘）

@@ -326,14 +326,25 @@ strategies/<name>/
 
 ## 11. 漂移门禁
 
-改完 skill 后跑，命中数必须为 0：
+改完 skill 后跑，命中数必须为 0。
+
+**豁免**：`docs/archive/`（归档不动）和 `CONFIG_UNIFICATION_SPEC.md`（删改史
+本身要引用旧名），以及含否定语气的行（"不再生成/已删除/不存在"——那是禁令，不是用法）：
 
 ```bash
+# 门禁 1：旧路径/旧参数名
 grep -rn 'backtest\.run_strategy\|--backtest-config\|config\.test\.yaml' \
-    trading-*/SKILL.md trading-*/templates/ | wc -l
+    trading-*/SKILL.md trading-*/templates/ 2>/dev/null \
+  | grep -v 'docs/archive/' \
+  | grep -v 'CONFIG_UNIFICATION_SPEC' \
+  | grep -v '不再\|已删除\|不存在\|幻觉' \
+  | wc -l
 
+# 门禁 2：run_backtest 旧 CLI 参数
 grep -rn 'run_backtest.*--strategy \|run_backtest.*--symbol \|run_backtest.*--output ' \
-    trading-*/SKILL.md trading-*/templates/ | wc -l
+    trading-*/SKILL.md trading-*/templates/ 2>/dev/null \
+  | grep -v 'docs/archive/' \
+  | wc -l
 ```
 
 注意区分两类 `--strategy`：

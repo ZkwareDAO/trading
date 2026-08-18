@@ -36,9 +36,14 @@
 | A1 | `strategy.py` 存在 | 必需 | ⬜ |
 | A2 | `{prefix}_core.py` 存在 | 必需 | ⬜ |
 | A3 | `__init__.py` 存在 | 推荐 | ⬜ |
-| A4 | `config.yaml` 存在 | 必需 | ⬜ |
-| A5 | `config.test.yaml` 存在 | 必需（回测） | ⬜ |
+| A4 | `overrides/{SYMBOL}.yaml` 至少一份 | 必需（实盘与回测共用） | ⬜ |
+| A5 | `.strategy-spec.yaml` 存在 | 推荐（策略契约） | ⬜ |
 | A6 | `tests/` 目录存在 | 推荐 | ⬜ |
+
+> ⚠️ v3.7 起 **不存在** `config.yaml` / `config.dev.yaml` / `config.test.yaml`。
+> per-symbol 参数的唯一事实来源是 `overrides/{SYMBOL}.yaml`——实盘 `run_strategy.py`
+> 与回测 `run_backtest.py` 读的都是它。按环境分文件会让回测与实盘读到两份参数，
+> 是回测失真的根源，v3.7 已删除。
 
 **A 类结论**：⬜ PASS / ⬜ FAIL
 

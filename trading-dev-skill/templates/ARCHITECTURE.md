@@ -292,9 +292,9 @@ strategies/cta_ict_v3/
 ├── strategy.py       # 继承 BaseStrategy，~35 行
 ├── ict_core.py       # 继承 BaseStrategyCore，实现 analyze/check_realtime_exit
 ├── state.py          # 继承 BaseState，添加特有字段
-├── config.yaml       # 策略配置
-├── config.dev.yaml   # 开发环境配置
-├── config.test.yaml  # 测试环境配置
+├── overrides/        # per-symbol 参数（v3.7 唯一事实来源，实盘与回测共用）
+│   └── BTCUSDT.yaml
+├── .strategy-spec.yaml  # 策略契约（给人和 AI 读，无代码消费）
 └── __init__.py
 ```
 

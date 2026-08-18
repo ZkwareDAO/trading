@@ -29,17 +29,23 @@ strategies/{strategy_name}/
 ├── __init__.py              # 模块初始化
 ├── strategy.py              # Strategy 接口类（必需）
 ├── {prefix}_core.py         # 核心逻辑类（必需）
-├── config.yaml              # 默认配置
-├── config.dev.yaml          # 开发环境配置
-├── config.test.yaml         # 测试/回测配置
+├── .strategy-spec.yaml      # 策略契约（推荐，无代码消费，给人和 AI 读）
+├── overrides/
+│   └── {SYMBOL}.yaml        # per-symbol 参数（必需，至少一份）
 └── tests/
     ├── test_{prefix}_core.py      # 核心逻辑测试
     └── test_strategy_logging.py   # 信号日志测试
 ```
 
+> ⚠️ v3.7 起 **不再有** `config.yaml` / `config.dev.yaml` / `config.test.yaml`。
+> 参数的唯一事实来源是 `overrides/{SYMBOL}.yaml`，实盘与回测共读同一份，
+> 避免按环境分文件导致回测与实盘参数分叉。
+
 **命名规范**：
-- `{strategy_name}`: 策略目录名，如 `obv_atr`, `cta_trend`
+- `{strategy_name}`: 策略目录名，如 `obv_atr`, `cta_trend`。目录名即策略名，
+  加载走模块路径 `strategies.{strategy_name}.strategy`，必须是合法 Python 包名
 - `{prefix}`: 核心文件前缀，如 `obv`, `trend`
+- `{SYMBOL}`: 交易对，如 `BTCUSDT`
 
 ---
 
@@ -180,32 +186,68 @@ __all__ = ["Strategy", "{Prefix}Core", "{Prefix}State"]
 
 ## 配置文件模板
 
+**路径**：`strategies/{strategy_name}/overrides/{SYMBOL}.yaml`
+（每个代币一份，`symbols` 只含自己那一个）
+
 ```yaml
-{strategy_name}:
+{strategy_name}:                  # 顶层必须是策略名键
+  strategy:
+    name: {PREFIX}
   enabled: true
   version: '1'
 
+  # 运行模式：live / paper_trading / smoking
+  # ⚠ 缺省时框架按 live 处理（会下真单），新策略务必显式写 paper_trading
+  trading_mode: "paper_trading"
+
   # 标的与周期
   symbols:
-    - BTCUSDT
+    - BTCUSDT                     # 只含本文件对应的那一个代币
   timeframes:
     - 1h
   direction: neutral
 
   # 策略参数
   params:
-    {indicator}_timeframes: 1h  # 每个指标必须配置 *_timeframes
+    {indicator}_timeframes: 1h    # 每个指标必须配置 *_timeframes
     # 其他参数...
 
   # 信号配置
   signal:
     min_strength: 0.5
-    cooldown_ms: 60000
+    cooldown_ms: 0
+    order_type: 1
+    slippage: 0
+    exchange: binance
 
   # 系统字段
   capital:
-    max_cash: 100
+    max_cash: 1000
     max_parts: 1
+    leverage: 1
+  risk:
+    enabled: true
+    fixed_stop_loss_pct: 2.0
+    trailing_profit:
+      enabled: true
+      activation_pct: 2.0
+      drawdown_pct: 20.0
+    fixed_take_profit_pct: 0.0
+  cooldown_timeframe: 1h
+  user_id: 1                      # 信号归属用户 ID，单用户部署保持 1
+```
+
+`interval` / `version` / `trading_mode` 由框架从本文件自动读取，无需在命令行传。
+回测用 `--strategies {strategy_name}:{SYMBOL}` 自动定位本文件，**不需要** `--config`。
+
+还需在**编排层** `config/strategies.yaml` 登记"跑哪些"（实盘与回测共用）：
+
+```yaml
+strategies:
+  {strategy_name}:
+    trading_mode: "paper_trading"
+    symbols:
+      - BTCUSDT
 ```
 
 ---

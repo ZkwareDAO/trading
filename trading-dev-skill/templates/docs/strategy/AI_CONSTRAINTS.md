@@ -38,7 +38,7 @@
 | 7 | 止损时必须调用 `clear_position(record_stop_loss=True)` | Core 类 `_close()` 方法 |
 | **8** | **必须在 `analyze()` 内计算所有技术指标** | Core 类 `analyze()` |
 | **9** | **必须对每个时间框架调用 `get_closed_data()`** | Core 类 `analyze()` |
-| **10** | **必须在 config.yaml 配置 `*_timeframes`** | 配置文件 |
+| **10** | **必须在 `overrides/{SYMBOL}.yaml` 配置 `*_timeframes`** | per-symbol 配置文件 |
 | **11** | **数组/字典字段必须使用 `field(default_factory=...)`** | State 类 |
 
 ---

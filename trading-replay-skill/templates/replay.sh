@@ -3,15 +3,16 @@
 # 扫描 snapshot/{date}/ 目录，对每个 {strategy}-{model} 快照执行回测
 #
 # 用法:
-#   replay.sh                          # 回测当天 snapshot，从 snapshot 日期前 30 天到今天
+#   replay.sh                          # 回测当天 snapshot，默认只回测前一天
 #   replay.sh --date 20260801          # 回测指定日期 snapshot
 #   replay.sh --date 20260801 --start 20260101 --end 20260801  # 自定义回测时间范围
 #   replay.sh --strategy ema_rsi       # 只回测指定策略
 #   replay.sh --model product          # 只回测指定模型
 #
-# 依赖模板 v3.7 的回测入口:
-#   python -m backtest.batch_runner --run name:symbol,... --start D --end D --profile P
-# 每个快照是一份完整项目副本，回测在快照目录内运行，
+# 依赖模板 v3.7 的批量回测入口:
+#   scripts/run_backtest_batch.sh --strategies N --symbols S --start D --end D --profile P --yes
+# 该脚本内部转调 python -m backtest.batch_runner，本 skill 不直连 Python 入口。
+# 每个快照是一份完整项目副本，回测在快照目录内运行（用快照自带的 scripts/），
 # 策略参数读快照自带的 strategies/<name>/overrides/<SYMBOL>.yaml
 # —— 这正是"回放当天实盘参数"的意义所在。
 
@@ -33,7 +34,9 @@ KLINE_DATA_DIR="${KLINE_DATA_DIR:-./data/klines}"
 DATA_PATH="${DATA_PATH:-./data}"
 SKIP_ANALYSIS="${SKIP_ANALYSIS:-false}"
 # 回测回看天数（--start 未指定时用）
-LOOKBACK_DAYS="${LOOKBACK_DAYS:-30}"
+# 默认 1 = 只回测前一天：replay 的语义是"复盘昨天实盘跑出了什么"，
+# 回测窗口应与那一天对齐；拉长窗口会混入与当日实盘无关的行情。
+LOOKBACK_DAYS="${LOOKBACK_DAYS:-1}"
 # run-profile 名：在每个快照目录内生成 config/<name>.yaml
 PROFILE_NAME="${REPLAY_PROFILE:-replay}"
 BT_CASH="${BT_CASH:-5000}"
@@ -105,9 +108,9 @@ while [[ $# -gt 0 ]]; do
             echo ""
             echo "选项:"
             echo "  --date YYYYMMDD       snapshot 日期（默认: 当天）"
-            echo "  --start YYYYMMDD      回测开始时间（默认: snapshot 日期前 ${LOOKBACK_DAYS} 天）"
-            echo "  --end YYYYMMDD        回测结束时间（默认: 当天）"
-            echo "  --lookback-days N     --start 未指定时的回看天数（默认: 30）"
+            echo "  --start YYYYMMDD      回测开始时间（默认: snapshot 日期前 ${LOOKBACK_DAYS} 天，即前一天）"
+            echo "  --end YYYYMMDD        回测结束时间（默认: snapshot 日期前 1 天，即前一天）"
+            echo "  --lookback-days N     --start 未指定时的回看天数（默认: 1）"
             echo "  --config FILE         Replay 自身配置文件（默认: config.yaml）"
             echo "  --strategy NAME       只回测指定策略"
             echo "  --model TYPE          只回测指定模型 (product/smoking/paper)"
@@ -206,8 +209,10 @@ with open(sys.argv[2], 'w') as out:
 fi
 
 # ===== 回测时间范围默认值 =====
-# --start: 默认为 snapshot 日期前 LOOKBACK_DAYS 天
-# --end: 默认为当天
+# 默认区间 = 前一天这一整天（start = end = snapshot 日期 - 1）。
+# snapshot 日期通常是当天，故默认就是"昨天"。
+# --start: snapshot 日期前 LOOKBACK_DAYS 天（默认 1）
+# --end:   snapshot 日期前 1 天
 if [ -z "$BT_START" ]; then
     BT_START=$($PYTHON_CMD -c "
 from datetime import datetime, timedelta
@@ -220,7 +225,15 @@ print((d - timedelta(days=${LOOKBACK_DAYS})).strftime('%Y%m%d'))
     fi
 fi
 if [ -z "$BT_END" ]; then
-    BT_END=$(date +%Y%m%d)
+    BT_END=$($PYTHON_CMD -c "
+from datetime import datetime, timedelta
+d = datetime.strptime('${REPLAY_DATE}', '%Y%m%d')
+print((d - timedelta(days=1)).strftime('%Y%m%d'))
+" 2>/dev/null || date -d "${REPLAY_DATE} - 1 day" +%Y%m%d 2>/dev/null || echo "")
+    if [ -z "$BT_END" ]; then
+        log "❌ 无法计算前一天日期，请手动指定 --end"
+        exit 1
+    fi
 fi
 
 # ===== 创建目录 =====
@@ -342,12 +355,12 @@ if [ ! -f "${SCRIPT_DIR}/make_profile.py" ]; then
 fi
 
 # ===== 执行回测 =====
-# 每个快照是独立的项目副本，各自 cd 进去跑一次 batch_runner。
+# 每个快照是独立的项目副本，各自 cd 进去调它自带的 scripts/run_backtest_batch.sh。
 # 单快照内的多个 (策略, 代币) 由 profile.max_workers 并发，
 # 快照之间串行 —— 每个快照有自己的 config/，并行会互相踩生成的 profile。
 #
-# 注意: 刻意不用 batch_runner --daemon —— 该模式重建子命令时会丢掉
-# --run/--start/--end/--config，等于跑成空清单。需要后台请在外层 nohup 本脚本。
+# 注意: 刻意不用 --daemon —— batch_runner 该模式重建子命令时会丢掉
+# --run/--start/--end，等于跑成空清单。需要后台请在外层 nohup 本脚本。
 SUCCESS_COUNT=0
 FAIL_COUNT=0
 GENERATED_PROFILES=()
@@ -420,6 +433,7 @@ for s in data.get('strategies', []):
     fi
 
     RUN_LIST=""
+    SYMBOL_CSV=""
     PAIR_COUNT=0
     NO_DATA_SYMBOLS=()
     for override_file in "$OVERRIDES_DIR"/*.yaml; do
@@ -432,8 +446,10 @@ for s in data.get('strategies', []):
         fi
         if [ -z "$RUN_LIST" ]; then
             RUN_LIST="${strategy_name}:${sym}"
+            SYMBOL_CSV="$sym"
         else
             RUN_LIST="${RUN_LIST},${strategy_name}:${sym}"
+            SYMBOL_CSV="${SYMBOL_CSV},${sym}"
         fi
         PAIR_COUNT=$((PAIR_COUNT + 1))
     done
@@ -473,13 +489,26 @@ for s in data.get('strategies', []):
     fi
 
     # ===== 执行 =====
+    # 转调【快照自带】的 scripts/run_backtest_batch.sh —— 不是当前项目的那份。
+    # 快照是当天项目的完整副本，用它自己的 wrapper 才是真正"回放当天的执行路径"。
+    # --yes: 非交互环境，wrapper 在任务数 > 6 时会 read 提示。
+    SNAPSHOT_BATCH_SCRIPT="${SNAPSHOT_ABS}/scripts/run_backtest_batch.sh"
+    if [ ! -f "$SNAPSHOT_BATCH_SCRIPT" ]; then
+        log "❌ ${snapshot}: 快照缺少 scripts/run_backtest_batch.sh，跳过"
+        log "    说明: 该快照可能早于模板 v3.7，或 snapshot 时排除了 scripts/"
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        continue
+    fi
+
     BATCH_OK=true
-    (cd "$SNAPSHOT_ABS" && $PYTHON_CMD -m backtest.batch_runner \
-        --run "$RUN_LIST" \
+    (cd "$SNAPSHOT_ABS" && bash "$SNAPSHOT_BATCH_SCRIPT" \
+        --strategies "$strategy_name" \
+        --symbols "$SYMBOL_CSV" \
         --start "$BT_START" \
         --end "$BT_END" \
         --profile "$PROFILE_NAME" \
-        --log-level INFO) 2>&1 | tee -a "$LOG_FILE" || BATCH_OK=false
+        --log-level INFO \
+        --yes) 2>&1 | tee -a "$LOG_FILE" || BATCH_OK=false
 
     # 检查回测结果（产物: {output_dir}/{strategy}/{date}/{time}/{symbol}/）
     RESULT_COUNT=$(find "$OUTPUT_DIR" -name "backtest_result.json" 2>/dev/null | wc -l | tr -d ' ')
