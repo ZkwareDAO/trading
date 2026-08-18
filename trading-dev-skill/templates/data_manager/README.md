@@ -14,7 +14,7 @@ klines_service              data_manager                     策略
 │ HTTP API     │ ────────▶ │ DataManager      │ ────────▶ │ get_klines()│
 └──────────────┘           │ KlineRepository  │            │ Kline 对象  │
                            │ Cache (1m+LRU)   │            └─────────────┘
-本地 CSV 文件 ────────────▶ │ BacktestLoader   │
+本地 CSV 文件 ────────────▶ │                  │
   {symbol}_{tf}.csv        └──────────────────┘
 ```
 
@@ -60,7 +60,7 @@ klines_service              data_manager                     策略
 ```python
 from data_manager.klines_ws_client import KlinesWebSocketClient
 
-client = KlinesWebSocketClient(ws_url="ws://127.0.0.1:17081/ws/klines")
+client = KlinesWebSocketClient(ws_url="${KLINES_WS_URL}")
 await client.connect()
 client.set_on_kline_callback(on_kline)
 await client.subscribe(["BTCUSDT", "ETHUSDT"])
@@ -69,10 +69,6 @@ await client.subscribe(["BTCUSDT", "ETHUSDT"])
 ### klines_loader.py - 数据加载与重采样
 
 从原始按日期分文件的 CSV 数据中加载、合并、重采样。
-
-### backtest_data_loader.py - 回测数据智能加载
-
-按回测日期区间查找覆盖文件，未覆盖时从细粒度源数据合成。
 
 ### indicators.py - 技术指标计算
 
@@ -103,8 +99,8 @@ config = DataManagerConfig(
     cache_1m_max_rows=500000,
     cache_1m_max_age_days=90,
     klines_service_enabled=True,
-    klines_service_ws_url="ws://127.0.0.1:17081/ws/klines",
-    klines_service_http_url="http://127.0.0.1:17081",
+    klines_service_ws_url="${KLINES_WS_URL}",
+    klines_service_http_url="${KLINES_HTTP_URL}",
     sync_history_days=30,
     auto_sync_on_connect=True,
     persistence_interval_minutes=5,

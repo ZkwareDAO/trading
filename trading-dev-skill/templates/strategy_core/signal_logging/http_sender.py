@@ -126,7 +126,7 @@ class HttpSignalSender:
 
                 logger.info(
                     f"HTTP 信号发送请求: signal_id={signal_id}, "
-                    f"url={url}, symbol={symbol}"
+                    f"url={url}, symbol={symbol}, payload={payload}"
                 )
 
                 resp = requests.post(

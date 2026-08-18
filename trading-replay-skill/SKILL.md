@@ -249,7 +249,7 @@ fi
 | `SCP_USER` | .env / config.yaml | sync | 无 |
 | `SCP_STRATEGY_DIR` | .env / config.yaml | sync | 无 |
 | `DATA_PATH` | .env | replay | ./data |
-| `KLINE_DATA_DIR` | .env | replay | ./data/strategies/1m |
+| `KLINE_DATA_DIR` | .env | replay | ./data/klines |
 | `SNAPSHOT_DIR` | config.yaml | 全流程 | ./snapshot |
 | `LOGS_DIR` | config.yaml | 全流程 | ./logs |
 | `REPLAY_OUTPUTS_DIR` | config.yaml | replay | ./replay_outputs |
@@ -474,7 +474,7 @@ $PYTHON_CMD analyze_snapshot.py \
   Source: replay
   Path:   ./snapshot/20260801
   Range:  20260702 ~ 20260801
-  Data:   ./data/strategies/1m
+  Data:   ./data/klines
 
 [READY]   ema_rsi (product)
   Config: /path/to/snapshot/20260801/ema_rsi-product/strategies/ema_rsi/overrides/BTCUSDT.yaml
@@ -508,7 +508,7 @@ Summary: 1 ready, 1 partial, 1 skip | 2 of 3 can proceed
   "source_path": "./snapshot/20260801",
   "start_date": "20260702",
   "end_date": "20260801",
-  "kline_data_dir": "./data/strategies/1m",
+  "kline_data_dir": "./data/klines",
   "strategies": [
     {
       "strategy_name": "ema_rsi",
@@ -765,7 +765,7 @@ echo "[$(date '+%Y-%m-%d %H:%M:%S')] Replay Summary - ${REPLAY_DATE}" > "$SUMMAR
 ```bash
 # ===== 必需配置 =====
 DATA_PATH=./data
-KLINE_DATA_DIR=./data/strategies/1m
+KLINE_DATA_DIR=./data/klines
 SNAPSHOT_DIR=./snapshot
 LOGS_DIR=./logs
 REPLAY_OUTPUTS_DIR=./replay_outputs

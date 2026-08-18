@@ -9,7 +9,6 @@ from .manager import DataManager, DataManagerConfig, DataCache
 from .cache import ShardCache, ShardCacheConfig
 from .klines_data import Kline
 from .klines_ws_client import KlinesWebSocketClient
-from .kafka_consumer import KlineKafkaConsumer
 from .klines_loader import (
     load_klines_data,
     resample_ohlcv,
@@ -24,7 +23,6 @@ __all__ = [
     "ShardCacheConfig",
     "Kline",
     "KlinesWebSocketClient",
-    "KlineKafkaConsumer",
     "load_klines_data",
     "resample_ohlcv",
     "save_to_csv",

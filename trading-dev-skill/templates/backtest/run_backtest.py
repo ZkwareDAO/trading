@@ -2,11 +2,17 @@
 """
 回测框架入口 — 对标 run_strategy.py
 
+配置加载与实盘对齐：统一走 strategies/<name>/overrides/<symbol>.yaml（per-symbol）。
+回测专有参数（timeframe/data_dir/cash/commission/输出目录）下放到 config/backtest.yaml。
+
 使用方式:
-    python -m backtest.run_backtest --strategy rbreaker --start 20260101 --end 20260331 --symbol btcusdt
-    python -m backtest.run_backtest --strategy trend --start 20260101 --end 20260331 --symbol btcusdt
-    python -m backtest.run_backtest --strategy ict --start 20260101 --end 20260331 --symbol btcusdt
-    python -m backtest.run_backtest --strategy dolphin --start 20260101 --end 20260331 --symbol BTCUSDT,ETHUSDT,SOLUSDT
+    # 标准用法：name:symbol 自动加载 overrides，回测参数从 profile 读
+    python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260601 --end 20260811
+
+    # 自定义配置文件路径（覆盖默认 overrides 路径）
+    python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --config-path /path/to/custom.yaml --start 20260601
+
+    # 批量回测请用 backtest.batch_runner
 """
 
 import argparse
@@ -26,7 +32,10 @@ load_dotenv()
 
 from strategy_core.constants import TF_MINUTES
 from strategy_core.utils.log_handlers import DailyDirectoryFileHandler
-from strategy_core.utils.strategy_naming import build_strategy_id, extract_name_prefix
+from strategy_core.utils.strategy_naming import build_strategy_id_from_overrides
+
+# 复用实盘 run_strategies_manager 的 name:symbol 解析逻辑，保证回测/实盘 CLI 风格一致
+from run_strategies_manager import parse_explicit_strategies
 
 import backtrader as bt
 import pandas as pd
@@ -36,7 +45,11 @@ from data_manager.klines_loader import load_klines_data, save_to_csv
 from backtest.bt_strategy import BacktestBTStrategy
 from backtest.signal_mapper import SignalMapper
 from backtest.backtest_reporter import BacktestReporter
-from backtest.config_loader import merge_config_with_overrides
+from backtest.config_loader import (
+    load_profile,
+    merge_config_with_overrides,
+    verify_data_dir_consistency,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -178,16 +191,32 @@ def _calc_sync_days(start_date: str) -> int:
     return max(delta_days, _SYNC_MIN_DAYS)
 
 
-def load_strategy_config(strategy_dir: str) -> Dict[str, Any]:
-    """从策略目录加载 config.test.yaml."""
-    config_path = Path(strategy_dir) / "config.test.yaml"
-    if not config_path.exists():
-        logger.warning(f"策略配置文件不存在: {config_path}")
-        return {}
-    with open(config_path, "r", encoding="utf-8") as f:
-        full_config = yaml.safe_load(f)
+def load_strategy_config(strategy_dir: str, symbol: str | None = None) -> Dict[str, Any]:
+    """从策略目录加载 per-symbol overrides 配置。
+
+    优先 strategies/<name>/overrides/<SYMBOL>.yaml；未指定 symbol 或文件
+    不存在时回退到目录下任意一个 overrides/*.yaml（取第一个），再不行返回空。
+    """
+    overrides_dir = Path(strategy_dir) / "overrides"
     strategy_name = Path(strategy_dir).name
-    return full_config.get(strategy_name, {})
+
+    candidates = []
+    if symbol:
+        candidates.append(overrides_dir / f"{symbol.upper()}.yaml")
+    if overrides_dir.is_dir():
+        # 回退：取 overrides 下第一个 yaml
+        candidates.extend(sorted(overrides_dir.glob("*.yaml")))
+
+    for config_path in candidates:
+        if config_path.exists():
+            with open(config_path, "r", encoding="utf-8") as f:
+                full_config = yaml.safe_load(f)
+            cfg = full_config.get(strategy_name, {}) if full_config else {}
+            logger.info(f"加载 overrides 配置: {config_path}")
+            return cfg
+
+    logger.warning(f"未找到 overrides 配置: {overrides_dir} (symbol={symbol})")
+    return {}
 
 
 def load_strategy_config_from_path(config_path: str, strategy_name: str) -> Dict[str, Any]:
@@ -489,9 +518,9 @@ def run_backtest(
             hour=23, minute=59, second=59, tzinfo=timezone.utc
         )
 
-    # 1. 加载策略配置（若未提供则从默认路径加载）
+    # 1. 加载策略配置（若未提供则从 overrides 加载）
     if strategy_config is None:
-        strategy_config = load_strategy_config(strategy_dir)
+        strategy_config = load_strategy_config(strategy_dir, symbol=symbols[0] if symbols else None)
     if not strategy_config:
         logger.error(f"无法加载策略 {strategy_dir_name} 的配置")
         sys.exit(1)
@@ -703,7 +732,8 @@ def run_backtest(
     logger.info(f"回测完成: 初始 {cash:.2f} → 最终 {end_value:.2f}")
 
     # 11. 构建 reporter 输入数据
-    strategy_id = strategy.strategy_name if hasattr(strategy, 'strategy_name') else strategy_dir_name
+    # strategy_name 属性可能存在但为 None，故用 or 兜底到目录名，避免报告出现 "None 回测"
+    strategy_id = getattr(strategy, "strategy_name", None) or strategy_dir_name
     daily_equity = strat.get_daily_equity()
 
     bt_config = {
@@ -776,65 +806,42 @@ def _find_csv_files(data_dir: str, symbol: str, timeframe: str,
 
 
 def main():
-    """CLI 入口点."""
+    """CLI 入口点.
+
+    CLI 参数收敛为 7 个（原 16 个）。回测专有参数（timeframe/data_dir/output_dir/
+    cash/commission/输出日期模式）下放到 config/backtest.yaml，由 --profile 选取。
+    symbol 唯一来源是 --strategies 的 name:symbol，与实盘 --run 格式一致。
+    """
     parser = argparse.ArgumentParser(description="CTA 策略回测框架")
     parser.add_argument(
-        "--strategy",
+        "--strategies",
         required=True,
-        help="策略简称 (rbreaker/trend/ict/trend_strength/dolphin) 或完整目录名",
+        help=(
+            "运行清单，格式 name:symbol（与实盘 run_strategies_manager.py 的 --run 一致）。"
+            "自动加载 strategies/<name>/overrides/<symbol>.yaml；文件不存在则报错。"
+            "示例: --strategies sar_snt3_v3:BTCUSDT"
+        ),
     )
     parser.add_argument(
         "--start",
         required=True,
-        help="开始日期 (YYYYMMDD 或时间戳)",
+        help="开始日期 (YYYYMMDD 或时间戳)，覆盖 profile.start",
     )
     parser.add_argument(
         "--end",
         default=None,
-        help="结束日期 (YYYYMMDD 或时间戳，默认当前时间)",
+        help="结束日期 (YYYYMMDD 或时间戳，默认当前时间)，覆盖 profile.end",
     )
     parser.add_argument(
-        "--symbol",
-        default="BTCUSDT",
-        help="交易对，支持逗号分隔多个 (如 BTCUSDT,ETHUSDT,SOLUSDT)",
+        "--profile",
+        default="backtest",
+        help="run-profile（默认 backtest），从 config/<name>.yaml 读取回测专有参数",
     )
     parser.add_argument(
-        "--timeframe",
-        default="1m",
-        help="K 线周期 (默认 1m)",
-    )
-    parser.add_argument(
-        "--data-dir",
-        default="./data/strategies",
-        help="K 线数据目录",
-    )
-    parser.add_argument(
-        "--output-dir",
-        default="./backtest_output",
-        help="回测输出目录",
-    )
-    parser.add_argument(
-        "--cash",
-        type=float,
-        default=5000,
-        help="初始资金 (默认 5000)",
-    )
-    parser.add_argument(
-        "--commission",
-        type=float,
-        default=0.0004,
-        help="手续费率 (默认 0.0004，币安合约 taker)",
-    )
-    parser.add_argument(
-        "--log-level",
+        "--config-path",
+        dest="config_path",
         default=None,
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="日志级别（优先级高于配置文件）",
-    )
-    parser.add_argument(
-        "--config",
-        default=None,
-        help="策略配置文件路径（默认使用 strategies/{strategy}/config.test.yaml）",
+        help="策略配置文件完整路径（覆盖默认 overrides 路径，与实盘 --config-path 一致）",
     )
     parser.add_argument(
         "--overrides",
@@ -842,27 +849,65 @@ def main():
         help="配置覆盖字段（JSON 字符串），用于覆盖配置文件中的特定字段",
     )
     parser.add_argument(
-        "--use-today-as-output-date",
-        action="store_true",
-        default=True,
-        help="输出目录使用当天日期而非回测结束日期（默认 True）",
-    )
-    parser.add_argument(
-        "--use-end-date-as-output-date",
-        action="store_true",
-        help="输出目录使用回测结束日期（禁用 use-today-as-output-date）",
+        "--log-level",
+        default=None,
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="日志级别（优先级高于 profile 与配置文件）",
     )
 
     args = parser.parse_args()
 
-    strategy_dir_name = resolve_strategy_name(args.strategy)
-    strategy_dir = str(Path("strategies") / strategy_dir_name)
+    # 加载 run-profile（回测专有参数：cash/commission/data_dir/output_dir/...）
+    try:
+        profile_cfg = load_profile(args.profile)
+    except (FileNotFoundError, ValueError) as e:
+        logger.error(f"加载 profile 失败: {e}")
+        sys.exit(1)
 
-    # 加载策略配置
-    if args.config:
-        strategy_config = load_strategy_config_from_path(args.config, strategy_dir_name)
-    else:
-        strategy_config = load_strategy_config(strategy_dir)
+    # 回测专有参数全部来自 profile，CLI 不得覆盖（避免回测与实盘读两份策略参数）
+    timeframe = profile_cfg.get("timeframe", "1m")
+    data_dir = profile_cfg.get("data_dir", "./data/klines")
+    output_dir = profile_cfg.get("output_dir", "./backtest_output")
+    cash = profile_cfg.get("cash", 5000)
+    commission = profile_cfg.get("commission", 0.0004)
+    use_today_as_output_date = profile_cfg.get("use_today_as_output_date", True)
+
+    # data_dir 是 profile 与 settings.yaml 间唯一的语义重复（回测不读 settings.yaml）。
+    # 只改一处会导致实盘往 A 目录写、回测从 B 目录读，回测基于过时数据却无提示 ——
+    # 属于回测失真，故启动即校验。settings.yaml 缺失时跳过（纯回测使用者不该被实盘配置阻断）。
+    try:
+        settings_csv_dir = None
+        settings_path = Path("config/settings.yaml")
+        if settings_path.exists():
+            with open(settings_path, "r", encoding="utf-8") as f:
+                settings_csv_dir = (
+                    (yaml.safe_load(f) or {}).get("data_manager", {}).get("csv_dir")
+                )
+        verify_data_dir_consistency(data_dir, settings_csv_dir)
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
+
+    # 运行清单：单次回测只跑一个 name:symbol，symbol 唯一来源就是这里
+    pairs = parse_explicit_strategies(args.strategies)
+    if len(pairs) != 1:
+        logger.error(
+            f"--strategies 仅支持单个 name:symbol，收到 {len(pairs)} 个: {pairs}。"
+            f"批量回测请用 backtest.batch_runner。"
+        )
+        sys.exit(1)
+    strategy_dir_name, symbol_cli = pairs[0]
+
+    # --config-path 优先；否则按 overrides 约定推导
+    config_path_resolved = args.config_path or str(
+        Path("strategies") / strategy_dir_name / "overrides" / f"{symbol_cli}.yaml"
+    )
+    if not Path(config_path_resolved).exists():
+        logger.error(f"策略配置文件不存在: {config_path_resolved}")
+        sys.exit(1)
+    strategy_config = load_strategy_config_from_path(config_path_resolved, strategy_dir_name)
+    logger.info(f"配置来源(--strategies): {config_path_resolved}")
+    logger.info(f"profile: {args.profile} | data_dir={data_dir} cash={cash} commission={commission}")
 
     if not strategy_config:
         logger.error(f"无法加载策略 {strategy_dir_name} 的配置")
@@ -878,8 +923,14 @@ def main():
             logger.error(f"overrides JSON 解析失败: {e}")
             sys.exit(1)
 
-    # 解析日志级别
-    log_level_str = resolve_log_level(args.log_level, strategy_config)
+    # 日志级别优先级：CLI > 策略配置 diagnostic_log_level > profile > 默认 INFO
+    # 这里就地展开而不调 resolve_log_level：后者不认识 profile 这一级
+    if args.log_level:
+        log_level_str = args.log_level.upper()
+    elif strategy_config.get("signal", {}).get("diagnostic_log_level"):
+        log_level_str = strategy_config["signal"]["diagnostic_log_level"].upper()
+    else:
+        log_level_str = profile_cfg.get("log_level", "INFO").upper()
     log_level = getattr(logging, log_level_str, logging.INFO)
 
     # 解析日期参数（支持时间戳）- 必须在日志初始化之前
@@ -891,16 +942,15 @@ def main():
         end_date = end_dt.strftime("%Y%m%d")
 
     # 生成标准化日志文件名（与实盘一致）
-    # 格式: ICT_4H_V2_BTCUSDT_BACKTEST
-    strategy_dir = STRATEGY_MAP.get(args.strategy, args.strategy)
-    interval = strategy_config.get("timeframes", ["4h"])[0] if strategy_config.get("timeframes") else "4h"
+    timeframes = strategy_config.get("timeframes")
+    interval = timeframes[0] if timeframes else "4h"
     version = strategy_config.get("version", "v2")
-    log_filename = build_strategy_id(
-        name=strategy_dir,
+    log_filename = build_strategy_id_from_overrides(
+        strategy_dir=strategy_dir_name,
+        symbol=symbol_cli,
+        trading_mode="backtest",  # 回测模式
         interval=interval,
         version=version,
-        symbol=args.symbol,
-        trading_mode="backtest",  # 回测模式
     )
 
     # 添加按日目录存储的文件日志处理器
@@ -929,32 +979,23 @@ def main():
         logging.getLogger("data_manager.manager").setLevel(logging.WARNING)
         logging.getLogger("backtest.bt_strategy").setLevel(logging.WARNING)
 
-    # 调试日志（在 logging.basicConfig 之后）
-    if args.config:
-        logger.debug(f"从 {args.config} 加载配置: timeframes={strategy_config.get('timeframes')}")
-    else:
-        logger.debug(f"从默认配置加载: timeframes={strategy_config.get('timeframes')}")
-
-    if args.log_level:
-        logger.info(f"日志级别: {log_level_str}（来自命令行）")
-    elif strategy_config.get("signal", {}).get("diagnostic_log_level"):
-        logger.info(f"日志级别: {log_level_str}（来自配置文件）")
+    logger.info(f"日志级别: {log_level_str}")
 
     run_backtest(
         strategy_dir_name=strategy_dir_name,
-        symbol=args.symbol,
+        symbol=symbol_cli,
         start_date=start_date,
         end_date=end_date,
         start_dt=start_dt,
         end_dt=end_dt,
-        timeframe=args.timeframe,
-        data_dir=args.data_dir,
-        output_dir=args.output_dir,
-        cash=args.cash,
-        commission=args.commission,
+        timeframe=timeframe,
+        data_dir=data_dir,
+        output_dir=output_dir,
+        cash=cash,
+        commission=commission,
         strategy_config=strategy_config,
-        config_path=args.config,  # 传递配置文件路径，用于复制到输出目录
-        use_today_as_output_date=not args.use_end_date_as_output_date,
+        config_path=config_path_resolved,  # 实际生效的配置路径，复制到输出目录供复现
+        use_today_as_output_date=use_today_as_output_date,
     )
 
 

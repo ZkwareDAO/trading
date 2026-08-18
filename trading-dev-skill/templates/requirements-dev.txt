@@ -1,0 +1,20 @@
+# =============================================================================
+# 开发/测试依赖
+# =============================================================================
+# 安装：pip install -r requirements.txt -r requirements-dev.txt
+#
+# 为什么单独一份：pytest 与 pandas-ta 只在测试中使用，部署实盘不需要。
+# 但它们必须被声明 —— 之前 pytest 仅靠 py-clob-client-v2 的传递依赖偶然存在，
+# 删掉那个未使用的包后测试就跑不起来了，属于隐式依赖。
+# =============================================================================
+
+pytest>=8.0.0
+
+# data_manager/tests/ 有 49+ 个 @pytest.mark.asyncio 用例，缺它这些用例会被跳过或报错。
+# 原先只写在 CI 的 `pip install pytest pytest-asyncio` 一行里，本地开发者装不到。
+pytest-asyncio>=0.23.0
+
+# 仅 data_manager/tests/test_talib_pandas_ta_consistency.py 使用：
+# 验证 ta-lib 与 pandas-ta 的指标数值一致（重构前后对比用）。
+# 缺失时该文件 7 个用例会 ImportError 而非 skip。
+pandas-ta>=0.3.14b0

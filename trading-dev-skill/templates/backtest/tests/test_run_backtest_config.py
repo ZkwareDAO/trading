@@ -13,27 +13,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 class TestRunBacktestConfigParams:
     """Test --config and --log-level parameters."""
 
-    def test_default_config_path_is_config_test_yaml(self):
-        """默认配置路径为 strategies/{strategy}/config.test.yaml"""
-        from backtest.run_backtest import load_strategy_config, resolve_strategy_name
-        import os
-
-        # 修改工作目录到项目根目录
-        original_cwd = os.getcwd()
-        try:
-            os.chdir(Path(__file__).parent.parent.parent)
-            strategy_dir_name = resolve_strategy_name("obv")
-            strategy_dir = str(Path("strategies") / strategy_dir_name)
-
-            config = load_strategy_config(strategy_dir)
-
-            # config.test.yaml 存在且包含 obv_atr 配置
-            assert config is not None, "应该加载 config.test.yaml"
-            assert "symbols" in config, "配置应包含 symbols"
-            assert "signal" in config, "配置应包含 signal"
-            assert config["signal"].get("diagnostic_log_level") == "WARNING"  # 当前配置值
-        finally:
-            os.chdir(original_cwd)
 
     def test_rbreaker_alias_uses_maintained_v3_strategy(self):
         from backtest.run_backtest import resolve_strategy_name

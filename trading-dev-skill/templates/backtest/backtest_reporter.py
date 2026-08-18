@@ -331,13 +331,13 @@ class BacktestReporter:
         lines.append("  时间                  策略              标的         方向               数量         价格         盈亏")
         lines.append("  " + "-" * 85)
         for t in recent:
-            ts_str = str(t.get("timestamp", ""))[:19].replace("T", " ")
-            sid = t.get("strategy_id", "")
-            sym = t.get("symbol", "")
-            side = t.get("side", "")
-            qty = t.get("quantity", 0)
-            price = t.get("price", 0)
-            pnl = t.get("pnl", 0)
+            ts_str = str(t.get("timestamp", "") or "")[:19].replace("T", " ")
+            sid = str(t.get("strategy_id") or "")
+            sym = str(t.get("symbol") or "")
+            side = str(t.get("side") or "")
+            qty = t.get("quantity") or 0
+            price = t.get("price") or 0
+            pnl = t.get("pnl") or 0
             pnl_str = f"{pnl:.2f}" if pnl != 0 else "-"
             lines.append(
                 f"  {ts_str} {sid:<20s} {sym:<12s} {side:<18s} {qty:>10.2f} {price:>12.2f} {pnl_str:>10s}"

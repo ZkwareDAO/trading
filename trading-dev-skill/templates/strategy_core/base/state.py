@@ -8,6 +8,9 @@
 from dataclasses import dataclass
 from datetime import datetime, date
 from typing import Optional, Dict, Any
+import logging
+
+logger = logging.getLogger("state.lifecycle")
 
 
 @dataclass
@@ -67,6 +70,17 @@ class BaseState:
             record_stop_loss: 是否记录止损日期
             current_time: 当前时间，用于记录止损日期
         """
+        # 诊断日志：记录清仓调用。"清仓后状态为何恢复"问题已由 4d47eed 定位修复，
+        # 去掉 stack_info=True 的栈打印（会刷屏且形似 Traceback，干扰排障）。
+        prev_position = self.position
+        prev_entry = self.entry_price
+        # entry_price 在某些恢复路径下可能为 None（如远程仓位 EntryPrice=None），
+        # 不能直接用 :.4f 格式化，否则抛 TypeError 中断整个清仓流程。
+        prev_entry_str = f"{prev_entry:.4f}" if isinstance(prev_entry, (int, float)) else str(prev_entry)
+        logger.debug(
+            f"clear_position() 调用 | prev_position={prev_position} prev_entry={prev_entry_str}"
+        )
+
         self.position = None
         self.position_id = None
         self.entry_timestamp = None

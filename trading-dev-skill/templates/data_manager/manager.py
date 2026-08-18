@@ -22,6 +22,16 @@ import pandas as pd
 import aiohttp
 
 from data_manager.kline_repository import KlineRepository
+
+
+def _get_proxy() -> Optional[str]:
+    """读取代理环境变量（HTTPS_PROXY / https_proxy / HTTP_PROXY / http_proxy）"""
+    return (
+        os.environ.get("HTTPS_PROXY")
+        or os.environ.get("https_proxy")
+        or os.environ.get("HTTP_PROXY")
+        or os.environ.get("http_proxy")
+    )
 from data_manager.klines_data import Kline as KlineFull
 from data_manager.klines_ws_client import KlinesWebSocketClient
 from data_manager.indicators import compute_indicator, get_available_indicators
@@ -44,16 +54,11 @@ class DataManagerConfig:
     cache_1m_max_age_days: int = 90
 
     # klines_service 集成配置
+    # 未配置时回退到 Binance 公共 API（wss://fstream.binance.com 实时 + fapi.binance.com 历史）
     klines_service_enabled: bool = True
-    klines_service_ws_url: str = "ws://127.0.0.1:17081/ws/klines"
-    klines_service_http_url: str = "http://127.0.0.1:17081"
+    klines_service_ws_url: Optional[str] = None
+    klines_service_http_url: Optional[str] = None
     klines_service_history_days: int = 7
-
-    # Kafka 集成配置 (新增)
-    kafka_enabled: bool = False
-    kafka_brokers: List[str] = None  # type: ignore
-    kafka_topic: str = "biance_klines"
-    kafka_group_id: Optional[str] = None  # None 时自动生成
 
     # 启动时自动同步配置
     sync_history_days: int = 30  # 启动时补齐历史天数
@@ -67,8 +72,7 @@ class DataManagerConfig:
 
     def __post_init__(self):
         """初始化后处理"""
-        if self.kafka_brokers is None:
-            object.__setattr__(self, 'kafka_brokers', [])
+        pass
 
     @classmethod
     def from_env(cls, **kwargs) -> "DataManagerConfig":
@@ -85,11 +89,11 @@ class DataManagerConfig:
         Returns:
             DataManagerConfig 实例
         """
-        # 环境变量覆盖
-        ws_url = os.environ.get("KLINES_WS_URL", cls.__dataclass_fields__["klines_service_ws_url"].default)
-        http_url = os.environ.get("KLINES_HTTP_URL", cls.__dataclass_fields__["klines_service_http_url"].default)
+        # 环境变量覆盖（未设置环境变量时为 None，回退到 Binance 公共 API）
+        ws_url = os.environ.get("KLINES_WS_URL")
+        http_url = os.environ.get("KLINES_HTTP_URL")
 
-        # 合并参数：kwargs > env > default
+        # 合并参数：kwargs > env > default(None)
         config_kwargs = {
             "klines_service_ws_url": ws_url,
             "klines_service_http_url": http_url,
@@ -233,15 +237,15 @@ class DataManager:
         self._ws_buffer_size = 10
         self._last_api_fill_cache_ts: Dict[str, datetime] = {}
 
-        # Kafka 消费者 (新增)
-        self._kafka_consumer: Optional[Any] = None  # KlineKafkaConsumer
-        self._kafka_enabled = False
-
         # Kline dispatch callback — 当 WS 收到新 K 线时通知策略引擎
         self._kline_dispatch_callback: Optional[Any] = None
 
         # 后台任务
         self._background_tasks: List[asyncio.Task] = []
+        # Binance REST 轮询任务（fstream 推送不可用时的回退实时源）
+        self._binance_poll_task: Optional[asyncio.Task] = None
+        # 每个已喂给策略的最新闭合 1m kline 时间戳，避免重复派发
+        self._binance_poll_last_ts: Dict[str, int] = {}
 
         self.csv_dir.mkdir(parents=True, exist_ok=True)
 
@@ -680,23 +684,19 @@ class DataManager:
         """
         self._kline_dispatch_callback = callback
 
-    async def start_klines_service_async(self) -> bool:
+    async def start_klines_service_async(self, symbols: Optional[List[str]] = None) -> bool:
         """
-        启动实时数据服务 (Kafka 或 WebSocket)
+        启动实时数据服务 (WebSocket)
 
-        优先级:
-        1. 如果 Kafka 已启用且配置，使用 Kafka
-        2. 否则使用 WebSocket
+        优先连 klines_service 自建 WS；未配置 ws_url 时回退到 Binance 公共 WS。
+        Binance 回退模式需要 symbols 来拼 combined-stream URL，因此应先传 symbols 再启动。
+
+        Args:
+            symbols: 订阅的 symbol 列表（Binance 回退模式必须，自建模式可省略）
 
         Returns:
             是否启动成功
         """
-        # 优先使用 Kafka
-        if self.config.kafka_enabled and self.config.kafka_brokers:
-            logger.info("使用 Kafka 作为实时数据源")
-            return await self.init_kafka_consumer()
-
-        # 回退到 WebSocket
         if not self.config.klines_service_enabled:
             logger.info("klines_service 已禁用，跳过启动")
             return False
@@ -706,9 +706,19 @@ class DataManager:
             logger.debug("WS 已连接，跳过重复启动")
             return True
 
+        # 预登记 symbols（Binance 回退模式拼 URL 需要）
+        if symbols:
+            self._ws_subscribed_symbols.update(s.upper() for s in symbols)
+
+        ws_url = self.config.klines_service_ws_url
+        if not ws_url:
+            # 未配置自建 WS，回退到 Binance 公共 WS
+            logger.info("未配置 klines_service_ws_url，回退到 Binance 公共 WebSocket")
+            return await self._start_binance_ws()
+
         try:
             self._ws_client = KlinesWebSocketClient(
-                ws_url=self.config.klines_service_ws_url,
+                ws_url=ws_url,
                 reconnect_delay=self.WS_RECONNECT_DELAY,
                 max_reconnect=self.WS_MAX_RECONNECT,
                 max_backoff=self.WS_MAX_BACKOFF,
@@ -718,7 +728,7 @@ class DataManager:
             connected = await self._ws_client.connect()
             if connected:
                 self._connected = True
-                logger.info(f"klines_service 连接成功：{self.config.klines_service_ws_url}")
+                logger.info(f"klines_service 连接成功：{ws_url}")
                 return True
             else:
                 logger.warning("klines_service 连接失败")
@@ -727,66 +737,12 @@ class DataManager:
             logger.error(f"klines_service 连接异常：{e}")
             return False
 
-    async def init_kafka_consumer(
-        self,
-        brokers: Optional[List[str]] = None,
-        topic: Optional[str] = None,
-        group_id: Optional[str] = None,
-    ) -> bool:
-        """
-        初始化 Kafka 消费者 (替代 WebSocket)
-
-        Args:
-            brokers: Kafka broker 地址列表 (默认使用配置)
-            topic: Kafka topic (默认使用配置)
-            group_id: Consumer Group ID (默认使用配置或自动生成)
-
-        Returns:
-            是否初始化成功
-        """
-        brokers = brokers or self.config.kafka_brokers
-        topic = topic or self.config.kafka_topic
-        group_id = group_id or self.config.kafka_group_id
-
-        if not brokers:
-            logger.warning("Kafka brokers 未配置，跳过 Kafka 初始化")
-            return False
-
-        if self._kafka_consumer is not None and self._kafka_consumer.is_connected:
-            logger.debug("Kafka Consumer 已连接，跳过重复初始化")
-            return True
-
-        try:
-            from data_manager.kafka_consumer import KlineKafkaConsumer
-
-            self._kafka_consumer = KlineKafkaConsumer(
-                brokers=brokers,
-                topic=topic,
-                group_id=group_id,
-            )
-            self._kafka_consumer.set_on_kline_callback(self._on_kline_received)
-
-            if self._kafka_consumer.connect():
-                self._kafka_enabled = True
-                await self._kafka_consumer.start_consume()
-                self._connected = True
-                logger.info(f"Kafka 消费者启动成功: brokers={brokers}, topic={topic}")
-                return True
-            else:
-                self._kafka_consumer = None  # 清理失败的对象
-                logger.error("Kafka 消费者连接失败")
-                return False
-
-        except Exception as e:
-            self._kafka_consumer = None  # 清理异常时的对象
-            logger.error(f"Kafka 初始化异常: {e}")
-            return False
-
     async def subscribe_klines_async(self, symbols: List[str]) -> bool:
         """
-        订阅 K 线数据
+        订阅 K 线数据 (WebSocket)
 
-        支持 Kafka 和 WebSocket 两种模式。
+        自建 klines_service：通过 WS subscribe 消息订阅。
+        Binance 回退模式：先登记 symbol，重连时重建 streams URL。
 
         Args:
             symbols: 要订阅的 symbol 列表
@@ -794,14 +750,17 @@ class DataManager:
         Returns:
             是否订阅成功
         """
-        if self._kafka_enabled and self._kafka_consumer:
-            self._kafka_consumer.add_symbols(symbols)
-            logger.info(f"Kafka 订阅: {symbols}")
-            return True
+        # 登记 symbol（两种模式都需要）
+        self._ws_subscribed_symbols.update(s.upper() for s in symbols)
 
         if not self._ws_client:
-            logger.warning("无可用的实时数据源 (Kafka 或 WebSocket)")
+            logger.warning("无可用的实时数据源 (WebSocket)")
             return False
+
+        # Binance 回退模式：无需发送 subscribe 消息，streams 在连接 URL 里已固定
+        if getattr(self._ws_client, "_binance_mode", False):
+            logger.info(f"Binance WS 已在连接 URL 订阅: {symbols}")
+            return True
 
         if not self._ws_client._connected:
             logger.warning("WebSocket 未连接，无法订阅")
@@ -809,7 +768,6 @@ class DataManager:
 
         try:
             await self._ws_client.subscribe(symbols)
-            self._ws_subscribed_symbols.update(s.upper() for s in symbols)
             logger.info(f"WebSocket 订阅: {symbols}")
             return True
         except Exception as e:
@@ -818,12 +776,15 @@ class DataManager:
 
     async def stop_realtime(self):
         """停止实时数据服务"""
-        # 停止 Kafka
-        if self._kafka_consumer:
-            self._kafka_consumer.disconnect()
-            self._kafka_consumer = None
-            self._kafka_enabled = False
-            logger.info("Kafka 已停止")
+        # 停止 Binance REST 轮询任务
+        if self._binance_poll_task and not self._binance_poll_task.done():
+            self._binance_poll_task.cancel()
+            try:
+                await self._binance_poll_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._binance_poll_task = None
+            logger.info("Binance REST 轮询已停止")
 
         # 停止 WebSocket
         if self._ws_client:
@@ -844,17 +805,6 @@ class DataManager:
         Returns:
             状态字典
         """
-        if self._kafka_enabled and self._kafka_consumer:
-            return {
-                "mode": "kafka",
-                "connected": self._kafka_consumer.is_connected,
-                "running": self._kafka_consumer.is_running,
-                "subscribed_symbols": list(self._kafka_consumer.subscribed_symbols),
-                "brokers": self._kafka_consumer.brokers,
-                "topic": self._kafka_consumer.topic,
-                "group_id": self._kafka_consumer.group_id,
-            }
-
         if self._ws_client:
             return {
                 "mode": "websocket",
@@ -867,7 +817,155 @@ class DataManager:
 
     def is_klines_service_available(self) -> bool:
         """检查实时数据服务是否可用"""
-        return (self._ws_client is not None) or (self._kafka_consumer is not None)
+        return self._ws_client is not None
+
+    # ==================== Binance 公共数据回退 ====================
+
+    BINANCE_WS_BASE = "wss://fstream.binance.com"
+    BINANCE_FAPI_BASE = "https://fapi.binance.com"
+    # REST 轮询间隔（秒）。1m K 线每分钟闭合一次，15s 轮询可在闭合后 ~15s 内拾取。
+    BINANCE_POLL_INTERVAL = 15.0
+
+    async def _start_binance_ws(self) -> bool:
+        """
+        启动 Binance 实时数据回退（未配置自建 klines_service_ws_url 时使用）。
+
+        实现说明：
+        - 优先尝试 fstream WebSocket 推送（部分出口 IP 可用）。
+        - 若 WS 握手后 BINANCE_WS_PROBE_TIMEOUT 秒内收不到任何数据帧
+          （典型表现：握手 101 通但被 Binance 风控限推），自动降级到 REST 轮询。
+        - REST 轮询每 BINANCE_POLL_INTERVAL 秒拉一次 fapi/v1/klines，
+          取最新闭合的 1m K 线喂给 _on_kline_received。
+
+        Returns:
+            是否启动成功（WS 或 REST 任一可用即 True）
+        """
+        if not self._ws_subscribed_symbols:
+            logger.warning("Binance 回退：尚未订阅任何 symbol，无法启动")
+            return False
+
+        # 先尝试 WS 推送
+        ws_ok = await self._start_binance_ws_push()
+        if ws_ok:
+            return True
+
+        # WS 不可用，降级 REST 轮询
+        logger.info("Binance WS 推送不可用，降级到 REST 轮询模式")
+        return await self._start_binance_rest_poll()
+
+    async def _start_binance_ws_push(self) -> bool:
+        """尝试 fstream WS 推送，握手后在探测窗口内验证是否真有数据帧。"""
+        streams = "/".join(
+            f"{s.lower()}@kline_1m" for s in self._ws_subscribed_symbols
+        )
+        ws_url = f"{self.BINANCE_WS_BASE}/stream?streams={streams}"
+
+        try:
+            self._ws_client = KlinesWebSocketClient(
+                ws_url=ws_url,
+                reconnect_delay=self.WS_RECONNECT_DELAY,
+                max_reconnect=0,
+                max_backoff=self.WS_MAX_BACKOFF,
+            )
+            self._ws_client.set_on_kline_callback(self._on_kline_received)
+            self._ws_client._binance_mode = True
+            self._ws_client._subscribed_symbols_snapshot = list(self._ws_subscribed_symbols)
+
+            connected = await self._ws_client.connect()
+            if not connected:
+                logger.warning("Binance 公共 WS 连接失败")
+                return False
+
+            # 探测：握手成功后短时间内验证是否有数据帧
+            # 不直接 recv()（与 _receive_loop 的 recv 冲突），改为等首帧事件
+            self._ws_client.reset_first_frame_event()
+            probe_ok = await self._probe_binance_ws_data()
+            if probe_ok:
+                self._connected = True
+                logger.info(f"Binance 公共 WS 连接成功并收到数据：{ws_url}")
+                return True
+
+            # 握手通但无数据帧 —— 风控限推，停掉 WS 转 REST
+            logger.warning("Binance WS 握手成功但未收到数据帧（疑似风控限推），转 REST 轮询")
+            try:
+                await self._ws_client.disconnect()
+            except Exception:
+                pass
+            self._ws_client = None
+            return False
+        except Exception as e:
+            logger.error(f"Binance 公共 WS 连接异常：{e}")
+            self._ws_client = None
+            return False
+
+    async def _probe_binance_ws_data(self, timeout: float = 12.0) -> bool:
+        """握手后探测 timeout 秒内是否收到至少一条数据帧。
+
+        通过 _ws_client.wait_first_frame 等首帧事件，
+        不直接 recv() 以避免与 _receive_loop 的接收循环冲突。
+        """
+        if not self._ws_client:
+            return False
+        try:
+            return await self._ws_client.wait_first_frame(timeout=timeout)
+        except Exception:
+            return False
+
+    async def _start_binance_rest_poll(self) -> bool:
+        """启动 Binance REST 轮询后台任务作为实时数据源。"""
+        if self._binance_poll_task and not self._binance_poll_task.done():
+            return True
+        symbols = list(self._ws_subscribed_symbols)
+        if not symbols:
+            return False
+        self._binance_poll_task = asyncio.create_task(self._binance_rest_poll_loop(symbols))
+        self._connected = True
+        logger.info(f"Binance REST 轮询已启动，symbols={symbols}，间隔 {self.BINANCE_POLL_INTERVAL}s")
+        return True
+
+    async def _binance_rest_poll_loop(self, symbols: List[str]):
+        """REST 轮询主循环：定期拉取每个 symbol 最新闭合的 1m K 线。"""
+        # 启动后立即拉一次，缩短首帧延迟
+        await self._poll_once(symbols)
+        while True:
+            try:
+                await asyncio.sleep(self.BINANCE_POLL_INTERVAL)
+                await self._poll_once(symbols)
+            except asyncio.CancelledError:
+                logger.info("Binance REST 轮询任务被取消，退出")
+                raise
+            except Exception as e:
+                logger.error(f"Binance REST 轮询异常：{e}")
+                await asyncio.sleep(self.BINANCE_POLL_INTERVAL)
+
+    async def _poll_once(self, symbols: List[str]):
+        """拉取一次：每个 symbol 取最近 2 条 1m kline，喂入最新闭合的那条。"""
+        for symbol in symbols:
+            try:
+                data = await self._fetch_from_binance_public(
+                    symbol, start_time_ms=None, limit=2,
+                )
+            except Exception as e:
+                logger.warning(f"REST 轮询 {symbol} 拉取异常：{e}")
+                continue
+            if not data or len(data) < 2:
+                logger.debug(f"REST 轮询 {symbol}: 无数据")
+                continue
+            # data[-1] 是当前未闭合的 1m，data[-2] 是上一条已闭合的
+            closed_raw = data[-2]
+            kline = Kline.from_binance_format(closed_raw, symbol, "1m")
+            kline.is_final = True
+            ts_ms = int(kline.timestamp.timestamp() * 1000)
+            last_ts = self._binance_poll_last_ts.get(symbol)
+            if last_ts is not None and ts_ms <= last_ts:
+                continue  # 已派发过，跳过
+            self._binance_poll_last_ts[symbol] = ts_ms
+            logger.debug(
+                f"[REST-POLL] {symbol} closed kline ts={kline.timestamp.isoformat()} "
+                f"O={kline.open} H={kline.high} L={kline.low} C={kline.close}"
+            )
+            self._on_kline_received(kline)
+
 
     # ==================== API 调用 ====================
 
@@ -885,10 +983,17 @@ class DataManager:
 
         - 传入 startTime/endTime 时使用 GET /api/v1/klines（时间范围查询）
         - 传入 day 时使用 POST /api/v1/klines/daily（单日下载）
+
+        未配置 klines_service_http_url 时返回 None，由调用方回退到 Binance 公共 API。
         """
+        http_url = self.config.klines_service_http_url
+        if not http_url:
+            logger.info(f"{symbol} {interval}: 未配置 klines_service_http_url，跳过 klines_service")
+            return None
+
         if start_time_ms is not None or end_time_ms is not None:
             # 时间范围查询：使用 GET /api/v1/klines
-            url = f"{self.config.klines_service_http_url}/api/v1/klines"
+            url = f"{http_url}/api/v1/klines"
             params: Dict[str, Any] = {
                 "symbol": symbol.upper(),
                 "interval": interval,
@@ -915,7 +1020,7 @@ class DataManager:
                 return None
         else:
             # 单日下载：使用 POST /api/v1/klines/daily
-            url = f"{self.config.klines_service_http_url}/api/v1/klines/daily"
+            url = f"{http_url}/api/v1/klines/daily"
             body: Dict[str, Any] = {
                 "symbol": symbol.upper(),
                 "interval": interval,
@@ -941,28 +1046,46 @@ class DataManager:
 
     # ==================== Binance 公共 API 回退 ====================
 
-    BINANCE_FAPI_BASE = "https://fapi.binance.com"
-
     async def _fetch_from_binance_public(
-        self, symbol: str, day: str, limit: int = 1500,
+        self, symbol: str, day: Optional[str] = None, limit: int = 1500,
+        start_time_ms: Optional[int] = None, end_time_ms: Optional[int] = None,
     ) -> Optional[List]:
         """
-        从 Binance 公共 API 下载 K 线数据（回退源）
+        从 Binance 公共 API 下载 1m K 线数据（回退源）
+
+        两种调用方式：
+        - 传 day：下载指定日期（00:00 ~ 23:59）的 1m 数据
+        - 传 start_time_ms / end_time_ms：下载时间范围内的 1m 数据
 
         Args:
             symbol: 交易对
-            day: 日期
+            day: 日期字符串（如 "2024-04-08"），与 start_time_ms 二选一
             limit: 最大条数
+            start_time_ms: 起始时间戳（毫秒）
+            end_time_ms: 结束时间戳（毫秒，可选）
 
         Returns:
             Binance 格式 K 线列表
         """
         symbol_upper = symbol.upper()
-        day_start = datetime.strptime(day, "%Y-%m-%d").replace(
-            tzinfo=timezone.utc
-        )
-        start_ms = int(day_start.timestamp() * 1000)
-        end_ms = start_ms + 86400000 - 1000  # 当天最后一毫秒
+        # 实时轮询模式：不传 day 也不传 start_time_ms，只拉最近 limit 条
+        if day is None and start_time_ms is None:
+            url = f"{self.BINANCE_FAPI_BASE}/fapi/v1/klines"
+            params = {
+                "symbol": symbol_upper,
+                "interval": "1m",
+                "limit": min(limit, 1500),
+            }
+            return await self._binance_public_request(symbol_upper, url, params)
+        if day is not None:
+            day_start = datetime.strptime(day, "%Y-%m-%d").replace(
+                tzinfo=timezone.utc
+            )
+            start_ms = int(day_start.timestamp() * 1000)
+            end_ms = start_ms + 86400000 - 1000  # 当天最后一毫秒
+        else:
+            start_ms = start_time_ms
+            end_ms = end_time_ms if end_time_ms is not None else start_ms + 86400000 - 1000
 
         url = f"{self.BINANCE_FAPI_BASE}/fapi/v1/klines"
         params = {
@@ -972,24 +1095,30 @@ class DataManager:
             "endTime": end_ms,
             "limit": min(limit, 1500),
         }
+        return await self._binance_public_request(symbol_upper, url, params)
 
+    async def _binance_public_request(
+        self, symbol_upper: str, url: str, params: Dict[str, Any]
+    ) -> Optional[List]:
+        """发起 Binance fapi 请求并返回 JSON（统一代理/超时/错误处理）。"""
+        proxy = _get_proxy()
         try:
             async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as resp:
+                async with session.get(url, params=params, proxy=proxy, timeout=aiohttp.ClientTimeout(total=30)) as resp:
                     if resp.status != 200:
                         text = await resp.text()
                         logger.warning(
-                            f"Binance 公共 API 请求失败 {symbol_upper} {day}: "
+                            f"Binance 公共 API 请求失败 {symbol_upper}: "
                             f"{resp.status} {text}"
                         )
                         return None
                     data = await resp.json()
                     if not data:
-                        logger.debug(f"Binance 公共 API {symbol_upper} {day}: 返回空数据")
+                        logger.debug(f"Binance 公共 API {symbol_upper}: 返回空数据")
                         return None
                     return data
         except Exception as e:
-            logger.warning(f"Binance 公共 API 请求异常 {symbol_upper} {day}: {e}")
+            logger.warning(f"Binance 公共 API 请求异常 {symbol_upper}: {e}")
             return None
 
     # ==================== 核心方法 1: download_daily_data ====================
@@ -1009,30 +1138,34 @@ class DataManager:
         """
         symbol_upper = symbol.upper()
 
-        # 1. 优先使用 klines_service
-        url = f"{self.config.klines_service_http_url}/api/v1/klines/daily"
-        payload = {"symbol": symbol_upper, "day": day}
+        # 1. 优先使用 klines_service（未配置 http_url 时直接跳过，回退到 Binance 公共 API）
+        http_url = self.config.klines_service_http_url
+        if http_url:
+            url = f"{http_url}/api/v1/klines/daily"
+            payload = {"symbol": symbol_upper, "day": day}
 
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(url, json=payload) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        klines = data.get("data") if isinstance(data, dict) else data
-                        if klines:
-                            return self._save_klines_and_cache(symbol_upper, klines, day)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(url, json=payload) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            klines = data.get("data") if isinstance(data, dict) else data
+                            if klines:
+                                return self._save_klines_and_cache(symbol_upper, klines, day)
 
-            # 2. klines_service 返回空，回退到 Binance 公共 API
-            logger.info(f"{symbol_upper} {day}: klines_service 无数据，回退到 Binance 公共 API")
-            klines = await self._fetch_from_binance_public(symbol_upper, day)
-            if not klines:
-                logger.warning(f"{symbol_upper} {day}: 所有数据源均返回空")
-                return False
-            return self._save_klines_and_cache(symbol_upper, klines, day)
+                # 2. klines_service 返回空，回退到 Binance 公共 API
+                logger.info(f"{symbol_upper} {day}: klines_service 无数据，回退到 Binance 公共 API")
+            except Exception as e:
+                logger.error(f"下载 {symbol_upper} {day} 异常：{e}")
+        else:
+            logger.info(f"{symbol_upper} {day}: 未配置 klines_service_http_url，直接使用 Binance 公共 API")
 
-        except Exception as e:
-            logger.error(f"下载 {symbol_upper} {day} 异常：{e}")
+        # 回退到 Binance 公共 API（klines_service 不可用 / 返回空 / 抛异常）
+        klines = await self._fetch_from_binance_public(symbol_upper, day)
+        if not klines:
+            logger.warning(f"{symbol_upper} {day}: 所有数据源均返回空")
             return False
+        return self._save_klines_and_cache(symbol_upper, klines, day)
 
     def _save_klines_and_cache(
         self, symbol_upper: str, klines: List, day: str,
@@ -1132,8 +1265,15 @@ class DataManager:
         Returns:
             API 原始返回数据（Binance 格式列表）或 None
         """
-        return await self._fetch_klines_from_api(
+        # 优先 klines_service，未配置或失败时回退到 Binance 公共 API
+        data = await self._fetch_klines_from_api(
             symbol, interval, start_time_ms=start_time_ms, end_time_ms=end_time_ms,
+        )
+        if data:
+            return data
+        logger.info(f"{symbol} {interval}: klines_service 无数据，回退到 Binance 公共 API")
+        return await self._fetch_from_binance_public(
+            symbol, start_time_ms=start_time_ms, end_time_ms=end_time_ms,
         )
 
     async def sync_to_latest(
@@ -1206,6 +1346,12 @@ class DataManager:
             api_data = await self._fetch_klines_from_api(
                 symbol_upper, "1m", start_time_ms=gap_start_ms,
             )
+            if not api_data:
+                # klines_service 未配置或失败，回退到 Binance 公共 API
+                logger.info(f"{symbol_upper}: klines_service gap 补齐失败，回退 Binance 公共 API")
+                api_data = await self._fetch_from_binance_public(
+                    symbol_upper, start_time_ms=gap_start_ms,
+                )
             if api_data:
                 return self._merge_api_data_to_cache(symbol_upper, api_data)
             logger.warning(f"{symbol_upper}: API 返回空数据，gap 未填充 (start_ms={gap_start_ms})")
@@ -1366,6 +1512,11 @@ class DataManager:
                 api_data = await self._fetch_klines_from_api(
                     symbol_upper, "1m", start_time_ms=start_ms,
                 )
+                if not api_data:
+                    logger.info(f"{symbol_upper}: klines_service gap 补齐失败，回退 Binance 公共 API")
+                    api_data = await self._fetch_from_binance_public(
+                        symbol_upper, start_time_ms=start_ms,
+                    )
                 if api_data:
                     rows = []
                     for kline in api_data:
@@ -1398,10 +1549,11 @@ class DataManager:
         # 4. 开启 WebSocket
         ws_ok = False
         if self.cache.get_1m_data(symbol_upper) is not None:
-            ws_ok = await self.start_klines_service_async()
-            if ws_ok:
+            # Binance 回退模式需要 symbol 预注册进 WS URL，提前传入
+            ws_ok = await self.start_klines_service_async([symbol_upper])
+            if ws_ok and not getattr(self._ws_client, "_binance_mode", False):
                 await self.subscribe_klines_async([symbol_upper])
-            else:
+            if not ws_ok:
                 logger.warning(f"{symbol_upper}: WS 启动失败，降级到 CSV 模式")
 
         # 5. 确认有数据
@@ -1483,6 +1635,16 @@ class DataManager:
         """
         symbol = kline.symbol.upper()
 
+        # DEBUG: 打印每条收到的 K 线（实时订阅回执）
+        _ts = kline.timestamp
+        if _ts.tzinfo is None:
+            _ts = _ts.replace(tzinfo=timezone.utc)
+        logger.debug(
+            f"[KLINE-RECV] {symbol} final={kline.is_final} "
+            f"ts={_ts.isoformat()} O={kline.open} H={kline.high} "
+            f"L={kline.low} C={kline.close} V={kline.volume}"
+        )
+
         if self._ws_subscribed_symbols and symbol not in self._ws_subscribed_symbols:
             return
 
@@ -1547,9 +1709,14 @@ class DataManager:
 
         existing = self.cache.get_1m_data(symbol)
         if existing is not None and not existing.empty:
-            df_combined = pd.concat([existing, df_new], ignore_index=True)
-            df_combined = df_combined.drop_duplicates(subset=['timestamp'], keep='last')
-            df_combined = df_combined.sort_values('timestamp').reset_index(drop=True)
+            if df_new['timestamp'].iloc[0] > existing['timestamp'].iloc[-1]:
+                # 快速路径：新 K 线严格晚于缓存末尾，跳过 dedup + sort
+                df_combined = pd.concat([existing, df_new], ignore_index=True)
+            else:
+                # 慢速路径：时间戳重叠或乱序（WS 重放、gap 补齐）
+                df_combined = pd.concat([existing, df_new], ignore_index=True)
+                df_combined = df_combined.drop_duplicates(subset=['timestamp'], keep='last')
+                df_combined = df_combined.sort_values('timestamp').reset_index(drop=True)
             self.cache.put(symbol, '1m', df_combined, force_1m=True)
         else:
             self.cache.put(symbol, '1m', df_new, force_1m=True)
@@ -1594,6 +1761,10 @@ class DataManager:
                 api_data = await self._fetch_klines_from_api(
                     symbol, "1m", start_time_ms=start_ms, end_time_ms=end_ms,
                 )
+                if not api_data:
+                    api_data = await self._fetch_from_binance_public(
+                        symbol, start_time_ms=start_ms, end_time_ms=end_ms,
+                    )
                 if api_data:
                     self._merge_api_data_to_cache(symbol, api_data)
                     logger.info(f"{symbol}: WS gap 已补齐 {len(api_data)} 条")
@@ -1650,19 +1821,60 @@ class DataManager:
 
         for interval in big_intervals:
             try:
-                df_agg = self.aggregate_1m_to_interval(df_1m, interval)
-                if df_agg is not None and not df_agg.empty:
-                    self.cache.put(symbol, interval, df_agg)
-                    # 回测模式不保存到 CSV
-                    if self.kline_repo and not self.config.backtest_mode:
-                        rows = df_agg.to_dict(orient="records")
-                        self.kline_repo.save_klines_to_csv(symbol, interval, rows)
-                    results[interval] = True
-                    logger.debug(
-                        f"{symbol} {interval}: 缓存聚合 {len(df_agg)} 条"
-                    )
-                else:
+                cached_agg = self.cache.get(symbol, interval)
+                period_minutes = self._parse_interval_to_minutes(interval)
+                df_agg = None
+                new_rows = None
+
+                if (cached_agg is not None and not cached_agg.empty
+                        and not self.config.backtest_mode and period_minutes > 0):
+                    # 增量路径：只 resample 尾部 3 个周期的 1m 数据
+                    tail_rows = period_minutes * 3
+                    df_tail = (df_1m.iloc[-tail_rows:]
+                               if len(df_1m) > tail_rows else df_1m)
+                    df_inc = self.aggregate_1m_to_interval(df_tail, interval)
+
+                    # 增量起点必须晚于缓存起点，否则 keep 为空 → 退化成截断
+                    if (df_inc is not None and not df_inc.empty
+                            and df_inc['timestamp'].iloc[0] > cached_agg['timestamp'].iloc[0]):
+                        keep = cached_agg[
+                            cached_agg['timestamp'] < df_inc['timestamp'].iloc[0]
+                        ]
+                        df_agg = pd.concat([keep, df_inc], ignore_index=True)
+                        new_rows = df_inc  # 仅新增/更新的行需要落 CSV
+
+                if df_agg is None:
+                    # 全量路径：冷启动 / 回测模式 / 缓存为空 / 增量前置条件不满足
+                    df_agg = self.aggregate_1m_to_interval(df_1m, interval)
+                    new_rows = df_agg
+
+                if df_agg is None or df_agg.empty:
                     results[interval] = False
+                    continue
+
+                self.cache.put(symbol, interval, df_agg)
+                # 回测模式不保存到 CSV
+                if self.kline_repo and not self.config.backtest_mode:
+                    rows = new_rows.to_dict(orient="records")
+                    self.kline_repo.save_klines_to_csv(symbol, interval, rows)
+                results[interval] = True
+                # 聚合诊断日志
+                src_start = df_1m['timestamp'].iloc[0]
+                src_end = df_1m['timestamp'].iloc[-1]
+                agg_start = df_agg['timestamp'].iloc[0]
+                agg_end = df_agg['timestamp'].iloc[-1]
+                inc_info = ""
+                if new_rows is not None and new_rows is not df_agg:
+                    inc_info = (
+                        f" 增量({len(new_rows)}根) "
+                        f"[{new_rows['timestamp'].iloc[0]} ~ {new_rows['timestamp'].iloc[-1]}]"
+                    )
+                logger.info(
+                    f"{symbol} {interval}: 聚合 {len(df_agg)} 根 "
+                    f"[{agg_start} ~ {agg_end}] | "
+                    f"1m源 {len(df_1m)}行 [{src_start} ~ {src_end}]"
+                    f"{inc_info}"
+                )
             except Exception as e:
                 logger.warning(f"{symbol} {interval}: 缓存聚合失败: {e}")
                 results[interval] = False

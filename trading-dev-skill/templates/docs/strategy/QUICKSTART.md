@@ -43,9 +43,11 @@ strategies/{strategy_name}/
 
 ---
 
-## 基类继承模式
+## 新架构：基类继承模式（推荐）
 
-使用 `BaseStrategy` / `BaseStrategyCore` / `BaseState` 基类开发。
+> **v3.6.0 新增**：使用 `BaseStrategy` / `BaseStrategyCore` / `BaseState` 基类，大幅简化策略开发。
+
+### 架构概述
 
 ```
 BaseState (strategy_core/base/state.py)
@@ -61,7 +63,7 @@ BaseStrategy (strategy_core/base/strategy.py)
 Strategy - 只需设置类属性和实现两个抽象方法
 ```
 
-### strategy.py 模板
+### strategy.py 模板（约 35 行）
 
 ```python
 #!/usr/bin/env python3
@@ -74,11 +76,15 @@ from .{prefix}_core import {Prefix}Core
 class Strategy(BaseStrategy):
     """{策略名称}"""
 
-    STRATEGY_TYPE = "{strategy_name}"
-    STRATEGY_PREFIX = "{PREFIX}"
-    DEFAULT_TIMEFRAME = "1h"
+    # ========== 必需类属性 ==========
+    STRATEGY_TYPE = "{strategy_name}"      # 策略目录名
+    STRATEGY_PREFIX = "{PREFIX}"            # 策略名称前缀
+    DEFAULT_TIMEFRAME = "1h"                # 默认主周期
+
+    # ========== 必需抽象方法 ==========
 
     def _create_core(self):
+        """创建核心逻辑实例"""
         return {Prefix}Core(
             symbols=self.symbols,
             timeframes=self.timeframes,
@@ -86,6 +92,7 @@ class Strategy(BaseStrategy):
         )
 
     def _get_indicator_timeframes(self) -> set:
+        """收集所有指标使用的 K 线周期"""
         tf_set = set(self.timeframes)
         p = self.params or {}
         tf_set.add(p.get("{indicator}_timeframes", "1h"))
@@ -100,13 +107,14 @@ class Strategy(BaseStrategy):
 
 from strategy_core.base import BaseStrategyCore, BaseState
 from typing import Dict, Any, Optional, List
-from datetime import datetime
+from datetime import datetime, timezone
 import pandas as pd
 
 
 class {Prefix}State(BaseState):
-    """策略状态"""
+    """策略状态 - 继承 BaseState"""
 
+    # 策略特有字段
     atr_at_entry: float = 0.0
     trail_activated: bool = False
 
@@ -123,22 +131,24 @@ class {Prefix}State(BaseState):
 
 class {Prefix}Core(BaseStrategyCore):
 
-    def __init__(self, symbols, timeframes, params=None):
+    def __init__(self, symbols: List[str], timeframes: List[str], params: Optional[Dict[str, Any]] = None):
         super().__init__(symbols, timeframes, params)
 
-    def _get_state(self, symbol):
+    def _get_state(self, symbol: str) -> {Prefix}State:
         if symbol not in self._state:
             self._state[symbol] = {Prefix}State()
         return self._state[symbol]
 
-    def analyze(self, symbol, klines_data, current_time=None, realtime_price=None):
+    def analyze(self, symbol, klines_data, current_time=None):
+        """入场分析"""
         state = self._get_state(symbol)
         if state.is_in_position():
-            return {"action": "hold", "price": 0, "strength": 0, "metadata": {"reason": "已有持仓"}}
+            return {"action": "hold", "price": 0, "strength": 0, "metadata": {"reason": f"已有持仓: {state.position}"}}
         # TODO: 实现入场条件检查
         return {"action": "hold", "price": 0, "strength": 0, "metadata": {"reason": "未满足入场条件"}}
 
     def check_realtime_exit(self, symbol, current_price, current_time=None, bar_high=None, bar_low=None):
+        """出场检查"""
         state = self._get_state(symbol)
         if not state.is_in_position():
             return {"action": "hold", "price": current_price, "strength": 0, "metadata": {"reason": "无持仓"}}
@@ -146,14 +156,20 @@ class {Prefix}Core(BaseStrategyCore):
         # TODO: 实现出场条件检查
         return {"action": "hold", "price": current_price, "strength": 0, "metadata": {"reason": "持仓中"}}
 
-    def get_status(self):
-        return {"symbols": self.symbols, "timeframes": self.timeframes,
-                "states": {s: self._get_state(s).to_persist_dict() for s in self.symbols}}
+    def get_status(self) -> Dict[str, Any]:
+        return {
+            "symbols": self.symbols,
+            "timeframes": self.timeframes,
+            "states": {s: self._get_state(s).to_persist_dict() for s in self.symbols},
+        }
 ```
 
 ### __init__.py 模板
 
 ```python
+#!/usr/bin/env python3
+"""{策略名称} 策略模块"""
+
 from .strategy import Strategy
 from .{prefix}_core import {Prefix}Core, {Prefix}State
 
@@ -179,37 +195,34 @@ __all__ = ["Strategy", "{Prefix}Core", "{Prefix}State"]
   # 策略参数
   params:
     {indicator}_timeframes: 1h  # 每个指标必须配置 *_timeframes
+    # 其他参数...
 
   # 信号配置
   signal:
     min_strength: 0.5
     cooldown_ms: 60000
 
-  # 资金配置
+  # 系统字段
   capital:
     max_cash: 100
     max_parts: 1
-
-  # 风控配置（可选）
-  risk:
-    enabled: true
-    fixed_stop_loss_pct: 20.0
-    trailing_profit:
-      enabled: true
-      activation_pct: 50.0
-      drawdown_pct: 5.0
-    fixed_take_profit_pct: 0.0
-
-  # 冷却周期
-  cooldown_timeframe: 1h
 ```
+
+---
+
+## 新旧架构对比
+
+| 对比项 | 旧版（手动实现） | 新版（基类继承） |
+|--------|----------------|----------------|
+| strategy.py 行数 | ~250 行 | ~35 行 |
+| 重复代码 | 大量生命周期、冷却、持久化逻辑 | 基类统一处理 |
+| 维护成本 | 每个策略独立维护 | 只维护特有逻辑 |
+| 回测兼容 | 手动处理 backtest_mode | 基类自动处理 |
 
 ---
 
 ## 下一步
 
-- API 参考 → [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md)
-- 实战注意事项 → [PRACTICAL_GUIDE.md](PRACTICAL_GUIDE.md)
+- 详细开发规范 → [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md)
 - 代码模板与 FAQ → [EXAMPLES.md](EXAMPLES.md)
-- 编码约束 → [AI_CONSTRAINTS.md](AI_CONSTRAINTS.md)
 - 提交前检查 → [REVIEW_CHECKLIST.md](REVIEW_CHECKLIST.md)

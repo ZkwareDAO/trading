@@ -14,8 +14,6 @@ from data_manager import DataManager
 from strategy_core.signal_logging import Signal, SignalType
 from strategy_core.position_persistence import PositionPersistence
 from strategy_core.stop_loss_cooldown_persistence import StopLossCoolDownPersistence
-from strategy_core.utils.config_loader import load_config_with_env
-from strategy_core.utils.strategy_naming import get_mode_suffix
 from strategy_core.base.risk_config import RiskControlConfig
 from strategy_core.constants import TF_MINUTES, DEFAULT_MIN_BARS_REQUIRED
 
@@ -27,7 +25,7 @@ class BaseStrategy(ABC):
     策略基类 - 包含所有策略共有的功能
 
     新增策略只需:
-    1. 设置类属性: STRATEGY_TYPE, STRATEGY_PREFIX, DEFAULT_TIMEFRAME
+    1. 设置类属性: STRATEGY_TYPE, DEFAULT_TIMEFRAME
     2. 实现 _create_core() 创建核心逻辑实例
     3. 实现 _get_indicator_timeframes() 返回指标周期
     4. (可选) 重写 State 类添加特有字段
@@ -39,7 +37,6 @@ class BaseStrategy(ABC):
 
     # ========== 子类必须设置的类属性 ==========
     STRATEGY_TYPE: str = ""       # 策略类型名称 (目录名)
-    STRATEGY_PREFIX: str = ""     # 策略名称前缀 (如 "OBVATR", "ICT")
     DEFAULT_TIMEFRAME: str = "1h"  # 默认主周期
 
     def __init__(
@@ -51,8 +48,8 @@ class BaseStrategy(ABC):
         factory_client: Optional[Any] = None,
         user_id: str = "",
     ):
-        # 加载配置
-        self.config = config if config else load_config_with_env(self.STRATEGY_TYPE)
+        # 配置必须由入口注入（来自 per-symbol overrides），不再回退读共享层 config.yaml
+        self.config = config or {}
         self.data_manager = data_manager
 
         # 外部传入的标准化策略名称
@@ -167,9 +164,10 @@ class BaseStrategy(ABC):
         Returns:
             全局配置字典
         """
-        from strategy_core.utils.config_loader import load_config_with_env
+        import yaml
         try:
-            return load_config_with_env("config/settings.yaml")
+            with open("config/settings.yaml", "r", encoding="utf-8") as f:
+                return yaml.safe_load(f) or {}
         except Exception as e:
             logger.warning(f"加载全局配置失败: {e}")
             return {}
@@ -178,35 +176,13 @@ class BaseStrategy(ABC):
 
     @property
     def strategy_name(self) -> str:
-        """策略名称: {PREFIX}v{version}_{tf}_{symbol} 或外部传入的标准化名称"""
-        if self._external_strategy_name:
-            return self._external_strategy_name
-        # 回退到旧逻辑
-        if len(self.symbols) == 1:
-            return f"{self.STRATEGY_PREFIX.upper()}_{self.main_timeframe.upper()}_{self.version.upper()}_{self.symbols[0]}"
-        return f"{self.STRATEGY_PREFIX.upper()}_{self.main_timeframe.upper()}_{self.version.upper()}"
-
-    def strategy_name_for(self, symbol: str) -> str:
-        """指定标的的策略名称（不含 trading_mode，用于 Factory 注册和仓位查询）"""
-        return f"{self.STRATEGY_PREFIX.upper()}_{self.main_timeframe.upper()}_{self.version.upper()}_{symbol.upper()}"
-
-    def strategy_id_for(self, symbol: str) -> str:
-        """指定标的的策略完整 ID（含 trading_mode，用于数据存储路径）
-
-        用于仓位持久化、历史仓位、信号存储，实现实盘/模拟盘/小金额实盘数据隔离。
+        """标准化策略 ID（入口算一次传入，直接复用，无回退）
 
         格式: {PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}_{MODE}
-        例如: RBREAKER_15M_V3_BTCUSDT_LIVE
-
-        Args:
-            symbol: 交易对
-
-        Returns:
-            完整策略 ID（含 trading_mode 后缀）
+        由 run_strategy.py / run_strategies_manager.py 通过
+        build_strategy_id_from_overrides 生成后传入。
         """
-        base_name = self.strategy_name_for(symbol)
-        mode_suffix = get_mode_suffix(self._trading_mode)
-        return f"{base_name}_{mode_suffix}"
+        return self._external_strategy_name
 
     @property
     def name(self) -> str:
@@ -298,7 +274,7 @@ class BaseStrategy(ABC):
         cooldown_persistence = StopLossCoolDownPersistence()
 
         for symbol in self.symbols:
-            key = self.strategy_id_for(symbol)
+            key = self._external_strategy_name
             state = self._core._get_state(symbol)
 
             # 恢复仓位状态
@@ -322,7 +298,7 @@ class BaseStrategy(ABC):
     def _on_position_enter(self, symbol: str, state) -> None:
         """开仓时持久化"""
         persistence = PositionPersistence()
-        key = self.strategy_id_for(symbol)
+        key = self._external_strategy_name
         persistence.save_on_entry(
             strategy_name=key,
             position_id=state.position_id,
@@ -344,7 +320,7 @@ class BaseStrategy(ABC):
         """平仓时：记录历史 + 清除持久化"""
         from strategy_core.history_position_logger import HistoryPositionLogger
 
-        strategy_id = self.strategy_id_for(symbol)
+        strategy_id = self._external_strategy_name
         exit_ts = exit_time or datetime.now(timezone.utc)
         exit_timestamp = (
             int(exit_ts.timestamp())
@@ -392,7 +368,7 @@ class BaseStrategy(ABC):
         if hasattr(state, "trail_activated"):
             updates["trail_activated"] = state.trail_activated
         PositionPersistence().update_state(
-            strategy_name=self.strategy_id_for(symbol),
+            strategy_name=self._external_strategy_name,
             position_id=state.position_id,
             updates=updates,
         )
@@ -442,9 +418,10 @@ class BaseStrategy(ABC):
         # 有持仓 → 检查出场
         if state.is_in_position():
             if current_price and current_price > 0:
+                position_snapshot = self._snapshot_position(state)
                 signal = self._check_exit(trigger_symbol, current_price, bar_high, bar_low)
-                # 输出场诊断日志
-                self._log_position_diagnostic(trigger_symbol, state, signal, current_price)
+                self._log_position_diagnostic(trigger_symbol, state, signal, current_price,
+                                              position_snapshot=position_snapshot)
                 if signal:
                     return signal
             return None
@@ -502,14 +479,34 @@ class BaseStrategy(ABC):
         else:
             logger.info(log_msg)
 
+    @staticmethod
+    def _snapshot_position(state: Any) -> Dict[str, Any]:
+        """快照持仓关键字段（check_realtime_exit 内部会清空 state）"""
+        return {
+            "position": state.position,
+            "entry_price": state.entry_price,
+            "stop_price": state.stop_price,
+            "peak_price": state.peak_price,
+        }
+
     def _log_position_diagnostic(
         self,
         symbol: str,
         state: Any,
         signal: Optional[Signal],
         current_price: float,
+        position_snapshot: Optional[Dict[str, Any]] = None,
     ) -> None:
-        """输出持仓诊断日志"""
+        """输出持仓诊断日志
+
+        Args:
+            symbol: 交易对
+            state: 当前状态对象（check_realtime_exit 后可能已清空）
+            signal: 出场信号（None 表示未触发出场）
+            current_price: 当前价格
+            position_snapshot: check_realtime_exit 前的状态快照，
+                              用于在 state 被清空后仍有正确的日志数据
+        """
         ts = self._current_kline_timestamp or datetime.now(timezone.utc)
 
         action = "hold"
@@ -518,22 +515,33 @@ class BaseStrategy(ABC):
             action = signal.signal_type.value.lower()
             reason = signal.metadata.get("reason", "")
 
+        # 优先用快照（check_realtime_exit 可能已清空 state），回退到 state 字段
+        snap_position = position_snapshot.get("position") if position_snapshot else None
+        snap_entry = position_snapshot.get("entry_price", 0.0) if position_snapshot else 0.0
+        snap_stop = position_snapshot.get("stop_price", 0.0) if position_snapshot else 0.0
+        snap_peak = position_snapshot.get("peak_price", 0.0) if position_snapshot else 0.0
+
+        log_position = snap_position or state.position or 'none'
+        log_entry = snap_entry if snap_entry > 0 else state.entry_price
+        log_stop = snap_stop if snap_stop > 0 else state.stop_price
+        log_peak = snap_peak if snap_peak > 0 else state.peak_price
+
         # 计算 ROI
         roi = 0.0
-        if state.entry_price > 0 and current_price:
-            if state.position == "long":
-                roi = (current_price - state.entry_price) / state.entry_price
-            elif state.position == "short":
-                roi = (state.entry_price - current_price) / state.entry_price
+        if log_entry > 0 and current_price:
+            if log_position == "long":
+                roi = (current_price - log_entry) / log_entry
+            elif log_position == "short":
+                roi = (log_entry - current_price) / log_entry
 
         price_str = f"{current_price:.2f}" if current_price else "0"
 
         log_msg = (
             f"[Signal] {self.strategy_name} | {symbol} 1m "
             f"@ {ts} | {action} | close={price_str} | "
-            f"position={state.position or 'none'} | entry={state.entry_price:.2f} | "
-            f"ROI={roi*100:.2f}% | stop={state.stop_price:.2f} | "
-            f"peak={state.peak_price:.2f} | reason={reason}"
+            f"position={log_position} | entry={log_entry:.2f} | "
+            f"ROI={roi*100:.2f}% | stop={log_stop:.2f} | "
+            f"peak={log_peak:.2f} | reason={reason}"
         )
 
         if action == "hold":
@@ -583,7 +591,7 @@ class BaseStrategy(ABC):
 
         # 查询远程仓位
         try:
-            strategy_name = self.strategy_name_for(symbol)
+            strategy_name = self._external_strategy_name
 
             # 记录请求 URL（不记录敏感参数）
             position_proxy_url = getattr(
@@ -702,7 +710,7 @@ class BaseStrategy(ABC):
 
             # 持久化到独立文件
             cooldown_persistence = StopLossCoolDownPersistence()
-            strategy_id = self.strategy_id_for(symbol)
+            strategy_id = self._external_strategy_name
             cooldown_persistence.save(strategy_id, state.stop_loss_date)
 
             logger.info(f"[{symbol}] 远程止损，设置 stop_loss_date={state.stop_loss_date}")
@@ -813,7 +821,7 @@ class BaseStrategy(ABC):
         direction = "long" if action in ("buy", "sell_close") else "short"
 
         return Signal(
-            strategy_id=self.strategy_id_for(symbol),
+            strategy_id=self._external_strategy_name,
             strategy_type=self.name,
             signal_type=signal_type,
             symbol=symbol,

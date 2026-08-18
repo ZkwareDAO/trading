@@ -1,7 +1,22 @@
-# Core dependencies
+# =============================================================================
+# 运行时依赖
+# =============================================================================
+# 本文件只列【代码真实 import】的包。每次增删请用以下命令核对，
+# 避免出现"声明了但没人用"或"用了但没声明"（后者会让干净环境直接崩）：
+#
+#   # 找出 import 了但未声明的
+#   grep -rhn "^\s*\(import\|from\) " --include="*.py" . | ...
+#
+#   # 最硬的验证：干净 venv 装完能否跑通文档里的命令
+#   python3 -m venv /tmp/t && /tmp/t/bin/pip install -r requirements.txt
+#   /tmp/t/bin/python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260701
+#
+# 测试依赖见 requirements-dev.txt。
+# =============================================================================
+
+# Core
 aiohttp>=3.9.0
 pyyaml>=6.0
-sqlalchemy>=2.0.0
 loguru>=0.7.0
 python-dotenv>=1.0.0
 
@@ -9,15 +24,15 @@ python-dotenv>=1.0.0
 numpy>=1.24.0
 pandas>=2.0.0
 
+# Backtest engine（backtest/bt_strategy.py 等 6 个文件 import bt）
+backtrader>=1.9.78
+
 # Visualization (for backtest analysis charts)
 matplotlib>=3.7.0
 
 # HTTP requests (for data downloader)
 requests>=2.31.0
 types-requests>=2.31.0
-
-# Binance API client (for data downloader)
-python-binance>=1.0.19
 
 # Type stub packages (for mypy type checking)
 types-PyYAML>=6.0
@@ -31,7 +46,5 @@ defusedxml>=0.7.0  # Prevents XXE attacks on XML-RPC
 # Kafka (for real-time signal push)
 kafka-python-ng>=2.2.0
 
-# Arbitrage: Polymarket + Deribit clients
+# WebSocket (data_manager/klines_ws_client.py)
 websockets>=12.0
-py-clob-client-v2>=0.1.0
-

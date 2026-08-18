@@ -210,7 +210,7 @@ class TestCsvParamsIncludesRiskFields:
         entry = StrategyEntry(
             strategy_id="test_strategy_001",
             strategy_name="RBreaker_v2_1m_BTCUSDT",
-            module_path="strategies.cta_rbreaker.strategy",
+            module_path="strategies.obv_atr_v2.strategy",
             config={
                 "version": "v2",
                 "params": {"threshold": 0.005},
@@ -289,7 +289,7 @@ class TestCsvParamsIncludesRiskFields:
         entry = StrategyEntry(
             strategy_id="test_strategy_leverage",
             strategy_name="RBreaker_v3_15m_SOLUSDT",
-            module_path="strategies.cta_rbreaker.strategy",
+            module_path="strategies.obv_atr_v2.strategy",
             config={
                 "version": "v3",
                 "params": {"threshold": 0.005},

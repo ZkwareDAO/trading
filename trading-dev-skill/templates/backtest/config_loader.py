@@ -2,13 +2,11 @@
 """
 配置加载器 - 只读取配置，不修改、不删除
 
-功能：
-- load_main_config: 加载全局配置
-- load_batch_config: 加载批量配置
-- build_config_path: 组合配置路径
-- resolve_config_path: 解析路径
-- parse_date: 解析日期
-- resolve_strategy_config_path: 解析策略配置路径（支持全局/策略级 config_path）
+保留的函数（legacy 双格式路径解析函数已删除）：
+- load_main_config: 加载 YAML 配置文件（通用）
+- load_profile: 加载 run-profile（config/<name>.yaml）
+- verify_data_dir_consistency: 校验 profile.data_dir 与 settings.csv_dir 一致
+- parse_date: 解析日期（YYYYMMDD / YYYY-MM-DD / 时间戳）
 - merge_config_with_overrides: 深度合并配置与覆盖字段
 """
 
@@ -18,13 +16,23 @@ from typing import Dict, Tuple
 
 import yaml
 
+PROFILES_DIR = Path("config")
+
+# config/ 下不是 run-profile 的文件：它们是系统层与编排层配置，结构完全不同。
+# 若允许 `--profile settings`，会把系统配置当 profile 解析，得到一堆字段缺失的
+# 怪错误而非"参数不合法"。profile 与它们同目录（回测本来就要读 settings.yaml，
+# 分开放反而割裂），因此改用保留名单显式拦截。
+RESERVED_CONFIG_NAMES = frozenset({
+    "settings", "settings.example",
+    "strategies", "strategies.example",
+})
+
 
 def load_main_config(path: str) -> Dict:
-    """
-    读取全局配置（只读）
+    """读取 YAML 配置文件（只读）。
 
     Args:
-        path: 配置文件路径，如 "backtest/config/main.yaml"
+        path: 配置文件路径
 
     Returns:
         配置字典
@@ -40,196 +48,128 @@ def load_main_config(path: str) -> Dict:
         return yaml.safe_load(f)
 
 
-def load_batch_config(path: str) -> Dict:
-    """
-    读取批量配置（只读）
+def load_profile(profile: str) -> Dict:
+    """加载 run-profile（config/<name>.yaml）。
 
-    配置文件格式：{strategy_name: {config}}
-    返回第一个 key 的 value
+    run-profile 承载回测的运行方式（时间范围/资金/费率/输出/并发），绝不含策略参数。
+    缺失或内容为空都视为错误——静默回退默认值会让"这次跑的是哪套参数"变得不可知，
+    与配置收敛的目的相悖。
 
     Args:
-        path: 配置文件路径，如 "backtest/config/cta_rbreaker_v2/BTCUSDT.yaml"
+        profile: profile 名（如 backtest）
 
     Returns:
-        策略配置字典
+        profile 配置字典（保证非空）
 
     Raises:
-        FileNotFoundError: 配置文件不存在
+        FileNotFoundError: profile 文件不存在
+        ValueError: profile 名含路径分隔符、是保留名，或文件内容为空
     """
-    config_path = Path(path)
-    if not config_path.exists():
-        raise FileNotFoundError(f"配置文件不存在: {path}")
+    # profile 是文件名而非路径：拦住 "../etc/hostname" 这类穿越。
+    if "/" in profile or "\\" in profile or profile.startswith("."):
+        raise ValueError(f"profile 名不合法（不能含路径分隔符）: {profile!r}")
 
-    with open(config_path, "r", encoding="utf-8") as f:
-        full_config = yaml.safe_load(f)
+    # settings / strategies 与 profile 同在 config/ 下但不是 profile，显式拦截。
+    if profile in RESERVED_CONFIG_NAMES:
+        raise ValueError(
+            f"{profile!r} 不是 run-profile，而是{'系统层' if 'settings' in profile else '编排层'}配置。"
+            f"可用 profile 见 config/ 下非保留名的 yaml（如 backtest）。"
+        )
 
-    if full_config:
-        strategy_name = list(full_config.keys())[0]
-        return full_config[strategy_name]
-    return {}
+    profile_path = PROFILES_DIR / f"{profile}.yaml"
+    if not profile_path.exists():
+        raise FileNotFoundError(f"profile 文件不存在: {profile_path}")
+
+    with open(profile_path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    if not cfg:
+        raise ValueError(f"profile 文件内容为空: {profile_path}")
+    return cfg
 
 
-def build_config_path(config_dir: str, strategy_name: str, symbol: str) -> str:
-    """
-    组合配置文件路径
+def verify_data_dir_consistency(profile_data_dir: str, settings_csv_dir) -> bool:
+    """校验 profile.data_dir 与 settings.data_manager.csv_dir 指向同一目录。
+
+    回测的配置来源是【两份】：config/settings.yaml（与实盘共用，提供
+    use_bar_high_low_for_exit 等影响成交判定的字段）+ config/backtest.yaml
+    （回测运行方式）。data_dir 与 csv_dir 是二者间唯一的语义重复。
+
+    只靠注释约定维持不住：一旦有人只改一处，实盘往 A 目录写数据、回测从 B 目录读，
+    回测结果基于过时数据却没有任何提示。这属于回测失真，必须在启动时拦住而不是
+    留给使用者自己发现。
+
+    settings_csv_dir 为 None（settings.yaml 不存在或未配置该键）时视为通过：
+    此时回测仍可跑，但注意 use_bar_high_low_for_exit 会退回代码默认值 True，
+    与 settings.yaml 中显式的 false 不同，止损判定行为会变化。
 
     Args:
-        config_dir: 配置目录，如 "backtest/config" 或 "./backtest/config"
-        strategy_name: 策略名称，如 "cta_rbreaker_v2"
-        symbol: 交易对，如 "BTCUSDT"
+        profile_data_dir: profile 的 data_dir
+        settings_csv_dir: settings.yaml 的 data_manager.csv_dir，可为 None
 
     Returns:
-        配置文件路径字符串，如 "backtest/config/cta_rbreaker_v2/BTCUSDT.yaml"
+        True（一致或无从比较）
+
+    Raises:
+        ValueError: 两者指向不同目录
     """
-    # 保留 ./ 前缀（如果存在）
-    has_dot_slash = config_dir.startswith("./")
+    if not settings_csv_dir:
+        return True
 
-    # 使用 Path 组合路径
-    config_path = Path(config_dir) / strategy_name / f"{symbol}.yaml"
+    # "./data/klines" / "data/klines" / "data/klines/" 是同一目录，
+    # 按写法直接比字符串会误报，故先归一化。
+    if Path(profile_data_dir) == Path(settings_csv_dir):
+        return True
 
-    # 转换为字符串
-    result = str(config_path)
-
-    # 如果原始路径有 ./ 前缀，恢复它
-    if has_dot_slash and not result.startswith("./"):
-        result = "./" + result
-
-    return result
-
-
-def resolve_config_path(config_path: str) -> str:
-    """
-    解析配置路径，确保路径格式正确
-
-    支持：
-    - backtest/config/cta_rbreaker_v2/BTCUSDT.yaml
-    - ./backtest/config/cta_rbreaker_v2/BTCUSDT.yaml
-    - /absolute/path/backtest/config/cta_rbreaker_v2/BTCUSDT.yaml
-
-    Args:
-        config_path: 原始路径
-
-    Returns:
-        解析后的路径
-    """
-    path = Path(config_path)
-
-    # 如果路径存在，返回绝对路径
-    if path.exists():
-        return str(path.resolve())
-
-    # 尝试添加 ./ 前缀
-    if not config_path.startswith("./") and not config_path.startswith("/"):
-        alt_path = Path("./" + config_path)
-        if alt_path.exists():
-            return str(alt_path.resolve())
-
-    # 返回原始路径（后续会报错文件不存在）
-    return config_path
+    raise ValueError(
+        "数据目录配置分叉：\n"
+        f"  profile data_dir            = {profile_data_dir!r}\n"
+        f"  settings.yaml csv_dir       = {settings_csv_dir!r}\n"
+        "二者必须指向同一目录，否则实盘写入与回测读取会落在不同位置，"
+        "回测将基于过时数据得出结论。"
+    )
 
 
 def parse_date(value: str) -> Tuple[str, datetime]:
-    """
-    解析日期输入，返回 (YYYYMMDD, datetime对象)
+    """解析日期输入，返回 (YYYYMMDD, datetime对象)。
 
     支持:
     - YYYYMMDD
     - YYYY-MM-DD
     - 秒时间戳(10位)
     - 毫秒时间戳(13位)
-
-    Args:
-        value: 日期字符串
-
-    Returns:
-        (YYYYMMDD格式字符串, datetime对象)
     """
-    # 时间戳格式
     if value.isdigit() and len(value) in (10, 13):
         ts = int(value)
         if len(value) == 13:
             dt = datetime.fromtimestamp(ts / 1000, tz=timezone.utc)
-        else:  # len == 10
+        else:
             dt = datetime.fromtimestamp(ts, tz=timezone.utc)
         return dt.strftime("%Y%m%d"), dt
 
-    # YYYY-MM-DD 格式
     if "-" in value:
         dt = datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
         return dt.strftime("%Y%m%d"), dt
 
-    # YYYYMMDD 格式
     dt = datetime.strptime(value, "%Y%m%d").replace(tzinfo=timezone.utc)
     return value, dt
 
 
-def resolve_strategy_config_path(
-    strategy_name: str,
-    symbol: str,
-    global_config_path: str = "backtest/config",
-    strategy_config_path: str | None = None,
-) -> str:
-    """
-    解析策略配置文件路径
-
-    优先级：strategy_config_path > global_config_path > 默认值
-
-    Args:
-        strategy_name: 策略名称，如 "cta_ict_v3"
-        symbol: 交易对，如 "BTCUSDT"（自动转大写）
-        global_config_path: 全局配置路径，默认 "config/strategies"
-        strategy_config_path: 策略级配置路径，优先级最高
-
-    Returns:
-        配置文件路径，如 "backtest/config/cta_ict_v3/BTCUSDT.yaml"
-    """
-    # 确定基础路径（策略级优先）
-    base_path = strategy_config_path if strategy_config_path else global_config_path
-
-    # symbol 转大写
-    symbol_upper = symbol.upper()
-
-    # 保留 ./ 前缀（如果存在）
-    has_dot_slash = base_path.startswith("./")
-
-    # 组合路径
-    config_path = Path(base_path) / strategy_name / f"{symbol_upper}.yaml"
-
-    # 转换为字符串
-    result = str(config_path)
-
-    # 如果原始路径有 ./ 前缀，恢复它
-    if has_dot_slash and not result.startswith("./"):
-        result = "./" + result
-
-    return result
-
-
 def merge_config_with_overrides(base_config: Dict, overrides: Dict) -> Dict:
-    """
-    深度合并基础配置与覆盖字段
+    """深度合并基础配置与覆盖字段。
 
     合并规则：
     - 嵌套字典：深度合并，只替换指定字段
     - 数组：直接替换（不合并）
     - None 值：删除该字段
     - 新字段：添加到结果
-
-    Args:
-        base_config: 基础配置（从配置文件加载）
-        overrides: 覆盖字段（优先级更高）
-
-    Returns:
-        合并后的配置（新字典，不修改原配置）
     """
     import copy
 
-    # 深拷贝避免修改原配置
     result = copy.deepcopy(base_config)
 
     for key, value in overrides.items():
         if value is None:
-            # None 值删除字段
             if key in result:
                 del result[key]
         elif (
@@ -237,10 +177,8 @@ def merge_config_with_overrides(base_config: Dict, overrides: Dict) -> Dict:
             and isinstance(result[key], dict)
             and isinstance(value, dict)
         ):
-            # 嵌套字典：递归合并
             result[key] = merge_config_with_overrides(result[key], value)
         else:
-            # 其他情况：直接覆盖
             result[key] = copy.deepcopy(value)
 
     return result

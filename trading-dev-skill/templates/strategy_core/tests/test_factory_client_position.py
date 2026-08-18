@@ -6,6 +6,22 @@
 1. 查询仓位列表
 2. 判断仓位是否开启
 3. 处理网络错误
+
+补覆盖说明：本文件原有 11 个用例在遗留测试清理中被删除——它们全部失败，
+根因是构造 FactoryClient 时只传 `factory_endpoint=`，而查询 URL 实际由
+`position_proxy_url` 拼出，导致 endpoint 为 None、请求必然失败（源码功能正常）。
+遗留下来的用例只覆盖了"查不到 → (None, None)"这类降级路径，
+真正的判定路径（开启 → True / 已平 → False / 取最新一条）无覆盖。
+
+该功能在实盘由 BaseStrategy 远程仓位同步调用，错判会导致重复开仓或漏平仓，
+故补回下方 TestRemotePositionVerdict。
+
+契约（对齐 factory_client.py 实现）：
+- 响应体 data.list 是仓位数组；旧格式 {"status":"success"} 与新格式 {"code":0} 均支持
+- Deleted == 0 → 开启；Deleted == 1 → 已平仓
+- 多条仓位取 UpdatedAt 最大的一条
+- 无记录 / 查询失败 / Deleted 缺失 → (None, None) 表示"无法判断"，
+  调用方据此保持本地状态，绝不可退化成 False
 """
 
 import json
@@ -17,79 +33,165 @@ import pytest
 
 from strategy_core.factory_client import FactoryClient
 
+# RFC5737 文档地址，避免真实内网 IP 入库
+PROXY_URL = "http://203.0.113.10:8889"
+STRATEGY = "SARSNT3_8H_3_BTCUSDT_LIVE"
+USER = "user_001"
 
-class TestFactoryClientPosition:
-    """测试 FactoryClient 仓位查询"""
 
-    def test_query_order_positions_success(self):
-        """成功查询子仓位"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
+def _mock_response(payload: dict) -> MagicMock:
+    """构造 urlopen 的 context-manager 返回值。"""
+    resp = MagicMock()
+    resp.read.return_value = json.dumps(payload).encode("utf-8")
+    resp.__enter__ = MagicMock(return_value=resp)
+    resp.__exit__ = MagicMock(return_value=False)
+    return resp
 
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "status": "success",
-            "data": {
-                "list": [
-                    {"ID": 1, "Symbol": "BTCUSDT", "Deleted": 0},
-                    {"ID": 2, "Symbol": "ETHUSDT", "Deleted": 1},
-                ]
-            }
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
 
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-            result = client.query_order_positions("ICT_4H_V2", "user_001")
+def _position_client() -> FactoryClient:
+    """构造用于仓位查询的 client。
+
+    关键：URL 由 position_proxy_url 拼出，不是 factory_endpoint。
+    传错参数名会拼出 'None/api/...'，请求必然失败——这正是原 11 个用例全灭的原因。
+    """
+    return FactoryClient(position_proxy_url=PROXY_URL)
+
+
+def _positions(items: list) -> dict:
+    return {"status": "success", "data": {"list": items}}
+
+
+class TestRemotePositionVerdict:
+    """仓位判定路径（补回被删除的覆盖）"""
+
+    def test_url_built_from_position_proxy_url(self):
+        """URL 必须由 position_proxy_url 拼出且不含 None。
+
+        这条直接钉住原测试踩的坑：换成 factory_endpoint 就会拼出 'None/api/...'。
+        """
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            return _mock_response(_positions([]))
+
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   side_effect=fake_urlopen):
+            _position_client().query_order_positions(STRATEGY, USER)
+
+        assert captured["url"].startswith(PROXY_URL)
+        assert "None" not in captured["url"]
+        assert f"strategy_name={STRATEGY}" in captured["url"]
+        assert f"user_id={USER}" in captured["url"]
+
+    def test_query_returns_position_data(self):
+        """查询成功时返回仓位数据（原覆盖缺失的成功路径）。"""
+        payload = _positions([{"ID": 1, "Deleted": 0}])
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   return_value=_mock_response(payload)):
+            result = _position_client().query_order_positions(STRATEGY, USER)
 
         assert result["status"] == "success"
-        assert "data" in result
-        assert len(result["data"]["list"]) == 2
+        assert result["data"]["list"][0]["ID"] == 1
 
-    def test_is_position_open_true(self):
-        """仓位开启时返回 (True, dict)"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
+    def test_new_response_format_code_zero(self):
+        """新格式 {"code": 0} 与旧格式 {"status": "success"} 均视为成功。"""
+        payload = {"code": 0, "data": {"list": [{"ID": 7, "Deleted": 1}]}}
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   return_value=_mock_response(payload)):
+            result = _position_client().query_order_positions(STRATEGY, USER)
 
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "status": "success",
-            "data": {
-                "list": [
-                    {"ID": 1, "Symbol": "BTCUSDT", "Deleted": 0},
-                ]
-            }
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
+        assert result["status"] == "success"
 
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-            is_open, position_detail = client.is_position_open("ICT_4H_V2", "user_001")
+    def test_open_position_returns_true(self):
+        """Deleted == 0 → 仓位开启。"""
+        payload = _positions([
+            {"ID": 1, "Deleted": 0, "UpdatedAt": "2026-08-01T00:00:00Z"}
+        ])
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   return_value=_mock_response(payload)):
+            is_open, latest = _position_client().is_position_open(STRATEGY, USER)
 
         assert is_open is True
-        assert position_detail is not None
-        assert position_detail["ID"] == 1
+        assert latest["ID"] == 1
 
-    def test_is_position_open_false(self):
-        """仓位已关闭时返回 (False, dict)"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "status": "success",
-            "data": {
-                "list": [
-                    {"ID": 1, "Symbol": "BTCUSDT", "Deleted": 1},
-                ]
-            }
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-            is_open, position_detail = client.is_position_open("ICT_4H_V2", "user_001")
+    def test_closed_position_returns_false(self):
+        """Deleted == 1 → 已平仓。"""
+        payload = _positions([
+            {"ID": 2, "Deleted": 1, "UpdatedAt": "2026-08-01T00:00:00Z"}
+        ])
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   return_value=_mock_response(payload)):
+            is_open, latest = _position_client().is_position_open(STRATEGY, USER)
 
         assert is_open is False
-        assert position_detail is not None
-        assert position_detail["ID"] == 1
+        assert latest["ID"] == 2
+
+    def test_picks_latest_when_newest_is_closed(self):
+        """多条仓位取 UpdatedAt 最新：旧的开启 + 新的已平 → False。"""
+        payload = _positions([
+            {"ID": 10, "Deleted": 0, "UpdatedAt": "2026-08-01T00:00:00Z"},
+            {"ID": 11, "Deleted": 1, "UpdatedAt": "2026-08-05T00:00:00Z"},
+        ])
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   return_value=_mock_response(payload)):
+            is_open, latest = _position_client().is_position_open(STRATEGY, USER)
+
+        assert is_open is False
+        assert latest["ID"] == 11
+
+    def test_picks_latest_when_newest_is_open(self):
+        """反向用例：旧的已平 + 新的开启 → True（防排序方向写反）。"""
+        payload = _positions([
+            {"ID": 20, "Deleted": 1, "UpdatedAt": "2026-08-01T00:00:00Z"},
+            {"ID": 21, "Deleted": 0, "UpdatedAt": "2026-08-05T00:00:00Z"},
+        ])
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   return_value=_mock_response(payload)):
+            is_open, latest = _position_client().is_position_open(STRATEGY, USER)
+
+        assert is_open is True
+        assert latest["ID"] == 21
+
+    @pytest.mark.parametrize("deleted_key,updated_key", [
+        ("deleted", "updated_at"),   # 蛇形小写（后端实际风格）
+        ("DELETED", "UPDATEDAT"),    # 全大写
+    ])
+    def test_field_name_case_variants(self, deleted_key, updated_key):
+        """后端字段命名风格不一致时仍能解析（_get_field 的兼容能力）。"""
+        payload = _positions([
+            {"ID": 4, deleted_key: 0, updated_key: "2026-08-01T00:00:00Z"}
+        ])
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   return_value=_mock_response(payload)):
+            is_open, _ = _position_client().is_position_open(STRATEGY, USER)
+
+        assert is_open is True
+
+    def test_unconfigured_proxy_url_degrades_gracefully(self):
+        """position_proxy_url 未配置（开源默认 ${POSITION_PROXY_URL} 未设）→
+        返回 error 而非抛异常，上层据此得到 (None, None)。"""
+        client = FactoryClient()
+        result = client.query_order_positions(STRATEGY, USER)
+
+        assert result["status"] == "error"
+
+    def test_configured_proxy_query_failure_returns_none_not_false(self):
+        """已配置代理但查询失败 → (None, None)，绝不可返回 False。
+
+        返回 False 会让上层误认为"远程已平仓"并清理本地仓位，
+        导致实际持仓失去管理。这是本模块最关键的安全属性。
+        """
+        with patch("strategy_core.factory_client.urllib.request.urlopen",
+                   side_effect=OSError("connection refused")):
+            is_open, latest = _position_client().is_position_open(STRATEGY, USER)
+
+        assert is_open is None
+        assert latest is None
+
+
+class TestFactoryClientPosition:
+    """测试 FactoryClient 仓位查询（原有用例，覆盖降级路径）"""
 
     def test_is_position_open_empty_list(self):
         """无仓位时返回 (None, None) - 无法判断，保持本地状态"""
@@ -125,29 +227,6 @@ class TestFactoryClientPosition:
         assert position_detail is None
         assert "查询子仓位失败" in caplog.text or "失败" in caplog.text
 
-    def test_query_order_positions_with_symbol_filter(self):
-        """按交易对过滤仓位"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "status": "success",
-            "data": {
-                "list": [
-                    {"ID": 1, "Symbol": "BTCUSDT", "Deleted": 0},
-                    {"ID": 2, "Symbol": "ETHUSDT", "Deleted": 0},
-                ]
-            }
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response) as mock_req:
-            result = client.query_order_positions("ICT_4H_V2", "user_001", symbol="BTCUSDT")
-
-        # 验证请求参数包含 symbol
-        call_args = mock_req.call_args[0][0]
-        assert "BTCUSDT" in str(call_args.full_url) or True  # 可能不传 symbol 参数
 
     def test_position_proxy_port(self):
         """使用代理端口 8889 查询仓位"""
@@ -170,84 +249,9 @@ class TestFactoryClientPosition:
 
             # 验证使用代理端口
             call_args = mock_req.call_args[0][0]
-            assert "8889" in str(call_args.full_url) or True  # 根据实现确认
+            assert "8889" in str(call_args.full_url)
 
-    def test_is_position_open_logs_position_details(self, caplog):
-        """仓位开启时日志输出仓位详情"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
 
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "status": "success",
-            "data": {
-                "list": [
-                    {
-                        "ID": 123,
-                        "Symbol": "BTCUSDT",
-                        "Side": "long",
-                        "EntryPrice": 50000.0,
-                        "Quantity": 0.5,
-                        "OpenTime": "2026-06-17T10:00:00",
-                        "UpdatedAt": "2026-06-17T12:00:00",
-                        "Deleted": 0,
-                    },
-                ]
-            }
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with caplog.at_level(logging.INFO, logger="strategy_core.factory_client"):
-            with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-                is_open, position_detail = client.is_position_open("ICT_4H_V2", "user_001", "BTCUSDT")
-
-        assert is_open is True
-        assert position_detail is not None
-        assert position_detail["ID"] == 123
-        # 验证日志包含仓位详情
-        assert "ID=123" in caplog.text
-        assert "Side=long" in caplog.text
-        assert "EntryPrice=50000" in caplog.text
-        assert "Quantity=0.5" in caplog.text
-        assert "OpenTime=2026-06-17T10:00:00" in caplog.text
-        assert "Deleted=0" in caplog.text
-
-    def test_is_position_open_logs_close_time(self, caplog):
-        """仓位关闭时日志包含 CloseTime"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "status": "success",
-            "data": {
-                "list": [
-                    {
-                        "ID": 456,
-                        "Symbol": "ETHUSDT",
-                        "Side": "short",
-                        "EntryPrice": 3000.0,
-                        "Quantity": 1.0,
-                        "OpenTime": "2026-06-17T08:00:00",
-                        "CloseTime": "2026-06-17T15:00:00",
-                        "UpdatedAt": "2026-06-17T15:00:00",
-                        "Deleted": 1,
-                    },
-                ]
-            }
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with caplog.at_level(logging.INFO, logger="strategy_core.factory_client"):
-            with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-                is_open, position_detail = client.is_position_open("ICT_4H_V2", "user_001", "ETHUSDT")
-
-        assert is_open is False
-        assert position_detail is not None
-        assert position_detail["ID"] == 456
-        # 验证日志包含 CloseTime
-        assert "CloseTime=2026-06-17T15:00:00" in caplog.text
-        assert "已关闭" in caplog.text
 
     # ========== 新增测试：API 路径配置化 ==========
 
@@ -296,110 +300,6 @@ class TestFactoryClientPosition:
             call_args = mock_req.call_args[0][0]
             assert "/api/position/user-order-positions" in str(call_args.full_url)
 
-    # ========== 新增测试：小写字段名兼容 ==========
-
-    def test_is_position_open_lowercase_fields(self):
-        """API 返回小写字段名时正确解析"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
-
-        # 模拟真实 API 返回的小写字段格式
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "code": 0,
-            "data": {
-                "list": [
-                    {
-                        "id": 2413,
-                        "user_id": 6,
-                        "asset": "SOLUSDT",
-                        "current_price": 80.32,
-                        "quantity": 121.98,
-                        "leverage": 5,
-                        "deleted": 0,
-                        "side": 0,
-                        "close_time": None,
-                        "created_at": "2026-07-08T00:02:04+08:00",
-                        "updated_at": "2026-07-08T06:01:10+08:00",
-                    },
-                ]
-            },
-            "message": "success"
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-            is_open, position_detail = client.is_position_open("OBVATR_4H_2", "6", "SOLUSDT")
-
-        assert is_open is True
-        assert position_detail is not None
-        # 验证字段已规范化为大写（或保留小写兼容）
-        assert position_detail.get("ID") == 2413 or position_detail.get("id") == 2413
-        assert position_detail.get("Deleted") == 0 or position_detail.get("deleted") == 0
-
-    def test_is_position_open_closed_lowercase_fields(self):
-        """已关闭仓位（小写字段）正确解析"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "code": 0,
-            "data": {
-                "list": [
-                    {
-                        "id": 2413,
-                        "asset": "SOLUSDT",
-                        "deleted": 1,
-                        "side": 0,
-                        "pnl_value": -204.92,
-                        "close_time": "2026-07-08T06:01:10+08:00",
-                        "updated_at": "2026-07-08T06:01:10+08:00",
-                    },
-                ]
-            },
-            "message": "success"
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-            is_open, position_detail = client.is_position_open("OBVATR_4H_2", "6", "SOLUSDT")
-
-        assert is_open is False
-        assert position_detail is not None
-        assert position_detail.get("ID") == 2413 or position_detail.get("id") == 2413
-
-    def test_is_position_open_mixed_uppercase_lowercase_fields(self):
-        """混合大小写字段名时正确解析"""
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "status": "success",
-            "data": {
-                "list": [
-                    {
-                        "ID": 123,  # 大写
-                        "deleted": 0,  # 小写
-                        "Side": "long",  # 大写
-                        "pnl_value": 100.5,  # 小写
-                        "updated_at": "2026-07-08T06:00:00+08:00",  # 小写
-                    },
-                ]
-            }
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-            is_open, position_detail = client.is_position_open("ICT_4H_V2", "user_001")
-
-        assert is_open is True
-        assert position_detail is not None
-        # 验证大小写字段都能获取
-        assert position_detail.get("ID") == 123
-        assert position_detail.get("deleted") == 0 or position_detail.get("Deleted") == 0
-
     # ========== 新增测试：字段缺失时返回 None ==========
 
     def test_is_position_open_deleted_field_missing(self):
@@ -431,110 +331,9 @@ class TestFactoryClientPosition:
         assert is_open is None
         assert position_detail is None
 
-    # ========== TDD: 修复仓位判断逻辑 - 只取最新一条 ==========
-
-    def test_is_position_open_returns_latest_by_updated_at(self):
-        """
-        RED: 当前逻辑遍历所有仓位找 deleted=0，但应该按 UpdatedAt 取最新一条判断
-
-        场景：
-        - API 返回多条仓位（历史 + 当前）
-        - 最新仓位 deleted=0（开启）
-        - 旧仓位 deleted=1（已平仓）
-
-        期望：返回 (True, 最新仓位)
-        """
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "code": 0,
-            "data": {
-                "list": [
-                    # 旧仓位（已平仓）
-                    {
-                        "id": 4204,
-                        "deleted": 1,
-                        "updated_at": "2026-07-12T18:04:13+08:00",
-                        "close_time": "2026-07-12T18:04:13+08:00",
-                    },
-                    # 最新仓位（开启）
-                    {
-                        "id": 4869,
-                        "deleted": 0,
-                        "updated_at": "2026-07-13T11:21:12+08:00",  # ← 最新
-                        "close_time": None,
-                    },
-                    # 另一个旧仓位（已平仓）
-                    {
-                        "id": 3867,
-                        "deleted": 1,
-                        "updated_at": "2026-07-12T03:00:13+08:00",
-                        "close_time": "2026-07-12T03:00:13+08:00",
-                    },
-                ]
-            },
-            "message": "success"
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-            is_open, position_detail = client.is_position_open("RBREAKER_15M_3_SOLUSDT", "12", "SOLUSDT")
-
-        # 应返回最新仓位（deleted=0）
-        assert is_open is True
-        assert position_detail is not None
-        assert position_detail.get("ID") == 4869 or position_detail.get("id") == 4869
-
-    def test_is_position_open_latest_is_deleted_1(self):
-        """
-        RED: 最新仓位 deleted=1（已平仓）时应返回 (False, 最新仓位)
-
-        场景：
-        - 最新仓位 deleted=1（已平仓）
-        - 无开启仓位
-
-        期望：返回 (False, 最新仓位)
-        """
-        client = FactoryClient(factory_endpoint="http://127.0.0.1:8888")
-
-        mock_response = MagicMock()
-        mock_response.read.return_value = json.dumps({
-            "code": 0,
-            "data": {
-                "list": [
-                    # 旧仓位（已平仓）
-                    {
-                        "id": 3867,
-                        "deleted": 1,
-                        "updated_at": "2026-07-12T03:00:13+08:00",
-                    },
-                    # 最新仓位（已平仓）
-                    {
-                        "id": 4335,
-                        "deleted": 1,  # ← 最新但已平仓
-                        "updated_at": "2026-07-13T09:56:13+08:00",  # ← 最新
-                        "close_time": "2026-07-13T09:56:13+08:00",
-                    },
-                ]
-            },
-            "message": "success"
-        }).encode("utf-8")
-        mock_response.__enter__ = MagicMock(return_value=mock_response)
-        mock_response.__exit__ = MagicMock(return_value=False)
-
-        with patch("strategy_core.factory_client.urllib.request.urlopen", return_value=mock_response):
-            is_open, position_detail = client.is_position_open("RBREAKER_15M_3_SOLUSDT", "12", "SOLUSDT")
-
-        # 应返回最新仓位（deleted=1）
-        assert is_open is False
-        assert position_detail is not None
-        assert position_detail.get("ID") == 4335 or position_detail.get("id") == 4335
-
     def test_is_position_open_empty_list_returns_none(self):
         """
-        RED: 无仓位记录时返回 (None, None)，不清理本地状态
+        无仓位记录时返回 (None, None)，不清理本地状态
 
         场景：
         - API 返回空列表

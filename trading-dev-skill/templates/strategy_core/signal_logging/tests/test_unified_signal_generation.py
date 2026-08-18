@@ -1,4 +1,3 @@
-# NOTE: IP addresses in this test are mock values, not real endpoints
 #!/usr/bin/env python3
 """
 测试统一信号数据生成
@@ -97,7 +96,7 @@ class TestUnifiedSignalGeneration:
 
         cta = CtaSignalCSV.from_signal(signal, **params)
 
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
 
         with patch("strategy_core.signal_logging.http_sender.requests.post") as mock_post:
             mock_resp = MagicMock()

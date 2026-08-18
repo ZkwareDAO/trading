@@ -324,7 +324,7 @@ class StrategyEngine:
 
         # 使用 signal.strategy_id 作为策略名称（完整策略实例名，如 ICT_1D_3_BNBUSDT_LIVE）
         # 用于 CSV 文件路径，与 history_positions 目录结构一致
-        strategy_full_name = signal.strategy_id or entry.strategy_name or ''
+        strategy_full_name = signal.strategy_id or ''
 
         # 统一构建 CtaSignalCSV 参数
         # 从策略实例获取 trading_mode

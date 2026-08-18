@@ -8,6 +8,7 @@ Klines WebSocket 客户端模块
 import asyncio
 import json
 import logging
+import os
 from typing import Optional, Callable, List, Dict, Any
 
 import websockets
@@ -68,6 +69,11 @@ class KlinesWebSocketClient:
         # 任务
         self._receive_task: Optional[asyncio.Task] = None
 
+        # 首帧探测：connect() 后外部 probe 等待首个数据帧，
+        # 避免 probe 自己 recv() 与 _receive_loop 冲突。
+        # 事件循环可能跨重连变化，懒创建以保证绑定到当前 loop。
+        self._first_frame_event: Optional[asyncio.Event] = None
+
     def set_on_kline_callback(self, callback: Callable):
         """设置 K 线数据回调"""
         self._on_kline_callback = callback
@@ -76,16 +82,51 @@ class KlinesWebSocketClient:
         """设置重连成功回调"""
         self._on_reconnect_callback = callback
 
+    def _ensure_first_frame_event(self) -> asyncio.Event:
+        """懒创建首帧事件，绑定到当前运行的事件循环。"""
+        if self._first_frame_event is None:
+            self._first_frame_event = asyncio.Event()
+        return self._first_frame_event
+
+    def reset_first_frame_event(self) -> asyncio.Event:
+        """重置（清空）首帧事件并返回，供每次 connect 后的 probe 复用。"""
+        event = self._ensure_first_frame_event()
+        event.clear()
+        return event
+
+    async def wait_first_frame(self, timeout: float) -> bool:
+        """等待首个数据帧到达（由 _message_handler 置位）。
+
+        替代外部直接 _ws.recv() 探测，避免与 _receive_loop 的 recv 冲突。
+        """
+        event = self._ensure_first_frame_event()
+        try:
+            await asyncio.wait_for(event.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
     async def connect(self) -> bool:
         """连接到 WebSocket 服务"""
         try:
-            self._ws = await websockets.connect(
-                self.ws_url,
+            connect_kwargs = dict(
                 ping_interval=30,
                 ping_timeout=30,
                 close_timeout=10,
-                open_timeout=30
+                open_timeout=30,
             )
+            # Binance 公共 WS（wss://）走 HTTP 代理
+            if self.ws_url.startswith("wss://"):
+                proxy = (
+                    os.environ.get("HTTPS_PROXY")
+                    or os.environ.get("https_proxy")
+                    or os.environ.get("HTTP_PROXY")
+                    or os.environ.get("http_proxy")
+                )
+                if proxy:
+                    connect_kwargs["proxy"] = proxy
+                    logger.info(f"WebSocket 通过代理连接：{proxy}")
+            self._ws = await websockets.connect(self.ws_url, **connect_kwargs)
             self._connected = True
             self._running = True
             self._reconnect_count = 0
@@ -174,9 +215,11 @@ class KlinesWebSocketClient:
     async def _receive_loop(self):
         """接收消息循环"""
         assert self._ws is not None
+        logger.debug(f"[WS-RECV] receive_loop 启动，等待消息 (binance_mode={getattr(self, '_binance_mode', False)})")
         try:
             async for message in self._ws:
                 try:
+                    logger.debug(f"[WS-RAW] {message[:200]}")
                     data = json.loads(message)
                     await self._message_handler(data)
                 except json.JSONDecodeError as e:
@@ -191,6 +234,17 @@ class KlinesWebSocketClient:
 
     async def _message_handler(self, data: Dict[str, Any]):
         """消息处理器"""
+        # 首帧到达，唤醒可能正在 probe 的协程
+        if self._first_frame_event is not None and not self._first_frame_event.is_set():
+            self._first_frame_event.set()
+
+        # Binance combined-stream 回退协议：{"stream":"...","data":{"e":"kline","k":{...}}}
+        if getattr(self, "_binance_mode", False):
+            kline = self._parse_binance_kline(data)
+            if kline is not None and self._on_kline_callback:
+                await self._call_callback(self._on_kline_callback, kline)
+            return
+
         msg_type = data.get('type', '')
 
         if msg_type == 'kline':
@@ -199,6 +253,37 @@ class KlinesWebSocketClient:
                 await self._call_callback(self._on_kline_callback, kline)
         else:
             logger.debug(f"收到未知消息类型：{msg_type}")
+
+    def _parse_binance_kline(self, data: Dict[str, Any]) -> Optional[Kline]:
+        """解析 Binance combined-stream kline 消息"""
+        try:
+            payload = data.get("data", data)
+            if payload.get("e") != "kline":
+                return None
+            k = payload.get("k", {})
+            symbol = k.get("s", "")
+            interval = k.get("i", "1m")
+            # Binance kline 字段：t=open_time, o/h/l/c, v, T=close_time, q, n, V, Q, x=is_closed
+            raw = [
+                k.get("t"),
+                k.get("o"),
+                k.get("h"),
+                k.get("l"),
+                k.get("c"),
+                k.get("v"),
+                k.get("T"),
+                k.get("q"),
+                k.get("n"),
+                k.get("V"),
+                k.get("Q"),
+                "0",
+            ]
+            kline = Kline.from_binance_format(raw, symbol, interval)
+            kline.is_final = bool(k.get("x", False))
+            return kline
+        except Exception as e:
+            logger.warning(f"Binance kline 解析失败: {e}")
+            return None
 
     def _parse_kline_data(self, data: Dict[str, Any]) -> Kline:
         """解析 K 线数据"""
@@ -265,8 +350,8 @@ class KlinesWebSocketClient:
                 await asyncio.sleep(wait_time)
 
                 if await self.connect():
-                    # 重连成功后重新订阅
-                    if self.symbols:
+                    # 重连成功后重新订阅（Binance 回退模式 streams 在 URL 里，无需 subscribe）
+                    if self.symbols and not getattr(self, "_binance_mode", False):
                         await self.subscribe(self.symbols)
                     # 通知重连回调
                     if self._on_reconnect_callback:

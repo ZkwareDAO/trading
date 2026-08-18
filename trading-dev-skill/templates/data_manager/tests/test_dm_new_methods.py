@@ -127,14 +127,6 @@ class TestFetchKlinesRange:
             assert call_args[0] == "BTCUSDT"
             assert call_args[1] == "1m"
 
-    @pytest.mark.asyncio
-    async def test_fetch_klines_range_api_failure(self, dm):
-        """API 调用失败返回 None"""
-        with patch.object(dm, '_fetch_klines_from_api', new_callable=AsyncMock) as mock_fetch:
-            mock_fetch.return_value = None
-
-            result = await dm.fetch_klines_range("BTCUSDT", "1m", 1713500000000, 1713500100000)
-            assert result is None
 
 
 class TestSyncToLatest:

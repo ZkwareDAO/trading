@@ -2,7 +2,7 @@
 """
 测试信号格式对齐设计文档
 
-根据项目设计文档（策略信号.md）
+根据信号格式规范：docs/SIGNAL_CSV_FORMAT.md
 
 需要验证的格式差异:
 1. 顶层 strategy_type 字段 (如 "CTAFuture")

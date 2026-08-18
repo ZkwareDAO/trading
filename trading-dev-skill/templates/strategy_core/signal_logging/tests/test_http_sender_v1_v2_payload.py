@@ -1,4 +1,3 @@
-# NOTE: IP addresses in this test are mock values, not real endpoints
 #!/usr/bin/env python3
 """
 测试 HTTP 信号发送器支持 V1/V2 不同 payload 格式
@@ -28,7 +27,7 @@ class TestApiVersionExtraction:
     def test_extract_v1_from_path(self):
         """从 /api/v1/kafka/message 提取版本 1"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v1/kafka/message",
         )
         assert sender._extract_api_version() == 1
@@ -36,7 +35,7 @@ class TestApiVersionExtraction:
     def test_extract_v2_from_path(self):
         """从 /api/v2/signals 提取版本 2"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v2/signals",
         )
         assert sender._extract_api_version() == 2
@@ -44,7 +43,7 @@ class TestApiVersionExtraction:
     def test_extract_v3_from_path(self):
         """从 /api/v3/signals 提取版本 3"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v3/signals",
         )
         assert sender._extract_api_version() == 3
@@ -52,7 +51,7 @@ class TestApiVersionExtraction:
     def test_default_version_when_no_version_in_path(self):
         """无版本号时默认返回 1"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/kafka/message",
         )
         assert sender._extract_api_version() == 1
@@ -60,7 +59,7 @@ class TestApiVersionExtraction:
     def test_default_version_when_empty_path(self):
         """空路径时默认返回 1"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="",
         )
         assert sender._extract_api_version() == 1
@@ -84,7 +83,7 @@ class TestV1PayloadFormat:
     def test_v1_payload_wraps_topic_and_message(self, caplog):
         """V1 格式应包装为 {"topic": ..., "message": ...}"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v1/kafka/message",
         )
 
@@ -118,7 +117,7 @@ class TestV1PayloadFormat:
     def test_v1_send_cta_signal_wraps_correctly(self, caplog):
         """V1 格式 send_cta_signal 也应包装"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v1/kafka/message",
         )
 
@@ -165,7 +164,7 @@ class TestV2PayloadFormat:
     def test_v2_payload_is_direct_to_json(self, caplog):
         """V2 格式应直接使用 cta_signal.to_json()，不包装"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v2/signals",
         )
 
@@ -202,7 +201,7 @@ class TestV2PayloadFormat:
     def test_v2_send_cta_signal_is_direct(self, caplog):
         """V2 格式 send_cta_signal 也应直接序列化"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v2/signals",
         )
 
@@ -238,7 +237,7 @@ class TestV2PayloadFormat:
     def test_v3_payload_same_as_v2(self, caplog):
         """V3 格式与 V2 相同（直接 to_json）"""
         sender = HttpSignalSender(
-            base_url="http://127.0.0.1:18888",
+            base_url="http://203.0.113.23:18888",
             api_path="/api/v3/signals",
         )
 
@@ -279,7 +278,7 @@ class TestBackwardCompatibility:
 
     def test_default_api_path_uses_v1_format(self, caplog):
         """默认 api_path 应使用 V1 格式（向后兼容）"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
         # 默认 api_path 是 /api/v1/kafka/message
 
         signal = self._make_signal()
@@ -307,7 +306,7 @@ class TestPayloadBuilderMethods:
 
     def test_build_v1_payload_structure(self):
         """_build_v1_payload 应返回正确包装结构"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
 
         topic = "test_topic"
         message = '{"SignalID": "test_001"}'
@@ -320,7 +319,7 @@ class TestPayloadBuilderMethods:
 
     def test_build_v2_payload_structure(self):
         """_build_v2_payload 应直接序列化 to_json"""
-        sender = HttpSignalSender(base_url="http://127.0.0.1:18888")
+        sender = HttpSignalSender(base_url="http://203.0.113.23:18888")
 
         signal = Signal(
             signal_id="test_build_v2_001",

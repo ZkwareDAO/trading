@@ -580,7 +580,7 @@ $PYTHON_CMD analyze_strategies.py \
   Source: discovery
   Path:   ./strategies
   Range:  20260601 ~ 20260701
-  Data:   ./data/strategies/1m
+  Data:   ./data/klines
 
 [READY]   ema_rsi
   Config: /path/to/strategies/ema_rsi/overrides/BTCUSDT.yaml
@@ -799,7 +799,7 @@ REPORT_FILE="${DISCOVERY_OUTPUTS_DIR}/discovery-report-${START_DATE}-${END_DATE}
 ```bash
 # ===== 必需配置 =====
 DATA_PATH=./data
-KLINE_DATA_DIR=./data/strategies/1m
+KLINE_DATA_DIR=./data/klines
 STRATEGIES_DIR=./strategies
 DISCOVERY_OUTPUTS_DIR=./discovery_outputs
 LOGS_DIR=./logs

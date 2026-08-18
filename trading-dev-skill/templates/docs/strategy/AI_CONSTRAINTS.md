@@ -15,13 +15,13 @@
 | 5 | 禁止在回测模式启用 K 线冷却 | 会导致回测信号缺失 |
 | 6 | 禁止使用 `datetime.now()` 判断止损日冷却 | 回测时应使用 K 线时间 |
 | 7 | 禁止移动止盈记录止损日期 | 非止损，次日应可开仓 |
-| 8 | 禁止在 Strategy 类中计算技术指标 | 所有指标应在 Core.analyze() 内使用已闭合 K 线计算 |
-| 9 | 禁止外部数据注入方法 | 避免在 on_start() 等方法中预计算指标 |
-| 10 | 禁止依赖外部传入的指标值 | 指标应从 klines_data 参数计算 |
-| 11 | 禁止自定义止损计数字段 | 使用 BaseState 提供的 `stop_loss_date` |
-| 12 | 禁止直接使用原始 K 线入场判断 | 多周期策略必须对每个时间框架调用 `get_closed_data()` |
-| 13 | 禁止数组/字典字段使用可变默认值 | 必须使用 `field(default_factory=list)` 或 `field(default_factory=dict)` |
-| 14 | 禁止缓存字段持久化 | 缓存字段不应在 to_persist_dict() 中保存 |
+| **8** | **禁止在 Strategy 类中计算技术指标** | 所有指标应在 Core.analyze() 内使用已闭合 K 线计算 |
+| **9** | **禁止外部数据注入方法** | 避免在 on_start() 等方法中预计算指标 |
+| **10** | **禁止依赖外部传入的指标值** | 指标应从 klines_data 参数计算 |
+| **11** | **禁止自定义止损计数字段** | 使用 BaseState 提供的 `stop_loss_date` |
+| **12** | **禁止直接使用原始 K 线入场判断** | 多周期策略必须对每个时间框架调用 `get_closed_data()` |
+| **13** | **禁止数组/字典字段使用可变默认值** | 必须使用 `field(default_factory=list)` 或 `field(default_factory=dict)` |
+| **14** | **禁止缓存字段持久化** | 缓存字段不应在 to_persist_dict() 中保存 |
 
 ---
 
@@ -36,10 +36,10 @@
 | 5 | 必须检查数据是否足够 | `analyze()` 开头 |
 | 6 | 必须实现 K 线冷却 | Strategy 类（BaseStrategy 已实现） |
 | 7 | 止损时必须调用 `clear_position(record_stop_loss=True)` | Core 类 `_close()` 方法 |
-| 8 | 必须在 `analyze()` 内计算所有技术指标 | Core 类 `analyze()` |
-| 9 | 必须对每个时间框架调用 `get_closed_data()` | Core 类 `analyze()` |
-| 10 | 必须在 config.yaml 配置 `*_timeframes` | 配置文件 |
-| 11 | 数组/字典字段必须使用 `field(default_factory=...)` | State 类 |
+| **8** | **必须在 `analyze()` 内计算所有技术指标** | Core 类 `analyze()` |
+| **9** | **必须对每个时间框架调用 `get_closed_data()`** | Core 类 `analyze()` |
+| **10** | **必须在 config.yaml 配置 `*_timeframes`** | 配置文件 |
+| **11** | **数组/字典字段必须使用 `field(default_factory=...)`** | State 类 |
 
 ---
 
@@ -98,6 +98,6 @@ if indicator.isna().iloc[-1]:
 
 ### K 线冷却
 
-K 线冷却由基类自动处理：
+新架构无需手动编写，基类已自动处理：
 - 同一根大周期 K 线不重复触发
 - 回测模式自动跳过冷却

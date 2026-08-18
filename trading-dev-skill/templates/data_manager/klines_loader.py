@@ -217,9 +217,8 @@ def load_klines_data(
     返回:
         合并后的 DataFrame
     """
-    data_path = os.getenv(
-        "DATA_PATH", "./data"
-    )
+    # 默认相对路径，避免把开发机绝对路径写进代码；可用 DATA_PATH 环境变量覆盖
+    data_path = os.getenv("DATA_PATH", "./data")
 
     # 确定日期范围
     if date_number is not None:

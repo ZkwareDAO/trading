@@ -113,23 +113,8 @@ class TestBaseStrategy:
         }
         return MockStrategy(data_manager=mock_data_manager, config=config)
 
-    def test_strategy_name_single_symbol(self, strategy):
-        """测试单标策略名称"""
-        assert strategy.strategy_name == "MOCK_1H_1_BTCUSDT"
 
-    def test_strategy_name_multi_symbols(self, mock_data_manager):
-        """测试多标的策略名称"""
-        config = {
-            "version": "2",
-            "symbols": ["BTCUSDT", "ETHUSDT"],
-            "timeframes": ["1h"],
-        }
-        strategy = MockStrategy(data_manager=mock_data_manager, config=config)
-        assert strategy.strategy_name == "MOCK_1H_2"
 
-    def test_strategy_name_for(self, strategy):
-        """测试指定标的策略名称"""
-        assert strategy.strategy_name_for("ETHUSDT") == "MOCK_1H_1_ETHUSDT"
 
     def test_subscribed_symbols(self, strategy):
         """测试订阅标的集合"""
