@@ -85,20 +85,27 @@ trading-discovery-skill/
 ├── SKILL.md                 # Skill 定义
 ├── INSTALL.md               # 本文件
 └── templates/               # 模板文件
-    ├── discover.sh          # Discovery 回测脚本
-    ├── analyze_strategies.py
-    ├── calc_data_requirements.py
-    ├── generate_report.py
-    ├── strategy_analyzer.py
-    ├── config.example.yaml  # 全局配置模板
+    ├── fetch_strategies.py  # 策略代码获取（git clone / pull）
+    ├── discovery.py         # 回测执行（遍历策略目录调 wrapper）
+    ├── download_data.py     # Binance 1m K线下载
+    ├── init_overrides.py    # per-symbol 配置兜底
+    ├── config.example.yaml  # 策略登记表模板（git_url）
+    ├── backtest.example.yaml # 回测 run-profile 模板
     └── .env.example         # 环境变量模板
 ```
 
 ## 使用流程
 
 ```
-/trading-discovery run --symbols BTCUSDT,ETHUSDT --strategies ema_rsi,ict_v4 --start 20260601 --end 20260701
-/trading-discovery run --all-strategies --symbols BTCUSDT --start 20260101
+# 1. 首次：填 config.yaml（策略目录名 + git_url）
+cp templates/config.example.yaml config.yaml
+
+# 2. 拉取策略代码
+python3 templates/fetch_strategies.py --config config.yaml --strategies-dir .
+
+# 3. 回测探索
+python3 templates/discovery.py --start 20260601 --end 20260801
+python3 templates/discovery.py --start 20260601 --strategies sar_snt
 ```
 
 详细流程见 SKILL.md。

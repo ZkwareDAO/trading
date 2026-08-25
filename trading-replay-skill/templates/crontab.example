@@ -11,8 +11,8 @@
 
 # ===== 每日回放回测 =====
 # 00:30 执行，对当日 snapshot 执行回测
-30 0 * * * cd /path/to/replay && bash replay.sh --date $(date +\%Y\%m\%d) >> logs/cron-replay.log 2>&1
+30 0 * * * cd /path/to/replay && python3 replay.py --date $(date +\%Y\%m\%d) >> logs/cron-replay.log 2>&1
 
 # ===== 一键完整流程（替代上面两步） =====
 # 00:15 执行备份+回测
-# 15 0 * * * cd /path/to/replay && python3 sync-exee.py --date $(date +\%Y\%m\%d) && bash replay.sh --date $(date +\%Y\%m\%d) >> logs/cron-full.log 2>&1
+# 15 0 * * * cd /path/to/replay && python3 sync-exee.py --date $(date +\%Y\%m\%d) && python3 replay.py --date $(date +\%Y\%m\%d) >> logs/cron-full.log 2>&1

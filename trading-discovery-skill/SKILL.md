@@ -1,928 +1,260 @@
 ---
 name: trading-discovery
-description: 指定代币/策略/时间范围的回测探索 skill。支持 git pull 拉取策略 → 代币确认 → K线需求计算 → 多代币×多策略×自定义时间范围组合回测 → 后台执行，输出对比报告。
+description: 指定代币/策略/时间范围的回测探索 skill。自然语言触发 → 初始化检查 → git clone 拉取策略 → 配置校验 → 批量回测 → 结果通知。
 origin: trading
 ---
 
 # Trading Discovery — 指定代币/策略/时间范围的回测探索
 
-输入代币列表 + 策略列表 + 时间范围 → 组合回测 → 输出对比报告，一条链路闭环。
+AI Skill 自动化回测工作流：自然语言触发 → 初始化检查 → 首次环境准备 → 信息确认与代码获取 → 配置校验 → 回测执行 → 结果通知。
 
-**核心行为**：灵活指定回测维度，探索策略在不同代币和时间范围下的表现。
-
-**首要原则：无参数或参数不全时，必须一步一步引导用户，不要报错让用户自己补命令。**
+**首要原则**：参数不全或环境未就绪时，逐步引导用户补齐，不报错甩给用户。
 
 ## When to Activate
 
-- 用户执行 `/trading-discovery`（无参数）→ **进入交互式引导**
-- 用户执行 `/trading-discovery run --symbols BTCUSDT,ETHUSDT --strategies ema_rsi,ict_v4 --start 20260601 --end 20260701`（参数齐全）→ 跳过引导，直接 Phase 0
-- 用户执行 `/trading-discovery run --symbols BTCUSDT --start 20260601`（缺 strategies）→ **进入引导，只补缺失项**
-- 用户说"探索回测"、"对比策略"、"多代币回测"
+- 用户说「探索回测」「对比策略」「多代币回测」
 - 用户想看某个策略在不同代币或时间范围下的表现对比
+- 用户执行 `/trading-discovery`
 
-## Commands
+## 触发输入
 
-| 命令 | 说明 |
+用户用自然语言发起回测探索指令即可，例如：
+
+- 「探索回测 sar_snt，代币 BTCUSDT ETHUSDT，从 6 月到现在」
+- 「对比 ema_rsi 和 ict_v4 在 BTCUSDT 上的表现」
+- 首次运行时给出 git 仓库地址 + 期望代币
+
+解析出策略来源、代币、时间范围后进入 Phase 1。
+
+---
+
+## 工作流总览
+
+```
+Phase 1   → 任务触发与初始化检查
+Phase 1.4 → 首次环境准备（仅首次/重置）
+Phase 2   → 信息确认与代码获取（git clone）
+Phase 3   → 配置校验与预处理（init_overrides 兜底）
+Phase 4   → 回测执行与结果通知
+```
+
+---
+
+## Phase 1: 任务触发与初始化检查
+
+### 1.1 用户自然语言输入
+
+用户通过自然语言向 AI Skill 发起 discovery（回测探索）指令。输入通常包含：策略来源（git 仓库地址）、期望回测代币、时间范围。
+
+### 1.2 触发词检测
+
+系统识别输入中的触发词（`@skill`、`/trading-discovery`，或「探索回测」「对比策略」「多代币回测」等关键词）后激活本 skill。
+
+### 1.3 初始化 SKILL 模板检查
+
+系统解析指令后，检查 SKILL 模板是否已就绪。
+
+**判断逻辑**：确认 `trading-discovery-skill/templates/` 下脚本与配置模板是否齐全（`fetch_strategies.py`、`discovery.py`、`download_data.py`、`init_overrides.py`、`config.example.yaml`、`backtest.example.yaml`、`.env.example`），以及工作目录是否已有用户配置（`config.yaml` 存在且至少有一个已 clone 的策略目录）。
+
+| 判断 | 流向 |
 |------|------|
-| `/trading-discovery` | 无参数 → 进入交互式引导，一步一步收集参数 |
-| `/trading-discovery run --symbols S1,S2 --strategies ST1,ST2 --start DATE --end DATE` | 指定代币×策略×时间范围回测 |
-| `/trading-discovery run --all-strategies --symbols S1,S2 --start DATE` | 所有策略×指定代币回测 |
-| `/trading-discovery run --symbols S1 --all-timeframes --start DATE --end DATE` | 指定代币×所有时间框架回测 |
-| `/trading-discovery run --strategies ST1 --start DATE` | 不指定 symbols，从策略配置读取 |
-| `/trading-discovery run --symbols S1 --strategies ST1 --start DATE --skip-analysis` | 跳过策略分析阶段 |
-| `/trading-discovery run --symbols S1 --strategies ST1 --start DATE --init-configs` | 为缺 overrides 的代币自动创建配置（Phase 0.55） |
-| `/trading-discovery run --background` | 后台执行回测（nohup + &） |
-| `/trading-discovery compare --date YYYYMMDD` | 查看指定日期的 discovery 结果对比 |
-| `/trading-discovery report --date YYYYMMDD` | 生成 discovery 对比报告 |
-
-### 时间格式
-
-| 格式 | 示例 | 说明 |
-|------|------|------|
-| YYYYMMDD | `20260601` | 日期字符串 |
-| Unix 时间戳 | `1748736000` | 秒级时间戳 |
-
-两种格式均支持，脚本自动识别。
+| 是（已初始化） | 跳过环境准备，直接进入 Phase 2.2 |
+| 否（未初始化） | 进入 Phase 1.4 进行首次环境准备 |
 
 ---
 
-## Phase -1: 交互式引导（无参数/参数不全时） ← NEW
+## Phase 1.4: 首次环境准备（仅限首次或重置）
 
-### 触发条件
+> 此阶段由 AI 主导完成基础环境搭建。仅当 Phase 1.3 判定未初始化时执行。
 
-进入引导的判定（满足任一即进入）：
+### 1.4.1 AI 分析必要内容
 
-| 条件 | 说明 |
+- **动作**：AI 分析用户自然语言输入，提取两类信息：
+  1. 策略来源：用户是否提供了策略仓库地址（git_url）
+  2. 期望代币：用户期望回测运行的代币（Token）清单
+
+若用户未提供，AI 逐步询问补齐（缺啥问啥，不报错）。
+
+### 1.4.2 记录策略仓库信息
+
+- **核心动作**：
+  1. 将解析出的策略及其 git 仓库地址记录在 `config.yaml` 中（顶层 key = 策略目录名，值含 `git_url`）。
+  2. 根据用户期望代币，生成该策略的清单文件 `strategies.yaml`（`strategies` 段，列出策略包名 + symbols）。
+
+完成后回到 Phase 1.3 复检，通过则进入 Phase 2。
+
+---
+
+## Phase 2: 信息确认与代码获取
+
+### 2.1 确认仓库与策略信息
+
+- **动作**：系统展示记录在 `config.yaml` 中的仓库信息和策略信息，供用户确认。
+
+**判断条件**：信息是否准确。
+
+| 判断 | 流向 |
 |------|------|
-| 无任何参数 | 用户只敲了 `/trading-discovery` 或 `/trading-discovery run` |
-| 缺 `--strategies` 且无 `--all-strategies` | 必需参数缺失 |
-| 缺 `--start` | 必需参数缺失 |
-| 缺 `--symbols` 且 `--skip-analysis` | 此时 symbols 必需（无分析阶段无法从配置读取） |
+| 否 | 用户介入，确认并修改 `config.yaml`，随后重新回到 2.1 确认 |
+| 是 | 信息确认无误，进入代码拉取阶段 |
 
-**不进入引导**（参数齐全直接走原流程）：
+### 2.2 确认并开始 Git Clone 代码
 
-- 有 `--all-strategies` + `--symbols` + `--start`
-- 或 `--strategies` + `--start`（symbols 可从配置读）
-
-### 引导核心原则
-
-1. **缺啥补啥**：用户已经给的参数跳过不问，只问缺失项
-2. **一步一问**：每次只问一个问题，给默认值 + 示例，用户答完再问下一个
-3. **每步可改**：用户随时能修改前面给过的值
-4. **不报错**：宁可多问一轮，也不要扔"参数不全，请补全命令"给用户
-5. **引导完汇总**：所有参数收齐后，输出完整回测计划让用户确认，确认后才进 Phase 0
-
-### 引导顺序
-
-引导按下面顺序逐步收集，已提供的参数跳过对应步骤：
-
-```
-Step 0: 先跑环境快速探测（策略目录是否有可用策略）
-        → 若无策略，先走 Phase 0.5 git pull 拉策略（这样后面能列出可用策略给用户选）
-        → 若有策略，直接进 Step 1
-       ↓
-Step 1: 问策略（--strategies 或 --all-strategies）
-        → 列出 STRATEGIES_DIR 下可用策略供选择
-        → 给默认：all
-       ↓
-Step 2: 问代币（--symbols）
-        → 若用户选了具体策略，从该策略配置读出默认 symbols 作为建议
-        → 给默认：留空（从策略配置读取）
-       ↓
-Step 3: 问开始时间（--start）  ← 必填，无默认
-        → 提示格式：YYYYMMDD 或 Unix 时间戳
-        → 给示例：20260601
-       ↓
-Step 4: 问结束时间（--end）
-        → 给默认：今天（当前日期）
-       ↓
-Step 5: 问可选参数（并行数/后台执行/跳过分析）
-        → 给默认：全用默认值，直接回车跳过
-       ↓
-Step 6: 汇总确认 → 输出完整回测计划，用户确认后进 Phase 0
-```
-
-### Step 0: 引导前的环境快速探测
-
-引导开始前先快速探测策略目录，目的是决定要不要先 git pull：
+- **动作**：用户确认后，直接调用 `fetch_strategies.py` 脚本，将远程策略代码仓库克隆/更新到本地。
 
 ```bash
-# 快速检查（不阻塞引导，只决定引导路径）
-STRATEGIES_DIR="${STRATEGIES_DIR:-./strategies}"
-if [ -d "$STRATEGIES_DIR" ] && [ "$(ls -1d "$STRATEGIES_DIR"/*/ 2>/dev/null | grep -v '\.git' | wc -l)" -gt 0 ]; then
-    GUIDE_MODE="strategies_ready"   # 策略已就绪，直接引导选策略
-else
-    GUIDE_MODE="need_git_pull"      # 需要先 git pull，走 Phase 0.5
-fi
+python3 fetch_strategies.py --config config.yaml --strategies-dir .
 ```
 
-- `need_git_pull`：先引导用户确认 git 地址 → 执行 Phase 0.5 拉策略 → 拉完列可用策略 → 进 Step 1
-- `strategies_ready`：直接列可用策略 → 进 Step 1
-
-### Step 1 话术模板：问策略
-
-```
-🧭 交互式引导 — 第 1 步（共 5 步）：选择策略
-
-可用策略（来自 ./strategies）：
-  1. ema_rsi      (3 configs)
-  2. ict_v4       (2 configs)
-  3. macd_cross   (1 config)
-
-请选择（输入编号、策略名、或逗号分隔多个；输入 all 选全部）：
-  > 1,2          ← 选 ema_rsi 和 ict_v4
-  > all           ← 等同 --all-strategies
-  > ema_rsi       ← 直接输策略名
-
-默认：all
-```
-
-**收集逻辑**：
-- 输入 `all` → `--all-strategies`
-- 输入编号 → 映射到策略名
-- 输入策略名 → 直接用
-- 多个用逗号分隔
-
-### Step 2 话术模板：问代币
-
-```
-🧭 交互式引导 — 第 2 步（共 5 步）：选择代币
-
-（若已选策略，从策略配置读出默认代币作为建议）
-ema_rsi 配置中的代币：BTCUSDT, ETHUSDT, SOLUSDT
-ict_v4 配置中的代币：BTCUSDT, ETHUSDT
-
-请输入要回测的代币（逗号分隔），或：
-  > BTCUSDT,ETHUSDT,SOLUSDT   ← 直接指定
-  > 留空回车                    ← 回测时从每个策略配置读取各自的代币
-  > +DOGEUSDT                  ← 在建议基础上追加 DOGEUSDT
-
-默认：留空（从策略配置读取）
-```
-
-### Step 3 话术模板：问开始时间（必填）
-
-```
-🧭 交互式引导 — 第 3 步（共 5 步）：开始时间（必填）
-
-格式：YYYYMMDD 或 Unix 时间戳（秒）
-
-示例：
-  > 20260601       ← 2026年6月1日
-  > 1748736000     ← Unix 时间戳
-
-请输入开始时间：
-```
-
-**校验**：输入后立即校验格式，不合法则重新问，不要报错退出。
-
-### Step 4 话术模板：问结束时间
-
-```
-🧭 交互式引导 — 第 4 步（共 5 步）：结束时间
-
-默认：今天（20260811）
-格式同开始时间（YYYYMMDD 或 Unix 时间戳）
-
-请输入结束时间（留空回车用今天）：
-```
-
-### Step 5 话术模板：问可选参数
-
-```
-🧭 交互式引导 — 第 5 步（共 5 步）：可选参数
-
-  并行回测数（--parallel，默认 1）：留空回车跳过
-  后台执行（--background，默认否）：留空回车跳过，输入 y 后台跑
-  跳过策略分析（--skip-analysis，默认否）：留空回车跳过
-
-全部用默认值？直接回车即可。
-```
-
-### Step 6 话术模板：汇总确认
-
-```
-📋 引导完成 — 回测计划确认
-
-  代币:    BTCUSDT, ETHUSDT, SOLUSDT
-  策略:    ema_rsi, ict_v4
-  时间:    20260601 - 20260811
-  并行:    1
-  后台:    否
-  分析:    启用
-
-回测组合 (6):
-  1. ema_rsi × BTCUSDT
-  2. ema_rsi × ETHUSDT
-  3. ema_rsi × SOLUSDT
-  4. ict_v4 × BTCUSDT
-  5. ict_v4 × ETHUSDT
-  6. ict_v4 × SOLUSDT
-
-确认执行？
-  > y / 回车   ← 进 Phase 0 正式预检 + 回测
-  > n          ← 取消
-  > 改 XX      ← 修改某项，如 "改 时间" 回到 Step 4 重问
-```
-
-### 引导收尾
-
-用户确认后：
-1. 把引导收集到的参数组装成等效命令行（内部使用，不必展示给用户）
-2. **进入 Phase 0 正式预检**（引导前的 Step 0 只是快速探测，Phase 0 才是完整阻塞判定）
-
-### 引导 vs 原流程对照
-
-| 场景 | 旧行为 | 新行为（方案 B） |
-|------|--------|----------------|
-| `/trading-discovery` 无参数 | 报错让用户补 run 命令 | 进引导，逐步问 5 步 |
-| 只给 `--symbols` | 报错缺 strategies | 进引导，只问 strategies/start/end |
-| 只给 `--start` | 报错缺 strategies/symbols | 进引导，只问 strategies/symbols |
-| 参数齐全 | 直接 Phase 0 | 跳过引导，直接 Phase 0（不变） |
+脚本对每个策略自适应：目录已存在且含 `.git` → `git pull`；目录不存在 → `git clone`；`git_url` 为空 → 告警跳过。
 
 ---
 
-## Phase 0: 环境预检
+## Phase 3: 配置校验与预处理
 
-### Step 0: 检查运行环境
+### 3.1 结合 strategies.yaml 输出配置
 
-```bash
-# 1. 探测 Python（模板依赖在 .venv，很多环境没有 python3 这个名字）
-PROJECT_DIR="${PROJECT_DIR:-.}"
-if [ -z "${PYTHON_CMD:-}" ]; then
-    if [ -x "${PROJECT_DIR}/.venv/bin/python" ]; then
-        PYTHON_CMD="${PROJECT_DIR}/.venv/bin/python"
-    elif command -v python3 &>/dev/null; then
-        PYTHON_CMD="python3"
-    else
-        PYTHON_CMD="python"
-    fi
-fi
-
-# 2. 检查回测入口（v3.7 批量 wrapper + 其后的 Python 模块）
-if [ ! -f "$PROJECT_DIR/scripts/run_backtest_batch.sh" ]; then
-    echo "❌ 缺少 scripts/run_backtest_batch.sh（阻塞项，需模板 v3.7+）"
-elif (cd "$PROJECT_DIR" && $PYTHON_CMD -m backtest.batch_runner --help) &>/dev/null; then
-    echo "✅ 回测引擎可用"
-else
-    echo "❌ 回测引擎不可用（阻塞项）"
-fi
-
-# 3. 检查 K 线数据
-#    必须与项目 config/settings.yaml 的 data_manager.csv_dir 一致，
-#    否则 run-profile 的 data_dir 校验不通过、回测启动即退出。
-KLINE_DIR="${KLINE_DATA_DIR:-./data/klines}"
-if [ -d "$KLINE_DIR" ] && [ -n "$(find "$KLINE_DIR" -name '*.csv' -print -quit 2>/dev/null)" ]; then
-    echo "✅ K 线数据就绪: $KLINE_DIR"
-else
-    echo "❌ K 线数据未就绪（阻塞项）"
-fi
-
-# 3. 检查策略目录
-STRATEGIES_DIR="${STRATEGIES_DIR:-./strategies}"
-if [ -d "$STRATEGIES_DIR" ]; then
-    strategy_count=$(ls -1d "$STRATEGIES_DIR"/*/ 2>/dev/null | wc -l)
-    echo "✅ 策略目录: $STRATEGIES_DIR (${strategy_count} strategies)"
-else
-    echo "❌ 策略目录不存在: $STRATEGIES_DIR"
-fi
-```
-
-**阻塞 vs 非阻塞**：
-
-| 检测项 | 不达标时 | 原因 |
-|--------|----------|------|
-| 回测引擎 | **阻塞** | 核心依赖 |
-| K 线数据 | **阻塞** | 核心依赖 |
-| 策略目录 | **阻塞** | 无策略无法回测 |
-
----
-
-## Phase 0.5: 策略代码获取（git pull） ← NEW
-
-### Step 1: 确认 git 仓库地址
-
-在回测前先拉取最新的策略代码。
-
-**读取 git 地址**（优先级）：
-1. 用户在命令中指定 `--git-url`
-2. 从 `config.yaml` 的 `strategies.git_url` 读取
-3. 从 `.env` 的 `STRATEGIES_GIT_URL` 读取
-4. 都没有 → 询问用户输入
+- **动作**：系统读取 `strategies.yaml`，遍历刚克隆的策略目录。
+- **详细逻辑**：
+  1. 检查每个策略目录下的路径 `(策略目录)/strategies/(策略名)/overrides`，确认是否存在所有必需的代币（Token）配置文件。
+  2. 容错机制：如果发现某个代币配置文件不存在，系统会自动调用 `init_overrides.py` 复制一份同策略已有的代币配置作为兜底。
 
 ```bash
-# 展示 git 地址供用户确认
-echo "📋 策略代码来源:"
-echo "  Git URL: ${STRATEGIES_GIT_URL}"
-echo "  本地路径: ${STRATEGIES_DIR:-./strategies}"
-echo ""
-echo "确认拉取？(y/n/修改地址: git@github.com:user/other.git)"
+python3 init_overrides.py \
+    --strategy-dir ./strategies/sar_snt/strategies/sar_snt \
+    --symbols BTCUSDT,ETHUSDT
 ```
 
-### Step 2: 执行 git clone / pull
+**注意路径层级**：`init_overrides.py` 的 `--strategy-dir` 指向含 `overrides/` 的那层 = `(策略目录)/strategies/(策略名)/`，不是 clone 顶层目录。
 
-```bash
-STRATEGIES_DIR="${STRATEGIES_DIR:-./strategies}"
+### 3.2 确认配置文件信息
 
-if [ -d "${STRATEGIES_DIR}/.git" ]; then
-    echo "📥 git pull..."
-    cd "$STRATEGIES_DIR" && git pull
-else
-    echo "📥 git clone ${STRATEGIES_GIT_URL} → ${STRATEGIES_DIR}"
-    git clone "$STRATEGIES_GIT_URL" "$STRATEGIES_DIR"
-fi
+- **判断条件**：系统检查生成的配置文件是否完整且符合运行要求。
 
-# 验证
-if [ $? -ne 0 ]; then
-    echo "❌ git 操作失败，请检查地址和权限"
-    exit 1
-fi
-
-echo "✅ 策略代码就绪: ${STRATEGIES_DIR}"
-```
-
-### Step 3: 列出可用策略
-
-```bash
-echo ""
-echo "📋 可用策略:"
-for d in "${STRATEGIES_DIR}"/*/; do
-    name=$(basename "$d")
-    [ "$name" = ".git" ] && continue
-    cfg_count=$(find "$d" -name "config*.yaml" -o -name "config/*.yaml" 2>/dev/null | wc -l)
-    echo "  - ${name} (${cfg_count} configs)"
-done
-```
-
----
-
-## Phase 0.55: per-symbol 配置初始化（init_overrides.py） ← NEW
-
-git pull 拉来的策略**未必有目标代币的配置**。v3.7 策略参数的唯一事实来源是
-`strategies/<name>/overrides/<SYMBOL>.yaml`，缺这一份则后续全部走不通：
-
-| 环节 | 缺 overrides 时的表现 |
-|------|----------------------|
-| Phase 0.7 K线需求计算 | 返回 `error: 未找到 per-symbol 配置`，算不出需要几天数据 |
-| Phase 1.5 策略分析 | 该 symbol 不在可回测集合内，被静默跳过 |
-| Phase 2 回测 | wrapper 的 `precheck_overrides` **拒绝整批**，一个都跑不了 |
-
-所以配置初始化必须排在 K线计算和策略分析**之前**。
-
-### Step 1: 检测缺哪些配置
-
-```bash
-# 目标代币来自用户 --symbols（或 Phase 0.6 的 +SYMBOL 增补）
-for strategy in $STRATEGIES; do
-    $PYTHON_CMD init_overrides.py \
-        --strategy-dir "${STRATEGIES_DIR}/${strategy}" \
-        --symbols "$SYMBOLS" \
-        --dry-run
-done
-```
-
-`--dry-run` 只报告将要做什么，不写盘。输出示例：
-
-```
-[dry-run] sar_snt3_v3
-  BTCUSDT: skip (已存在)
-  APTUSDT: copy from BTCUSDT.yaml
-```
-
-### Step 2: 创建配置
-
-模板来源按可信度排序，前者可用就不用后者：
-
-| 优先级 | 来源 | 说明 |
-|--------|------|------|
-| 1 | 同策略已有的 `overrides/<其它SYMBOL>.yaml` | **最可信**。结构完整（`capital`/`risk`/`signal`/`cooldown_timeframe`/`user_id` 全有），参数是调过的。复制它能保证新代币与老代币口径一致、回测可比 |
-| 2 | `strategies/<name>/.strategy-spec.yaml` 的 `default_params` | 由 trading-dev 脚手架生成。**只够拼骨架** |
-| 3 | 都没有 | 报错退出，不凭空编造参数值 |
-
-```bash
-$PYTHON_CMD init_overrides.py \
-    --strategy-dir "${STRATEGIES_DIR}/${strategy}" \
-    --symbols "$SYMBOLS"
-```
-
-**⚠ spec 骨架会"能跑但参数不对"**：`.strategy-spec.yaml` 只有
-`default_params`，实测缺 5 个 timeframe 类参数
-（`sar_timeframes`/`snt3_timeframes`/`adx_timeframes`/
-`sar_tracking_timeframe`/`cooldown_bars`），也没有 `capital`/`risk`/`signal`
-段，且值可能已与调优后的实际值漂移（实测 `adx_threshold` spec=20 / 实际=25，
-`stop_loss_pct` spec=1.5 / 实际=2.0）。
-
-缺失的参数会静默回落到策略代码里的 `p.get(key, default)`，**回测照样成功**——
-这才是危险处。同一区间实测对比：
-
-| 配置来源 | 交易数 | 夏普 |
-|----------|--------|------|
-| 调优后的真实 override | 9 | 1.93 |
-| spec 骨架 | 10 | **3.29** |
-
-骨架看起来"更好"，但那是另一套参数的结果。所以走 spec 路径时必须
-向用户明示需要复核，不能当作配置已就绪。
-
-### Step 3: 输出给用户确认参数
-
-创建后把新配置的关键参数展示给用户，询问是否需要调整：
-
-```
-✅ 已创建 1 份 per-symbol 配置
-
-  APTUSDT  ← 复制自 BTCUSDT.yaml
-  strategies/sar_snt3_v3/overrides/APTUSDT.yaml
-
-  timeframes:   8h
-  trading_mode: paper_trading   ← 强制安全值
-  params:
-    sar_step: 0.015
-    adx_threshold: 25
-    stop_loss_pct: 2.0
-    ...（共 16 项，与 BTCUSDT 一致）
-
-需要调整参数吗？
-  n / 回车  = 用当前参数继续回测
-  y         = 我列出全部参数供你逐项修改
-  直接说    = 如 "stop_loss_pct 改 3.0, adx_threshold 改 20"
-```
-
-用户要改时，直接编辑对应的 `overrides/<SYMBOL>.yaml`，改完复述最终值再继续。
-
-**⚠ 新建配置一律 `trading_mode: paper_trading`**：即使模板那份是 live。
-新代币未经回测验证就继承 live 会直接下真单。要上实盘必须由人显式改这一行，
-本工具不会替用户改。
-
-**已存在的配置默认不覆盖**（`--force` 才覆盖），避免抹掉用户调好的参数。
-
----
-
-## Phase 0.6: 代币配置确认
-
-### Step 1: 展示代币配置并等待确认
-
-策略分析完成后，输出代币配置摘要，让用户确认或调整。
-
-**交互流程**：
-
-```
-📋 策略代币配置确认
-
-ema_rsi (overrides/: 3 个代币):
-  Symbols:   BTCUSDT, ETHUSDT, SOLUSDT
-  Timeframes: 4h, 1h
-  Direction: neutral
-
-ict_v4 (overrides/: 2 个代币):
-  Symbols:   BTCUSDT, ETHUSDT
-  Timeframes: 1h
-  Direction: long
-
-是否需要调整代币配置？
-  n              = 使用以上配置继续
-  y              = 进入编辑模式
-  指定修改       = ema_rsi +DOGEUSDT -SOLUSDT, ict_v4 +BNBUSDT
-```
-
-**支持的操作**：
-
-| 语法 | 含义 |
+| 判断 | 流向 |
 |------|------|
-| `+SYMBOL` | 添加代币 |
-| `-SYMBOL` | 移除代币 |
-| `SYMBOL1=SYMBOL2` | 替换代币 |
-
-**`+SYMBOL` 增补的代币若没有 overrides，回到 Phase 0.55 为它建配置**，
-否则 Phase 2 的 `precheck_overrides` 会拒绝整批。
+| 否 | 用户介入，确认并修改配置文件，修复后重新回到 3.2 确认 |
+| 是 | 配置文件准备完毕，进入核心执行阶段 |
 
 ---
 
-## Phase 0.7: K线数据需求计算（calc_data_requirements.py） ← NEW
+## Phase 4: 回测执行与结果通知
 
-### Step 1: 计算策略所需的最小K线数据天数
+### 4.1 执行回测脚本
 
-根据策略配置中的技术指标参数，计算至少需要提前准备多少天 K 线数据。
+- **动作**：系统遍历所有准备好的策略目录，分别执行其中的 `run_backtest_batch.sh` 脚本。
+- **执行要求**：注意并发逻辑，系统需要控制同时运行的回测进程数量，防止资源耗尽。
+
+- **主要运行** `discovery.py`。
 
 ```bash
-for strategy in $STRATEGIES; do
-    $PYTHON_CMD calc_data_requirements.py \
-        --strategy-dir "${STRATEGIES_DIR}/${strategy}" \
-        --start "$START_DATE" \
-        --end "$END_DATE" \
-        --kline-data-dir "$KLINE_DATA_DIR"
-done
+python3 discovery.py --start 20260601 --end 20260801
 ```
 
-**输出示例**：
+**具体操作项**：
 
-```
-==============================================================
-  K线数据需求分析
-==============================================================
-  策略:       ema_rsi
-  配置:       ./strategies/ema_rsi/overrides/BTCUSDT.yaml
-  代币:       BTCUSDT, ETHUSDT, SOLUSDT
-  时间框架:   4h, 1h
-
-  最大指标周期: 200 根K线
-  最坏时间框架: 4h (240分钟/根)
-  最少需要K线:  200 根
-  最少数据天数: 34 天
-  建议准备天数: 41 天 (+20% 安全边际)
-
-  --- 本地K线数据状态 ---
-  BTCUSDT: ✅ 20260101 ~ 20260809
-  ETHUSDT: ✅ 20260101 ~ 20260809
-  SOLUSDT: ✅ 20260615 ~ 20260809
-
-  数据充足: ✅ 是
-  Gap: 数据充足
-==============================================================
-```
-
-**计算逻辑**：
-
-1. 从策略配置 `params` 中提取所有技术指标周期参数
-   - 识别关键字：`period`, `length`, `window`, `fast`, `slow`, `signal`, `ma`, `ema`, `atr`, `rsi` 等
-2. 取最大周期值 `max_period`
-3. 从 `timeframes` 中取最长时间框架
-   - 例如 `4h` = 240 分钟/根
-4. `最少数据天数 = ceil(max_period × 最坏timeframe分钟数 / 1440)`
-5. `建议准备天数 = 最少天数 × 1.2 + 1`（+20% 安全边际）
-
-**阻塞规则**：
-
-| 检查结果 | 行为 |
-|---------|------|
-| 数据充足 | 继续进入 Phase 1 |
-| 数据不足 | ⚠ 警告，给出缺少数天数和缺失 symbol 清单 |
-| 完全无数据 | ❌ 阻塞，需要先下载K线数据 |
+1. 遍历策略目录，从 `(策略目录)/config/strategies.yaml` 读取代币清单。
+2. 每个策略一份 `output_dir = discovery_outputs/{策略目录}/`。
+3. 在策略目录内执行其自带的 `scripts/run_backtest_batch.sh`，`--yes` 跳过交互确认。
+4. 并发由 `backtest.yaml` 的 `max_workers` 控制（写入 run-profile）。
 
 ---
 
-## Phase 1: 参数解析
+## 目录结构
 
-### Step 1: 解析输入参数
+```
+workspace/
+├── config.yaml                        ← 策略登记表（git_url，fetch_strategies 读）
+├── backtest.yaml                       ← 回测 run-profile（data_dir/output_dir/并发）
+├── sar_snt/                            ← 策略目录（git clone 目标，= config.yaml 顶层 key）
+│   ├── config/strategies.yaml          ← 代币清单（仓库自带，clone 后才有）
+│   ├── strategies/sar_snt/overrides/   ← per-symbol 配置（init_overrides 兜底）
+│   └── scripts/run_backtest_batch.sh    ← 批量回测 wrapper
+│
+├── data/klines/1m/                     ← K线数据（download_data.py 写入，回测读）
+│
+└── discovery_outputs/sar_snt/          ← 回测结果（discovery.py 写入）
+    └── ...
+```
 
-**必需参数**：
+**数据流转**：`config.yaml`（git_url）→ `fetch_strategies.py` clone → `strategies.yaml`（代币）→ `init_overrides.py` 兜底配置 → `run_backtest_batch.sh` 回测 → `discovery_outputs/`。
 
-| 参数 | 格式 | 说明 |
+---
+
+## config.yaml 结构
+
+```yaml
+sar_snt:                              # 顶层 key = 策略目录名 = git clone 目标 basename
+  git_url: git@github.com:user/sar_snt.git
+obv_atr:
+  git_url: https://github.com/user/obv_atr.git
+```
+
+| 字段 | 说明 |
+|------|------|
+| 顶层 key | 策略目录名，同时作为 git clone 目标文件夹名 |
+| `git_url` | 策略代码仓库地址（可空，空则跳过该策略） |
+
+---
+
+## backtest.yaml 结构
+
+```yaml
+start: "20260601"        # 回测时间范围（CLI --start/--end 可覆盖）
+end: ""
+cash: 5000               # 初始资金
+commission: 0.0004        # 手续费（币安合约 taker 0.04%）
+data_dir: "./data/klines"      # K线目录（必须与 settings.yaml csv_dir 一致）
+output_dir: "./discovery_outputs"   # 产物根（discovery.py 每策略覆盖为子目录）
+max_workers: 4           # 并发数
+```
+
+---
+
+## 脚本说明
+
+### fetch_strategies.py — 策略代码获取
+
+```bash
+python3 fetch_strategies.py [--config config.yaml] [--strategies-dir .] [--strategies sar_snt,obv_atr] [--no-list]
+```
+
+| 参数 | 默认 | 说明 |
 |------|------|------|
-| `--strategies` | 逗号分隔 或 `--all-strategies` | 策略列表 |
-| `--start` | YYYYMMDD 或时间戳 | 回测开始时间 |
+| `--config` | `config.yaml` | 策略登记表（顶层 key=策略目录名，含 git_url） |
+| `--strategies-dir` | `.` | 策略目录父目录（clone 目标在其下） |
+| `--strategies` | 全部 | 只处理指定策略（逗号分隔目录名） |
+| `--no-list` | - | 跳过末尾可用策略列表展示 |
 
-**条件必需参数**：
+### init_overrides.py — per-symbol 配置兜底
 
-| 参数 | 格式 | 说明 |
+```bash
+python3 init_overrides.py --strategy-dir ./strategies/sar_snt/strategies/sar_snt --symbols BTCUSDT,ETHUSDT [--force] [--dry-run]
+```
+
+| 参数 | 默认 | 说明 |
 |------|------|------|
-| `--symbols` | 逗号分隔 | 代币列表。`--skip-analysis` 时必需；否则可选，从策略配置读取 |
+| `--strategy-dir` | 必需 | 含 overrides/ 的那层（`strategies/<pkg>/`） |
+| `--symbols` | 必需 | 逗号分隔代币列表 |
+| `--force` | 否 | 覆盖已存在的配置（默认跳过） |
+| `--dry-run` | 否 | 只报告将创建哪些，不写盘 |
 
-**可选参数**：
-
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--end` | 当天 | 回测结束时间 |
-| `--config` | `config.yaml` | 配置文件路径 |
-| `--output-dir` | `./discovery_outputs` | 输出目录 |
-| `--parallel` | `1` | 并行回测数 |
-| `--python` | 自动探测 | Python 命令（默认 `$PROJECT_DIR/.venv/bin/python` → `python3` → `python`） |
-| `--skip-analysis` | `false` | 跳过策略分析阶段 |
-
-### Step 2: 时间格式自动识别
-
-```python
-def parse_time(time_str: str) -> str:
-    """解析时间输入，统一输出为 YYYYMMDD 格式"""
-    # 纯数字且长度=10 → Unix 时间戳
-    if time_str.isdigit() and len(time_str) == 10:
-        from datetime import datetime
-        dt = datetime.fromtimestamp(int(time_str))
-        return dt.strftime("%Y%m%d")
-    # YYYYMMDD 格式
-    if time_str.isdigit() and len(time_str) == 8:
-        return time_str
-    raise ValueError(f"无法识别的时间格式: {time_str}，支持 YYYYMMDD 或 Unix 时间戳")
-```
-
-### Step 3: 验证策略存在性
+### discovery.py — 回测执行
 
 ```bash
-for strategy in $STRATEGIES; do
-    if [ ! -d "${STRATEGIES_DIR}/${strategy}" ]; then
-        echo "❌ 策略不存在: ${strategy}"
-        exit 1
-    fi
-done
+python3 discovery.py --start 20260601 [--end 20260801] [--config config.yaml] [--backtest-config backtest.yaml] [--strategies-dir .] [--output-root ./discovery_outputs] [--strategies sar_snt] [--log-level INFO]
 ```
 
-### Step 4: 列出回测组合
-
-```
-📋 Discovery 回测计划:
-
-  代币: BTCUSDT, ETHUSDT, SOLUSDT
-  策略: ema_rsi, ict_v4
-  时间: 20260601 - 20260701
-
-  回测组合 (6):
-    1. ema_rsi × BTCUSDT
-    2. ema_rsi × ETHUSDT
-    3. ema_rsi × SOLUSDT
-    4. ict_v4 × BTCUSDT
-    5. ict_v4 × ETHUSDT
-    6. ict_v4 × SOLUSDT
-```
-
----
-
-## Phase 1.5: 策略分析（analyze_strategies.py）
-
-### Step 1: 分析策略配置、代码完整性、K线数据
-
-在回测前先分析策略，确定哪些策略可以回测、配置是否完整、K线数据是否覆盖回测范围。
-当 `--symbols` 未指定时，从策略配置中读取默认 symbols。
-
-```bash
-$PYTHON_CMD analyze_strategies.py \
-    --strategies "$STRATEGIES" \
-    --strategies-dir "$STRATEGIES_DIR" \
-    --symbols "$SYMBOLS" \
-    --start "$START_DATE" \
-    --end "$END_DATE" \
-    --kline-data-dir "$KLINE_DATA_DIR" \
-    --output "${LOGS_DIR}/discovery-analysis-${START_DATE}.json"
-```
-
-**分析内容**：
-
-| 检查项 | 说明 | 不达标时 |
-|--------|------|----------|
-| strategy.py | 策略入口文件是否存在 | 标记 skip |
-| *_core.py | 策略核心逻辑文件 | 警告，不阻塞 |
-| overrides/<SYMBOL>.yaml | 策略参数文件（v3.7 单一事实来源） | 标记 skip |
-| symbols | 配置中定义的代币列表（`--symbols` 未指定时从此读取） | 无 symbols 标记 partial |
-| timeframes | 配置中定义的时间框架 | 信息展示 |
-| K线数据 | 每个 symbol 的 CSV 是否存在、日期范围是否覆盖回测区间 | 缺失标记 partial |
-
-**策略状态判定**：
-
-| 状态 | 条件 | 后续动作 |
-|------|------|----------|
-| `ready` | 所有检查通过 | 执行回测 |
-| `partial` | 部分检查不通过（如部分 symbol 无数据） | 执行回测（仅有效 symbol） |
-| `skip` | 关键检查失败（无配置/无代码/无数据） | 跳过回测 |
-
-**--symbols 可选行为**：
-
-- 指定 `--symbols`：覆盖配置中的 symbols，只回测指定代币
-- 不指定 `--symbols`：从每个策略的配置文件中读取 symbols 列表
-- `--skip-analysis` + 不指定 `--symbols`：报错退出（无分析阶段无法读取配置）
-
-**分析报告输出**（终端）：
-
-```
-============================================================
-  Strategy Analysis Report
-============================================================
-  Source: discovery
-  Path:   ./strategies
-  Range:  20260601 ~ 20260701
-  Data:   ./data/klines
-
-[READY]   ema_rsi
-  Config: /path/to/strategies/ema_rsi/overrides/BTCUSDT.yaml
-  Symbols: BTCUSDT, ETHUSDT, SOLUSDT
-  Timeframes: 4h, 1h | Direction: neutral
-  Params: obv_period=20, atr_multiplier=2.0
-  Code: strategy.py OK | ema_rsi_core.py OK
-  Data: BTCUSDT OK | ETHUSDT OK | SOLUSDT OK
-
-[PARTIAL] ict_v4
-  Config: /path/to/config/BTCUSDT.yaml
-  Symbols: BTCUSDT, ETHUSDT
-  Data: BTCUSDT OK | ETHUSDT MISSING
-  Issues: ETHUSDT 无K线数据
-
-------------------------------------------------------------
-Summary: 1 ready, 1 partial, 0 skip | 2 of 2 can proceed
-============================================================
-```
-
-**JSON 输出**（`logs/discovery-analysis-{date}.json`）：
-
-结构与 replay Phase 2.5 相同，`source` 字段为 `"discovery"`。
-
-**向后兼容**：
-- `--skip-analysis` 标志跳过此阶段，恢复旧行为（此时 `--symbols` 必需）
-- 分析脚本崩溃时：log 警告，回退到全量回测
-- JSON 文件缺失/损坏时：回退到循环内原有 config 解析逻辑
-
----
-
-## Phase 2: 执行回测
-
-### Step 0: 后台执行模式
-
-**`--background` 标志**：回测在后台执行，不阻塞终端。
-
-```bash
-# 后台执行
-nohup bash discover.sh --strategies "$STRATEGIES" --symbols "$SYMBOLS" \
-    --start "$START_DATE" --end "$END_DATE" \
-    > "${LOGS_DIR}/discovery-${START_DATE}.log" 2>&1 &
-
-echo "✅ 回测已在后台启动 (PID: $!)"
-echo "   日志: ${LOGS_DIR}/discovery-${START_DATE}.log"
-echo "   查看进度: tail -f ${LOGS_DIR}/discovery-${START_DATE}.log"
-```
-
-### Step 1: 转调模板的 scripts/run_backtest_batch.sh
-
-**不要直接调 `python -m backtest.batch_runner`。** 模板自带
-`scripts/run_backtest_batch.sh`，它承载了 overrides 预检、「策略 × 代币」
-笛卡尔积展开、`PYTHONPATH` 设置、`exec` 移交退出码等逻辑。skill 自己再实现
-一遍会与模板形成两套执行路径，模板升级时必然漂移 —— 这是模板脚本里明确
-写下的设计约束（"并发、结果汇总、退出码判定全部由 Python 负责"）。
-
-该 wrapper 只支持笛卡尔积，无法表达"每个策略配不同代币"，因此按策略分组：
-**每个策略一次调用**，传该策略实际可回测的代币子集。
-
-```bash
-# 1. 生成 run-profile（承载 output_dir / max_workers / cash / commission）
-#    wrapper 没有 --output-dir，自定义输出目录只能经 profile 传入。
-#    data_dir 由 make_profile.py 照抄 settings.yaml 的 data_manager.csv_dir，
-#    不一致时模板启动即退出（verify_data_dir_consistency）。
-$PYTHON_CMD make_profile.py \
-    --project-dir "$PROJECT_DIR" \
-    --name discovery \
-    --output-dir "$DISCOVERY_OUTPUTS_DIR" \
-    --max-workers "${PARALLEL:-1}"
-
-# 2. 按策略分组调用。只纳入 overrides/<SYMBOL>.yaml 真实存在的代币 ——
-#    缺文件时 wrapper 的 precheck_overrides 会拒绝整批，
-#    所以这里预先过滤，并向用户解释跳过了哪些组合、为什么。
-for strategy in $STRATEGIES; do
-    SYMS=""
-    for symbol in $SYMBOLS; do
-        [ -f "${STRATEGIES_DIR}/${strategy}/overrides/${symbol}.yaml" ] || continue
-        SYMS="${SYMS:+$SYMS,}${symbol}"
-    done
-    [ -z "$SYMS" ] && continue
-
-    (cd "$PROJECT_DIR" && bash scripts/run_backtest_batch.sh \
-        --strategies "$strategy" \
-        --symbols "$SYMS" \
-        --start "$START_DATE" \
-        --end "$END_DATE" \
-        --profile discovery \
-        --log-level INFO \
-        --yes) 2>&1 | tee -a "${LOGS_DIR}/discovery-${START_DATE}.log"
-done
-```
-
-**`--yes` 是必须的**：wrapper 在任务数 > 6 时会 `read` 等待确认，
-skill 跑在非交互环境，不传 `--yes` 会直接卡死。
-
-**并发控制**：由 profile 的 `max_workers` 决定（`--parallel N` 写入该字段）。
-wrapper 不接受并发参数，也不要用 shell 后台任务 + `wait -n`。
-
-**⚠ 不要用 `--daemon`**：`batch_runner` 该模式重建子命令时只传
-`--profile` 和 `--batch-id`，会丢掉 `--run/--start/--end`，
-等于跑成空清单。需要后台执行请在外层 `nohup` 本脚本。
-
-**输出目录结构**（由 `backtest/backtest_reporter.py` 决定）：
-
-```
-discovery_outputs/                        # = run-profile 的 output_dir
-└── {strategy}/
-    └── {date}/                           # 运行日期 YYYYMMDD
-        └── {time}/                       # 运行时刻 HHMMSS
-            └── {symbol}/
-                ├── backtest_result.json  # 指标在 "metrics" 段，不在顶层
-                ├── backtest_report.txt
-                ├── backtest_trades.csv
-                ├── backtest_equity.csv
-                ├── backtest_signals.csv
-                └── config.yaml           # 实际生效的参数副本，供复现
-```
-
-注意路径层级是 `{strategy}/{date}/{time}/{symbol}/` ——
-每次运行独立成目录，同一组合多跑几次不会互相覆盖。
-
----
-
-## Phase 3: 结果汇总
-
-### Step 1: 汇总所有回测结果
-
-用 `generate_report.py` 完成，它按 `rglob` 递归找结果文件，并从
-`metrics` 段读指标：
-
-```bash
-$PYTHON_CMD generate_report.py \
-    --output-dir "$DISCOVERY_OUTPUTS_DIR" \
-    --start "$START_DATE" \
-    --end "$END_DATE"
-```
-
-核心逻辑（两个容易踩的点都在这里）：
-
-```python
-from pathlib import Path
-import json
-
-base = Path("discovery_outputs")
-summary = []
-# 路径层级是 {strategy}/{date}/{time}/{symbol}/ —— 用 rglob 而不是固定层级
-# glob，层级微调也不会静默漏结果
-for result_file in sorted(base.rglob("backtest_result.json")):
-    r = json.load(open(result_file))
-    parts = result_file.relative_to(base).parts   # (strategy, date, time, symbol, file)
-    # 指标在 "metrics" 段，不在顶层 —— 直接 r.get("total_return") 恒为 0
-    m = r.get("metrics") if isinstance(r.get("metrics"), dict) else r
-    summary.append({
-        "strategy": parts[0],
-        "symbol": parts[-2],
-        "run_at": f"{parts[1]}/{parts[2]}",
-        "total_return": m.get("total_return", 0),
-        "roe": m.get("roe", 0),
-        "max_drawdown": m.get("max_drawdown", 0),
-        "win_rate": m.get("win_rate", 0),
-        "total_trades": m.get("total_trades", 0),
-        "sharpe_ratio": m.get("sharpe_ratio", 0),
-        "profit_factor": m.get("profit_factor", 0),
-    })
-```
-
-同一 (strategy, symbol) 跑过多次时按 `run_at` 取最新一次。
-
-**零交易要单独点出来**：`total_return` 为 0 多数不是"策略没赚钱"，
-而是回测期内一笔都没成交（数据不足 / 信号未触发 / 周期过长）。
-报告里把 `total_trades == 0` 的组合单列，避免被读成有效结果。
-
-### Step 2: 输出对比报告
-
-```
-📊 Discovery 回测对比报告
-
-时间范围: 20260601 - 20260701
-
-=== 按策略对比 ===
-
-ema_rsi:
-  BTCUSDT:  +2.3%  | 回撤 8.2%  | 胜率 45.0% | 交易 23 | 夏普 1.2
-  ETHUSDT:  -0.8%  | 回撤 12.1% | 胜率 38.5% | 交易 18 | 夏普 0.6
-  SOLUSDT:  +5.1%  | 回撤 6.5%  | 胜率 52.0% | 交易 31 | 夏普 1.8
-
-ict_v4:
-  BTCUSDT:  +1.7%  | 回撤 9.8%  | 胜率 42.1% | 交易 19 | 夏普 0.9
-  ETHUSDT:  +3.2%  | 回撤 7.3%  | 胜率 48.0% | 交易 25 | 夏普 1.4
-  SOLUSDT:  -1.5%  | 回撤 15.2% | 胜率 35.0% | 交易 14 | 夏普 0.3
-
-=== 按代币对比 ===
-
-BTCUSDT: ema_rsi (+2.3%) > ict_v4 (+1.7%)
-ETHUSDT: ict_v4 (+3.2%) > ema_rsi (-0.8%)
-SOLUSDT: ema_rsi (+5.1%) > ict_v4 (-1.5%)
-
-=== 最佳组合 ===
-  策略×代币: ema_rsi × SOLUSDT (+5.1%)
-  策略×代币: ict_v4 × ETHUSDT (+3.2%)
-```
-
-### Step 3: 写入报告文件
-
-```bash
-REPORT_FILE="${DISCOVERY_OUTPUTS_DIR}/discovery-report-${START_DATE}-${END_DATE}.md"
-# 将上述对比报告写入 $REPORT_FILE
-```
-
----
-
-## 环境变量清单
-
-### 必需配置
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `DATA_PATH` | `./data` | K 线数据存储路径 |
-| `KLINE_DATA_DIR` | `${DATA_PATH}/strategies/1m` | 1m K 线数据源目录 |
-| `STRATEGIES_DIR` | `./strategies` | 策略代码目录 |
-| `DISCOVERY_OUTPUTS_DIR` | `./discovery_outputs` | Discovery 结果输出目录 |
-| `LOGS_DIR` | `./logs` | 日志输出目录 |
-| `PYTHON_CMD` | 自动探测 | Python 命令路径（留空则探测 `.venv/bin/python`） |
-
-### .env.example 模板
-
-```bash
-# ===== 必需配置 =====
-DATA_PATH=./data
-KLINE_DATA_DIR=./data/klines
-STRATEGIES_DIR=./strategies
-DISCOVERY_OUTPUTS_DIR=./discovery_outputs
-LOGS_DIR=./logs
-PYTHON_CMD=
-```
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--start` | 必需 | 回测开始时间 YYYYMMDD 或 Unix 时间戳 |
+| `--end` | 当前 | 回测结束时间 |
+| `--config` | `config.yaml` | 策略登记表（不存在则扫 --strategies-dir） |
+| `--backtest-config` | `backtest.yaml` | 回测 run-profile |
+| `--strategies-dir` | `.` | 策略目录父目录 |
+| `--output-root` | `./discovery_outputs` | 产物根目录 |
+| `--strategies` | 全部 | 只回测指定策略 |
+| `--log-level` | `INFO` | 透传给 wrapper 的日志级别 |
 
 ---
 
@@ -935,83 +267,14 @@ PYTHON_CMD=
       "Bash(python3:*)",
       "Bash(python:*)",
       "Bash(bash:*)",
+      "Bash(git:*)",
       "Bash(mkdir:*)",
-      "Bash(xargs:*)",
-      "Bash(date:*)",
-      "Bash(wc:*)",
-      "Bash(source:*)",
       "Read(*)",
       "Write(*)",
       "Edit(*)"
     ]
   }
 }
-```
-
----
-
-## 执行顺序
-
-```
-用户输入:
-  /trading-discovery                                  ← 无参数
-  /trading-discovery run --symbols S1 --start DATE    ← 参数不全
-  /trading-discovery run --symbols S1,S2 --strategies ST1,ST2 --start DATE --end DATE  ← 参数齐全
-       ↓
-Phase -1: 交互式引导（仅无参数/参数不全时）  ← NEW
-  ├── Step 0: 环境快速探测（决定是否先 git pull）
-  ├── Step 1: 问策略（缺 --strategies 时）
-  ├── Step 2: 问代币（缺 --symbols 时）
-  ├── Step 3: 问开始时间（缺 --start 时，必填）
-  ├── Step 4: 问结束时间（缺 --end 时，默认今天）
-  ├── Step 5: 问可选参数（并行/后台/跳过分析）
-  └── Step 6: 汇总确认 → 用户确认后进 Phase 0
-       ↓
-Phase 0: 环境预检
-  ├── 检查回测引擎
-  ├── 检查 K 线数据
-  └── 检查策略目录
-       ↓
-Phase 0.5: 策略代码获取（git pull）
-  ├── 确认 git 仓库地址
-  ├── git clone / git pull
-  └── 列出可用策略
-       ↓
-Phase 0.6: 代币配置确认
-  ├── 输出策略代币配置摘要
-  ├── 支持 +SYMBOL / -SYMBOL / SYMBOL1=SYMBOL2
-  └── 用户确认后继续
-       ↓
-Phase 0.7: K线数据需求计算（calc_data_requirements.py）
-  ├── 提取技术指标周期参数
-  ├── 计算最少需要天数
-  ├── 检查本地数据是否充足
-  └── 输出 gap 分析
-       ↓
-Phase 1: 参数解析
-  ├── 解析代币列表、策略列表、时间范围
-  ├── 时间格式自动识别（YYYYMMDD / 时间戳）
-  ├── 验证策略存在性
-  └── 列出回测组合
-       ↓
-Phase 1.5: 策略分析（analyze_strategies.py）
-  ├── 分析策略配置（symbols, timeframes, params）
-  ├── 检查代码完整性（strategy.py, *_core.py）
-  ├── 检查K线数据可用性（CSV 存在 + 日期范围覆盖）
-  ├── 判定策略状态（ready/partial/skip）
-  ├── --symbols 未指定时从配置读取默认 symbols
-  ├── 过滤 skip 策略，只对 ready/partial 执行回测
-  └── 输出分析报告 + JSON
-       ↓
-Phase 2: 执行回测
-  ├── 对每个 (策略, 代币) 组合执行回测
-  ├── 输出到 discovery_outputs/{strategy}/{symbol}/{date_range}/
-  └── 支持并行 (--parallel N)
-       ↓
-Phase 3: 结果汇总
-  ├── 汇总所有回测结果
-  ├── 按策略对比 + 按代币对比
-  └── 输出对比报告
 ```
 
 ---

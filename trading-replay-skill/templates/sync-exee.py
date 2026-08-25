@@ -1,321 +1,267 @@
 #!/usr/bin/env python3
 """sync-exee.py — 每日策略项目备份
 
-从实盘机器 rsync 整个项目，排除日志/产物/venv/git，
-按 snapshot/{day}/{project_name}-{model} 存放。
-包含 data/ 目录（K线数据），Replay 机器拿到快照后可直接运行回测。
+从实盘机器同步策略项目快照到本地，按 snapshot/{day}/{策略文件夹}/ 存放。
 
 用法:
-    python3 sync-exee.py                          # 当日备份
-    python3 sync-exee.py --date 20260801          # 指定日期
-    python3 sync-exee.py --config config.yaml     # 指定配置
-    python3 sync-exee.py --model product          # 只备份指定模型
+    python3 sync-exee.py                       # 备份昨天（默认）
+    python3 sync-exee.py --date 20260807       # 备份指定日期
+    python3 sync-exee.py --config config.yaml  # 指定配置文件
+
+流程:
+  1. 读 config.yaml，遍历所有 model(product/paper/smoking) 下配置的策略
+  2. rsync 拉取策略项目，排除 logs / .venv / backtest_output（.gitignore 产物）
+     —— data 目录体积大，一并排除，仅按第 3 步拉取必要子集
+  3. 额外同步 data 指定文件（day 默认昨天，格式 YYYYMMDD）:
+       data/signals/{策略名}/{day}.csv
+       data/positions/                       （整个目录）
+       data/history_positions/{策略名}/{day}.csv
+     data 子集独立存放至 replay_data/{day}/{策略文件夹}/data/
+  4. 代码存放至 snapshot/{day}/{策略文件夹}/，目录结构与远程一致
+     （与 replay_outputs 对仗：replay_data=实盘输入基准，replay_outputs=回测结果）
+  5. 同步完成后扫描所有快照的 strategies/*/overrides/*.yaml，
+     收集代币去重，生成 symbols.yaml（供 download_data.py 读取）
+
+约定:
+  - 策略文件夹 = config 中 path 的 basename
+  - 策略名     = config 中的 key，同时作为 data 子目录的 strategy_id
+  - host 字段可填 user@ip 或 ssh 别名；端口/密钥走 ~/.ssh/config
 """
 
-from __future__ import annotations
-
 import argparse
-import logging
-import os
 import shutil
 import subprocess
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import yaml
 
-# rsync 排除列表：运行产物、缓存、虚拟环境
-RSYNC_EXCLUDES = [
-    ".venv/",             # Python 虚拟环境，本地重建
-    "node_modules/",
-    "__pycache__/",       # 编译缓存
-    "*.pyc",
-    "logs/",              # 运行日志
-    "backtest_output*/",  # 回测产物
-    "benchmark_output*/", # benchmark 产物
-    "snapshot/",          # 避免递归拉取旧快照
-    "replay_outputs/",    # replay 产物
-    "discovery_outputs/", # discovery 产物
-    ".git/",              # git 历史
-    ".env",               # 含敏感信息，不拉；Replay 机器用本地 .env
-    "*.log",              # 日志文件
-    ".idea/",             # IDE 配置
-    ".vscode/",
-]
+# 本地 host 标识：这些写法表示源就在本机，走本地拷贝而非 ssh
+LOCAL_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
+
+# 同步时排除的目录：运行产物、虚拟环境、大数据目录
+# data 整体排除：体积大，仅按需求第 3 步拉取必要子集
+EXCLUDE_DIRS = ["logs", ".venv", "backtest_output", "data"]
+
+# config 顶层 model 分组
+MODEL_KEYS = ["product", "paper", "smoking"]
 
 
-def setup_logging(logs_dir: str, date: str) -> logging.Logger:
-    """配置日志输出到文件和终端"""
-    logs_path = Path(logs_dir)
-    logs_path.mkdir(parents=True, exist_ok=True)
-
-    log_file = logs_path / f"sync-{date}.log"
-
-    logger = logging.getLogger("sync-exee")
-    logger.setLevel(logging.INFO)
-
-    fh = logging.FileHandler(log_file)
-    fh.setLevel(logging.INFO)
-    ch = logging.StreamHandler()
-    ch.setLevel(logging.INFO)
-
-    formatter = logging.Formatter("[%(asctime)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
-    fh.setFormatter(formatter)
-    ch.setFormatter(formatter)
-
-    logger.addHandler(fh)
-    logger.addHandler(ch)
-
-    return logger
+def parse_day(value):
+    """解析日期，默认昨天，校验 YYYYMMDD 格式"""
+    if not value:
+        value = (datetime.now() - timedelta(days=1)).strftime("%Y%m%d")
+    if len(value) != 8 or not value.isdigit():
+        sys.exit(f"❌ 日期格式错误: {value}，应为 YYYYMMDD（如 20260807）")
+    return value
 
 
-def load_config(config_path: str) -> dict:
-    """加载配置文件"""
-    config = {}
-    if os.path.exists(config_path):
-        with open(config_path) as f:
-            config = yaml.safe_load(f) or {}
-    return config
+def load_config(path):
+    """加载 YAML 配置"""
+    if not Path(path).is_file():
+        sys.exit(f"❌ 配置文件不存在: {path}")
+    with open(path, encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
 
 
-def load_env(env_path: str = ".env") -> dict:
-    """加载 .env 文件"""
-    env = {}
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    key, _, value = line.partition("=")
-                    env[key.strip()] = value.strip()
-    return env
+def iter_strategies(config):
+    """遍历所有 model 下的策略，yield (策略名, host, remote_path)
 
-
-def _safe_int(value, default):
-    """安全转换为 int，失败返回默认值"""
-    try:
-        return int(value)
-    except (ValueError, TypeError):
-        return default
-
-
-def get_scp_config(config: dict, env: dict) -> dict:
-    """合并远程同步配置（.env 优先于 config.yaml）"""
-    scp_cfg = config.get("scp", {})
-
-    # project_dir: 实盘项目根目录（如 /home/trader/your_project）
-    # 可自动推断：若 strategy_dir 以 /strategies 结尾，取上一级
-    project_dir = env.get("SCP_PROJECT_DIR", scp_cfg.get("project_dir", ""))
-    if not project_dir:
-        strategy_dir = env.get("SCP_STRATEGY_DIR", scp_cfg.get("strategy_dir", ""))
-        if strategy_dir.endswith("/strategies") or strategy_dir.endswith("/strategies/"):
-            project_dir = strategy_dir.rstrip("/").rsplit("/strategies", 1)[0]
-
-    return {
-        "host": env.get("SCP_HOST", scp_cfg.get("host", "")),
-        "port": env.get("SCP_PORT", scp_cfg.get("port", "22")),
-        "user": env.get("SCP_USER", scp_cfg.get("user", "")),
-        "project_dir": project_dir,
-        "key": env.get("SCP_KEY", scp_cfg.get("key", "~/.ssh/id_rsa")),
-        "timeout": _safe_int(env.get("SCP_TIMEOUT", scp_cfg.get("timeout", "30")), 30),
-        "retry": _safe_int(env.get("SCP_RETRY", scp_cfg.get("retry", "3")), 3),
-    }
-
-
-def get_paths_config(config: dict, env: dict) -> dict:
-    """合并路径配置"""
-    paths_cfg = config.get("paths", {})
-
-    return {
-        "snapshot_dir": env.get("SNAPSHOT_DIR", paths_cfg.get("snapshot_dir", "./snapshot")),
-        "logs_dir": env.get("LOGS_DIR", paths_cfg.get("logs_dir", "./logs")),
-        "replay_outputs_dir": env.get(
-            "REPLAY_OUTPUTS_DIR", paths_cfg.get("replay_outputs_dir", "./replay_outputs")
-        ),
-    }
-
-
-def sync_project(
-    project_name: str,
-    model: str,
-    date: str,
-    scp_config: dict,
-    paths_config: dict,
-    logger: logging.Logger,
-    snapshot_base: Path | None = None,
-) -> bool:
-    """rsync 拉取完整项目，排除日志/产物/大文件
-
-    产物: snapshot/{date}/{project_name}-{model}/
+    config 结构:
+        product:
+          strategy_name1: {host: ..., path: ...}
+        paper: ...
+        smoking: ...
     """
-    project_dir = scp_config.get("project_dir", "")
-    if not project_dir:
-        logger.error("❌ SCP_PROJECT_DIR 未配置，且无法从 SCP_STRATEGY_DIR 自动推断")
-        return False
+    for model in MODEL_KEYS:
+        strategies = config.get(model) or {}
+        if not isinstance(strategies, dict):
+            continue
+        for name, cfg in strategies.items():
+            if isinstance(cfg, dict) and cfg.get("path"):
+                yield name, cfg.get("host", ""), cfg["path"]
 
-    if snapshot_base is None:
-        snapshot_base = Path(paths_config["snapshot_dir"]) / date
-    snapshot_base.mkdir(parents=True, exist_ok=True)
 
-    target_dir = snapshot_base / f"{project_name}-{model}"
-    temp_dir = snapshot_base / f".tmp-{project_name}-{model}"
+def collect_symbols(snapshot_base):
+    """扫描所有快照的 strategies/*/overrides/*.yaml，收集代币去重
 
-    # 清理残留
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
+    多个策略可能代币重复，统一去重后排序。
+    跳过 .tmp-* 临时目录。
+    """
+    symbols = set()
+    if not snapshot_base.is_dir():
+        return []
+    for folder_dir in snapshot_base.iterdir():
+        if not folder_dir.is_dir() or folder_dir.name.startswith(".tmp-"):
+            continue
+        strategies_dir = folder_dir / "strategies"
+        if not strategies_dir.is_dir():
+            continue
+        # 每个 strategy 子目录下的 overrides/*.yaml 文件名即代币
+        for strat_dir in strategies_dir.iterdir():
+            if not strat_dir.is_dir():
+                continue
+            overrides_dir = strat_dir / "overrides"
+            if not overrides_dir.is_dir():
+                continue
+            for f in overrides_dir.glob("*.yaml"):
+                if f.is_file() and not f.name.startswith("."):
+                    symbols.add(f.stem.upper())
+    return sorted(symbols)
 
-    host = scp_config["host"]
-    port = scp_config["port"]
-    user = scp_config["user"]
-    key = os.path.expanduser(scp_config["key"])
-    timeout = scp_config["timeout"]
 
-    if not host or not user:
-        logger.error("配置不完整: 缺少 SCP_HOST 或 SCP_USER")
-        return False
+def write_symbols_yaml(symbols, path):
+    """写 symbols.yaml（供 download_data.py 读取）
 
-    remote_path = f"{user}@{host}:{project_dir}/"
+    格式:
+        symbols:
+          - BTCUSDT
+          - ETHUSDT
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# 自动生成 — 由 sync-exee.py 从快照 overrides 收集去重，勿手改\n")
+        f.write("# 供 download_data.py 读取\n")
+        f.write("symbols:\n")
+        for sym in symbols:
+            f.write(f"  - {sym}\n")
 
-    # 构建 rsync 命令
-    # 用列表传 SSH 参数，避免路径含空格时字符串拼接断裂
-    ssh_cmd = [
-        "ssh",
-        "-p", str(port),
-        "-i", key,
-        "-o", "StrictHostKeyChecking=accept-new",
+
+def run(cmd):
+    """执行命令，实时输出，返回是否成功"""
+    print(f"  $ {' '.join(cmd)}")
+    return subprocess.run(cmd).returncode == 0
+
+
+def is_local(host):
+    """源是否在本机：空 / 127.0.0.1 / localhost / ::1 视为本地"""
+    return (host or "").strip() in LOCAL_HOSTS
+
+
+def rsync_pull(host, remote, local, excludes=None):
+    """rsync 拉取 remote → local，排除指定目录
+
+    本地 host（127.0.0.1 等）走纯本地 rsync（无 -e ssh）；
+    远程 host 走 rsync over ssh。
+    """
+    if is_local(host):
+        src = f"{remote}/"
+    else:
+        src = f"{host}:{remote}/"
+    cmd = ["rsync", "-az", "--delete"]
+    if not is_local(host):
+        cmd += ["-e", "ssh -o StrictHostKeyChecking=accept-new"]
+    for d in excludes or []:
+        cmd += ["--exclude", f"{d}/"]
+    cmd += [src, f"{local}/"]
+    return run(cmd)
+
+
+def sync_data_files(host, remote_path, local_dir, day, name):
+    """同步 data 指定子集
+
+    - data/signals/{name}/{day}.csv
+    - data/positions/                   （整个目录）
+    - data/history_positions/{name}/{day}.csv
+
+    单个 csv 缺失不算错（部分策略当天无信号/历史持仓）；
+    --ignore-missing-args 让缺失文件不污染退出码。
+
+    本地 host 走纯本地 rsync（无 ssh）。
+    """
+    prefix = "" if is_local(host) else f"{host}:"
+    pulls = [
+        f"data/signals/{name}/{day}.csv",
+        "data/positions",
+        f"data/history_positions/{name}/{day}.csv",
     ]
-    rsync_cmd = [
-        "rsync", "-az",
-        "--timeout", str(timeout * 3),
-        "--rsh", " ".join(ssh_cmd),
-    ]
-
-    # 添加排除规则
-    for exclude in RSYNC_EXCLUDES:
-        rsync_cmd.extend(["--exclude", exclude])
-
-    rsync_cmd.extend([remote_path, str(temp_dir)])
-
-    for attempt in range(1, scp_config["retry"] + 1):
-        try:
-            logger.info(f"rsync: {remote_path} → {temp_dir} (attempt {attempt}/{scp_config['retry']})")
-            result = subprocess.run(
-                rsync_cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout * 10,
-            )
-            if result.returncode == 0:
-                # 成功：临时目录 → 目标目录
-                if target_dir.exists():
-                    shutil.rmtree(target_dir)
-                temp_dir.rename(target_dir)
-
-                file_count = sum(1 for _ in target_dir.rglob("*") if _.is_file())
-                logger.info(f"✅ {project_name}-{model}: {file_count} files synced")
-                return True
-            else:
-                logger.warning(f"rsync 失败 (attempt {attempt}): {result.stderr.strip()}")
-                if temp_dir.exists():
-                    shutil.rmtree(temp_dir)
-        except subprocess.TimeoutExpired:
-            logger.warning(f"rsync 超时 (attempt {attempt})")
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir)
-        except FileNotFoundError:
-            logger.error("❌ rsync 未安装，请执行: sudo apt install rsync")
-            return False
-        except Exception as e:
-            logger.warning(f"rsync 异常 (attempt {attempt}): {e}")
-            if temp_dir.exists():
-                shutil.rmtree(temp_dir)
-
-    logger.error(f"❌ {project_name}-{model}: sync failed after {scp_config['retry']} attempts")
-    return False
-
-
-def discover_project_name(scp_config: dict, logger: logging.Logger) -> str:
-    """从远程项目路径提取项目名"""
-    project_dir = scp_config.get("project_dir", "")
-    if project_dir:
-        return project_dir.rstrip("/").rsplit("/", 1)[-1]
-    return "project"
+    ok = True
+    for rel in pulls:
+        local_target = local_dir / Path(rel).parent
+        local_target.mkdir(parents=True, exist_ok=True)
+        cmd = ["rsync", "-az", "--ignore-missing-args"]
+        if not is_local(host):
+            cmd += ["-e", "ssh -o StrictHostKeyChecking=accept-new"]
+        cmd += [f"{prefix}{remote_path}/{rel}", f"{local_target}/"]
+        print(f"  $ {' '.join(cmd)}")
+        r = subprocess.run(cmd)
+        # positions 是目录，缺失才告警；csv 缺失可接受
+        if r.returncode != 0 and not rel.endswith(day + ".csv"):
+            ok = False
+    return ok
 
 
 def main():
-    parser = argparse.ArgumentParser(description="每日策略项目备份")
-    parser.add_argument("--date", default=None, help="备份日期 (YYYYMMDD，默认当天)")
-    parser.add_argument("--config", default="config.yaml", help="配置文件路径")
-    parser.add_argument("--model", default=None, help="只备份指定模型 (product/smoking/paper)")
-    args = parser.parse_args()
+    ap = argparse.ArgumentParser(description="每日策略项目备份")
+    ap.add_argument("--date", default=None, help="备份日期 YYYYMMDD，默认昨天")
+    ap.add_argument("--config", default="config.yaml", help="配置文件路径")
+    ap.add_argument("--snapshot-dir", default="./snapshot", help="快照根目录")
+    ap.add_argument("--data-dir", default="./replay_data", help="data 子集根目录")
+    args = ap.parse_args()
 
-    date = args.date or datetime.now().strftime("%Y%m%d")
-
+    day = parse_day(args.date)
     config = load_config(args.config)
-    env = load_env()
-    scp_config = get_scp_config(config, env)
-    paths_config = get_paths_config(config, env)
 
-    logger = setup_logging(paths_config["logs_dir"], date)
-    logger.info(f"START sync-exee.py --date {date}")
+    snapshot_base = Path(args.snapshot_dir) / day
+    snapshot_base.mkdir(parents=True, exist_ok=True)
+    data_base = Path(args.data_dir) / day
+    data_base.mkdir(parents=True, exist_ok=True)
 
-    if not scp_config["host"]:
-        logger.error("❌ SCP_HOST 未配置，无法执行备份")
-        sys.exit(1)
+    print(f"=== sync-exee 开始，日期 {day} ===")
 
-    if not scp_config["project_dir"]:
-        logger.error("❌ SCP_PROJECT_DIR 未配置，且无法从 SCP_STRATEGY_DIR 自动推断")
-        logger.error("  请在 .env 中设置 SCP_PROJECT_DIR=/path/to/your_project")
-        sys.exit(1)
+    seen = set()
+    success, fail = 0, 0
+    for name, host, remote_path in iter_strategies(config):
+        folder = Path(remote_path).name or name
+        local_dir = snapshot_base / folder
 
-    # 项目名从远程路径提取（如 your_project）
-    project_name = discover_project_name(scp_config, logger)
-    logger.info(f"项目名: {project_name}, 远程路径: {scp_config['project_dir']}")
+        # 同一日期下策略文件夹名需唯一（不同 model 同名时靠 path basename 区分）
+        if folder in seen:
+            print(f"⚠ 策略 {name}: 快照目录 {folder} 已被占用，跳过"
+                  f"（请保证各策略 path 的 basename 唯一）")
+            continue
+        seen.add(folder)
 
-    # 模型列表
-    models = config.get("replay", {}).get("models", ["product", "smoking", "paper"])
-    if args.model:
-        models = [args.model]
+        print(f"\n--- {name} → snapshot/{day}/{folder}/ ---")
+        print(f"  源: {host or '(本地)'}:{remote_path}")
+        if not host:
+            print(f"  ⚠ {name}: 缺少 host，跳过")
+            fail += 1
+            continue
 
-    success_count = 0
-    fail_count = 0
+        # 临时目录，成功后原子移动到最终位置
+        tmp_dir = snapshot_base / f".tmp-{folder}"
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    # 所有 model 共享同一份远程代码，只需 rsync 一次
-    # 后续 model 通过本地复制 + 不同目录后缀来区分
-    snapshot_base = Path(paths_config["snapshot_dir"]) / date
+        # 步骤 2: 拉取代码（排除产物/venv/data）
+        if not rsync_pull(host, remote_path, tmp_dir, excludes=EXCLUDE_DIRS):
+            print(f"  ❌ {name}: 代码同步失败")
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            fail += 1
+            continue
 
-    first_model_file_count = 0
+        # 步骤 3: 拉取 data 指定子集 → replay_data/{day}/{folder}/data/
+        data_dir = data_base / folder
+        sync_data_files(host, remote_path, data_dir, day, name)
 
-    for i, model in enumerate(models):
-        if i == 0:
-            # 第一个 model：rsync 从远程拉取
-            if sync_project(project_name, model, date, scp_config, paths_config, logger, snapshot_base):
-                first_model_file_count = sum(1 for _ in (snapshot_base / f"{project_name}-{model}").rglob("*") if _.is_file())
-                success_count += 1
-            else:
-                fail_count += 1
-        else:
-            # 后续 model：复制第一个 model 的快照（同一项目，不同 model 后缀）
-            first_model_dir = snapshot_base / f"{project_name}-{models[0]}"
-            target_dir = snapshot_base / f"{project_name}-{model}"
-            if first_model_dir.exists():
-                if target_dir.exists():
-                    shutil.rmtree(target_dir)
-                shutil.copytree(str(first_model_dir), str(target_dir))
-                logger.info(f"✅ {project_name}-{model}: copied from {models[0]} ({first_model_file_count} files)")
-                success_count += 1
-            else:
-                logger.error(f"❌ {project_name}-{model}: source {models[0]} not found")
-                fail_count += 1
+        # 步骤 4: 原子移动到最终位置
+        if local_dir.exists():
+            shutil.rmtree(local_dir)
+        tmp_dir.rename(local_dir)
+        print(f"  ✅ {name}: 已备份到 snapshot/{day}/{folder}/")
+        success += 1
 
-    logger.info(
-        f"END sync-exee.py: {len(models)} models, "
-        f"{success_count} synced, {fail_count} failed"
-    )
+    # 步骤 5: 扫描快照 overrides 收集代币去重 → 生成 symbols.yaml
+    symbols = collect_symbols(snapshot_base)
+    symbols_path = snapshot_base / "symbols.yaml"
+    write_symbols_yaml(symbols, symbols_path)
+    print(f"\n✅ 生成 {symbols_path}（{len(symbols)} 个代币，已去重）")
 
-    if fail_count > 0:
-        sys.exit(1)
+    print(f"\n=== 完成: {success} 成功, {fail} 失败 ===")
+    sys.exit(1 if fail else 0)
 
 
 if __name__ == "__main__":

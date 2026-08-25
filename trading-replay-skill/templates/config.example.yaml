@@ -1,64 +1,24 @@
-# Trading Replay Skill — 全局配置模板
-# 复制为 config.yaml 并根据实际环境修改
+product:
+  strategy_name1:
+    host: 127.0.0.1
+    path: /home/qpw/workspace/{strategy_name}
+  strategy_name2:
+    host: 127.0.0.1
+    path: /home/qpw/workspace/{strategy_name}
 
-# ===== 远程同步配置 =====
-scp:
-  # 实盘机器连接信息
-  # 敏感信息建议放在 .env 中，此处用 ${ENV_VAR} 引用
-  host: ${SCP_HOST}
-  port: ${SCP_PORT:-22}
-  user: ${SCP_USER}
-  # 实盘项目根目录（如 /home/trader/your_project）
-  # rsync 会拉取整个项目，自动排除日志/产物/K线数据
-  project_dir: ${SCP_PROJECT_DIR}
-  # SSH 私钥路径
-  key: ${SCP_KEY:-~/.ssh/id_rsa}
-  # 超时（秒）
-  timeout: ${SCP_TIMEOUT:-30}
-  # 重试次数
-  retry: ${SCP_RETRY:-3}
+paper:
+  strategy_name2:
+    host: 127.0.0.1
+    path: /home/qpw/workspace/{strategy_name}
+  strategy_name3:
+    host: 127.0.0.1
+    path: /home/qpw/workspace/{strategy_name}
 
-# ===== 回测配置 =====
-replay:
-  # 回测日期（空=当天，或 YYYYMMDD 格式）
-  date: ""
-  # 要回放的模型类型
-  # product: 实盘策略
-  # smoking: 模拟盘策略
-  # paper: 纸上交易策略
-  models:
-    - product
-    - smoking
-    - paper
-
-# ===== 目录配置 =====
-paths:
-  # 策略代码快照目录
-  snapshot_dir: ./snapshot
-  # 日志输出目录
-  logs_dir: ./logs
-  # 回测结果输出目录
-  replay_outputs_dir: ./replay_outputs
-
-# ===== 回测引擎配置 =====
-backtest:
-  # Python 命令。留空则自动探测 ./.venv/bin/python → python3 → python
-  # （快照排除了 .venv，用本机 Replay 项目的 .venv 跑快照代码）
-  python_cmd: ""
-  # K 线数据目录。必须与快照 config/settings.yaml 的 data_manager.csv_dir 一致
-  # —— run-profile 的 data_dir 由 make_profile.py 照抄该值，
-  #    不一致时模板启动即报错退出（verify_data_dir_consistency）。
-  kline_data_dir: ./data/klines
-  # run-profile 名：在每个快照目录内生成 config/<name>.yaml，运行结束自动删除
-  profile: replay
-  # --start 未指定时的回看天数
-  lookback_days: 30
-  # 并发回测数（写入 run-profile 的 max_workers）
-  parallel: 1
-  # 回测核算口径（与策略层 capital.max_cash 语义不同）
-  cash: 5000
-  commission: 0.0004
-
-# 注意：策略参数（周期/阈值/止损/资金）不在本文件配置。
-# 回放读的是快照自带的 strategies/<name>/overrides/<SYMBOL>.yaml，
-# 即当天实盘真实生效的那份参数 —— 这正是"回放不失真"的前提。
+smoking:
+  strategy_name4:
+    host: 127.0.0.1
+    path: /home/qpw/workspace/{strategy_name}
+  strategy_name5:
+    host: 127.0.0.1
+    path: /home/qpw/workspace/{strategy_name}
+  
