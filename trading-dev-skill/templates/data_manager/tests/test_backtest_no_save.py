@@ -24,7 +24,7 @@ class TestBacktestModeNoSave:
                 csv_dir=tmpdir,
                 backtest_mode=True,
                 preload_1m_enabled=False,
-                klines_service_enabled=False,
+                realtime_enabled=False,
             )
             dm = DataManager(dm_config)
             dm.connect()
@@ -76,7 +76,7 @@ class TestBacktestModeNoSave:
                 csv_dir=tmpdir,
                 backtest_mode=False,  # 正常模式
                 preload_1m_enabled=False,
-                klines_service_enabled=False,
+                realtime_enabled=False,
             )
             dm = DataManager(dm_config)
             dm.connect()

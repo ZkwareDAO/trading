@@ -92,7 +92,7 @@ def verify_data_dir_consistency(profile_data_dir: str, settings_csv_dir) -> bool
     """校验 profile.data_dir 与 settings.data_manager.csv_dir 指向同一目录。
 
     回测的配置来源是【两份】：config/settings.yaml（与实盘共用，提供
-    use_bar_high_low_for_exit 等影响成交判定的字段）+ config/backtest.yaml
+    顶层 use_bar_high_low_for_exit 等影响成交判定的字段）+ config/backtest.yaml
     （回测运行方式）。data_dir 与 csv_dir 是二者间唯一的语义重复。
 
     只靠注释约定维持不住：一旦有人只改一处，实盘往 A 目录写数据、回测从 B 目录读，
@@ -100,7 +100,7 @@ def verify_data_dir_consistency(profile_data_dir: str, settings_csv_dir) -> bool
     留给使用者自己发现。
 
     settings_csv_dir 为 None（settings.yaml 不存在或未配置该键）时视为通过：
-    此时回测仍可跑，但注意 use_bar_high_low_for_exit 会退回代码默认值 True，
+    此时回测仍可跑，但注意顶层的 use_bar_high_low_for_exit 会退回代码默认值 True，
     与 settings.yaml 中显式的 false 不同，止损判定行为会变化。
 
     Args:

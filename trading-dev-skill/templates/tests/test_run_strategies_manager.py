@@ -1,11 +1,11 @@
 """
-Test run_strategies_manager.py — 策略进程调度器
+Test run_strategies_manager.py — 策略进程监督者
 
 验证:
 1. 解析 strategies 列表配置
 2. 生成标准化策略 ID
 3. 构建策略进程启动命令
-4. 心跳正确报告策略状态
+4. StrategyRuntime 进程管理
 """
 
 import pytest
@@ -38,16 +38,11 @@ def _make_global_config(tmpdir, strategies=None):
         ]
 
     config = {
-        "strategy_engine": {
-            "factory_endpoint": "http://127.0.0.1:8888",
-            "strategies_dir": str(PROJECT_ROOT / "strategies"),
-        },
         "data_manager": {
             "source_data_path": str(tmpdir / "source_data"),
         },
         "signal_logging": {
             "storage": {"path": str(tmpdir / "signals")},
-            "kafka": {"enabled": False},
         },
         "strategies": strategies,
     }
@@ -61,16 +56,11 @@ def _make_separated_configs(tmpdir, strategies_config=None):
     """创建分离的配置文件 - settings.yaml + strategies.yaml"""
     # settings.yaml - 系统配置
     system_config = {
-        "strategy_engine": {
-            "factory_endpoint": "http://127.0.0.1:8888",
-            "strategies_dir": str(PROJECT_ROOT / "strategies"),
-        },
         "data_manager": {
             "source_data_path": str(tmpdir / "source_data"),
         },
         "signal_logging": {
             "storage": {"path": str(tmpdir / "signals")},
-            "kafka": {"enabled": False},
         },
     }
     settings_path = tmpdir / "settings.yaml"
@@ -171,9 +161,6 @@ class TestParseStrategiesConfig:
         configs = parse_strategies_config(settings_path)
         assert len(configs) == 0
 
-
-
-
     def test_user_id_from_config_path_takes_priority(self, tmp_path):
         """config_path 存在且含 user_id 时，优先使用其值（而非共享配置）"""
         from run_strategies_manager import parse_strategies_config
@@ -206,9 +193,6 @@ class TestParseStrategiesConfig:
         assert len(configs) == 1
         # 应使用 config_path 中的 user_id=42
         assert configs[0]["user_id"] == "42"
-
-
-
 
 
 class TestBuildStrategyId:
@@ -338,8 +322,6 @@ class TestStrategyRuntime:
         runtime = StrategyRuntime(
             system_config_path=settings_path,
             strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
         )
 
         assert runtime.system_config_path == settings_path
@@ -358,232 +340,8 @@ class TestStrategyRuntime:
         runtime = StrategyRuntime(
             system_config_path=settings_path,
             strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
         )
 
         # 验证至少有一个 cta_ict_v3 策略
         ict_ids = [k for k in runtime.enabled_strategies if "ICT" in k]
         assert len(ict_ids) >= 1
-
-
-    def test_register_all_to_factory_passes_dict(self, tmp_path):
-        """
-        _register_all_to_factory 应传 dict 给 factory_client.register()
-        而非关键字参数（factory_client.register() 签名为 register(config: Dict)）
-        """
-        from run_strategies_manager import StrategyRuntime
-
-        settings_path, strategies_path = _make_separated_configs(tmp_path)
-
-        runtime = StrategyRuntime(
-            system_config_path=settings_path,
-            strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
-        )
-
-        # Mock register 方法
-        runtime.factory_client.register = MagicMock(return_value={"status": "success"})
-
-        result = runtime._register_all_to_factory()
-
-        # 验证 register 被调用，且传参是 dict
-        assert runtime.factory_client.register.call_count >= 1, "至少应调用一次 register"
-        call_args = runtime.factory_client.register.call_args
-        # call_args[0] 是位置参数元组，call_args[1] 是关键字参数字典
-        # 应该通过位置参数传 dict，不应该有关键字参数
-        assert len(call_args[0]) == 1, "应传 1 个位置参数（dict）"
-        assert isinstance(call_args[0][0], dict), "位置参数应为 dict"
-        assert call_args[1] == {}, "不应传关键字参数"
-
-        # 验证 dict 中包含 strategy_id
-        config = call_args[0][0]
-        assert "strategy_id" in config
-
-    def test_register_all_to_factory_returns_results(self, tmp_path):
-        """_register_all_to_factory 返回注册结果"""
-        from run_strategies_manager import StrategyRuntime
-
-        settings_path, strategies_path = _make_separated_configs(tmp_path)
-
-        runtime = StrategyRuntime(
-            system_config_path=settings_path,
-            strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
-        )
-        runtime.factory_client.register = MagicMock(return_value={"status": "success"})
-
-        result = runtime._register_all_to_factory()
-
-        # 验证有返回结果
-        assert isinstance(result, dict)
-        assert len(result) >= 1  # 至少有一个策略注册
-
-
-class TestInitializeWithFactoryOrder:
-    """测试 initialize_with_factory 调用顺序"""
-
-    def test_callback_server_started_before_restore(self, tmp_path):
-        """
-        验证: callback server 必须在 _restore_running_strategies 之前启动
-
-        Bug: 如果 callback server 在 restore 之后启动，
-        factory 的 notify 回调连接 8892 失败，
-        二次确认也失败，导致策略状态被回滚到 registered。
-        """
-        from run_strategies_manager import StrategyRuntime
-
-        settings_path, strategies_path = _make_separated_configs(tmp_path)
-
-        runtime = StrategyRuntime(
-            system_config_path=settings_path,
-            strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
-            callback_port=18892,
-        )
-
-        call_order = []
-
-        original_start_callback = runtime._start_callback_server
-        def tracked_start_callback():
-            call_order.append("callback_server_started")
-
-        runtime._start_callback_server = tracked_start_callback
-
-        original_restore = runtime._restore_running_strategies
-        def tracked_restore():
-            call_order.append("restore_started")
-            return original_restore()
-
-        runtime._restore_running_strategies = tracked_restore
-
-        runtime.factory_client.register = MagicMock(return_value={"status": "success"})
-
-        async def _run():
-            return await runtime.initialize_with_factory()
-
-        asyncio.run(_run())
-
-        # callback_server_started 必须在 restore_started 之前
-        assert "callback_server_started" in call_order
-        assert "restore_started" in call_order
-        assert call_order.index("callback_server_started") < call_order.index("restore_started"), (
-            f"callback server 必须在 restore 之前启动，实际顺序: {call_order}"
-        )
-
-    def test_callback_port_available_when_factory_notifies(self, tmp_path):
-        """
-        验证: 当 factory 尝试通知时，callback server 应该已经在监听
-        """
-        from run_strategies_manager import StrategyRuntime
-
-        settings_path, strategies_path = _make_separated_configs(tmp_path)
-
-        runtime = StrategyRuntime(
-            system_config_path=settings_path,
-            strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
-            callback_port=18893,
-        )
-
-        runtime.factory_client.register = MagicMock(return_value={"status": "success"})
-        runtime._restore_running_strategies = MagicMock(return_value={})
-
-        # Mock callback server start to just set the flag
-        def mock_start_callback(port=None):
-            runtime.factory_client._callback_server = MagicMock()
-
-        runtime._start_callback_server = mock_start_callback
-
-        async def _run():
-            return await runtime.initialize_with_factory()
-
-        asyncio.run(_run())
-
-        # callback server 应该已启动
-        assert runtime.factory_client._callback_server is not None, \
-            "callback server 应该在 initialize_with_factory 后运行"
-
-
-class TestHeartbeatReportsCorrectStatus:
-    """测试心跳正确报告策略状态"""
-
-    def test_heartbeat_reports_running_when_subprocess_exists(self, tmp_path):
-        """
-        验证：当 factory_client._subprocesses 中有运行中的策略时，
-        心跳应报告 'running' 而不是 'stopped'
-        """
-        from run_strategies_manager import StrategyRuntime
-
-        settings_path, strategies_path = _make_separated_configs(tmp_path)
-
-        runtime = StrategyRuntime(
-            system_config_path=settings_path,
-            strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
-        )
-
-        # 模拟 factory_client._subprocesses 中有一个运行中的进程
-        mock_proc = MagicMock()
-        mock_proc.poll.return_value = None
-        runtime.factory_client._subprocesses["TEST_STRATEGY_ID"] = mock_proc
-
-        running = runtime.factory_client.get_running_strategies()
-
-        assert "TEST_STRATEGY_ID" in running
-
-    def test_heartbeat_reports_stopped_when_no_subprocess(self, tmp_path):
-        """
-        验证：当 factory_client._subprocesses 为空时，
-        心跳应报告 'stopped'
-        """
-        from run_strategies_manager import StrategyRuntime
-
-        settings_path, strategies_path = _make_separated_configs(tmp_path)
-
-        runtime = StrategyRuntime(
-            system_config_path=settings_path,
-            strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
-        )
-
-        runtime.factory_client._subprocesses.clear()
-
-        running = runtime.factory_client.get_running_strategies()
-
-        assert len(running) == 0
-
-    def test_heartbeat_ignores_self_processes_dict(self, tmp_path):
-        """
-        验证：心跳不应依赖 self.processes 字典
-        """
-        from run_strategies_manager import StrategyRuntime
-
-        settings_path, strategies_path = _make_separated_configs(tmp_path)
-
-        runtime = StrategyRuntime(
-            system_config_path=settings_path,
-            strategies_config_path=strategies_path,
-            strategies_dir=str(PROJECT_ROOT / "strategies"),
-            factory_endpoint="http://127.0.0.1:8888",
-        )
-
-        # 模拟 self.processes 有一个条目（旧的来源）
-        mock_old_proc = MagicMock()
-        mock_old_proc.returncode = None
-        runtime.processes["TEST_STRATEGY_ID"] = mock_old_proc
-
-        # 但 factory_client._subprocesses 有另一个运行中的进程
-        mock_new_proc = MagicMock()
-        mock_new_proc.poll.return_value = None
-        runtime.factory_client._subprocesses["TEST_STRATEGY_ID"] = mock_new_proc
-
-        running = runtime.factory_client.get_running_strategies()
-
-        assert "TEST_STRATEGY_ID" in running

@@ -1,11 +1,11 @@
 # Data Manager 架构文档
 
 **版本**: 3.7.0
-**更新日期**: 2026-05-29
+**更新日期**: 2026-09-06
 
 ## 概述
 
-Data Manager 是量化交易策略系统的数据接入层，为策略层提供统一的 K 线数据访问服务。采用本地 CSV 文件存储 + 内存缓存 + WS 实时推送的轻量化设计。
+Data Manager 是量化交易策略系统的数据接入层，为策略层提供统一的 K 线数据访问服务。单体模式下采用本地 CSV 文件存储 + 内存缓存 + 直连 Binance 公共 WS 实时推送的轻量化设计（无外部行情服务）。
 
 ---
 
@@ -14,7 +14,7 @@ Data Manager 是量化交易策略系统的数据接入层，为策略层提供�
 ```
 ┌─────────────────────────────────────────────────┐
 │              Strategy Core Layer                │
-│  (cta_ict_v3 / cta_rbreaker_v3 / obv_atr_v2)  │
+│  (sar_snt3_v3 等策略插件)   │
 └────────────────────┬────────────────────────────┘
                      │ get_klines(symbol, timeframe, limit)
                      ↓
@@ -32,7 +32,7 @@ Data Manager 是量化交易策略系统的数据接入层，为策略层提供�
                      ↓
 ┌─────────────────────────────────────────────────┐
 │  data/klines/{symbol}_{timeframe}.csv           │
-│  klines_service (WS + HTTP API)                 │
+│  Binance 公共 WS/REST（单体模式内置实时源）        │
 └─────────────────────────────────────────────────┘
 ```
 
@@ -57,11 +57,11 @@ Data Manager 是量化交易策略系统的数据接入层，为策略层提供�
 ### 实时数据流
 
 ```
-klines_service WS 推送 1m K 线
+Binance 公共 fstream WS 推送 1m K 线
     ↓
 KlinesWSClient._on_kline_received()
     ↓
-完整性验证（差值 > 90s → API 补齐 gap）
+完整性验证（差值 > 90s → fapi REST 补齐 gap）
     ↓
 save_klines_to_csv() 统一持久化
     ↓
@@ -120,9 +120,7 @@ data_manager:
   csv_filename_pattern: "{symbol}_{timeframe}.csv"
   cache_max_size: 10000
   auto_load: true
-  klines_service_enabled: true
-  klines_service_ws_url: "${KLINES_WS_URL}"
-  klines_service_http_url: "${KLINES_HTTP_URL}"
+  realtime_enabled: true    # 单体模式：直连 Binance 公共 WS + fapi 历史
 ```
 
 DataManagerConfig 字段:
@@ -135,7 +133,7 @@ DataManagerConfig 字段:
 | `preload_days` | 7 | 预加载最近 N 天 |
 | `cache_1m_max_rows` | 500000 | 1m 缓存最大行数 |
 | `cache_1m_max_age_days` | 90 | 1m 缓存最大年龄 |
-| `klines_service_enabled` | True | 是否启用 klines_service |
+| `realtime_enabled` | True | 单体模式：直连 Binance 公共 WS + fapi 历史（false 只用本地 CSV） |
 | `sync_history_days` | 30 | 启动时补齐历史天数 |
 | `persistence_interval_minutes` | 5 | 缓存刷到 CSV 的间隔 |
 | `backtest_mode` | False | 回测模式（禁用增量返回） |

@@ -263,7 +263,7 @@ class TestOptimize2CacheUpdateOptimization:
                 csv_dir=tmpdir_live,
                 preload_1m_enabled=False,
                 backtest_mode=False,
-                klines_service_enabled=False,
+                realtime_enabled=False,
             )
             dm_live = DataManager(dm_live_config)
             dm_live.connect()

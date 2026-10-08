@@ -23,7 +23,7 @@ import sys
 import yaml
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, Any, List
+from typing import Dict, Any, List, NoReturn
 
 from dotenv import load_dotenv
 
@@ -41,8 +41,13 @@ import backtrader as bt
 import pandas as pd
 
 from data_manager import DataManager, DataManagerConfig
-from data_manager.klines_loader import load_klines_data, save_to_csv
 from backtest.bt_strategy import BacktestBTStrategy
+# 回测缺数据时的自动下载走运维脚本这一条唯一路径。
+# 曾用 data_manager.klines_loader.load_klines_data，但它只扫本地按日 ZIP 解包目录
+# （$DATA_PATH/binance/futures/um/daily/...），干净环境下必然返回空 DataFrame ——
+# 「自动下载」根本不联网，回测就在过时数据上静默跑出零成交报告。
+# 方向是 backtest → scripts（脚本自身仍不 import 任何项目模块）。
+from scripts.download_data import _get_proxies, download_range
 from backtest.signal_mapper import SignalMapper
 from backtest.backtest_reporter import BacktestReporter
 from backtest.config_loader import (
@@ -134,6 +139,9 @@ _SYNC_BUFFER_DAYS = 5
 _SYNC_MIN_DAYS = 30
 
 _WARMUP_MARGIN = 1.2
+
+# 尾部允许的滞后：末根未闭合 + 归档发布延迟属常态，不该阻断回测
+_TAIL_TOLERANCE = timedelta(minutes=5)
 
 
 def calc_warmup_1m_bars(strategy_config: Dict[str, Any]) -> int:
@@ -278,7 +286,7 @@ def _save_big_interval_csvs(data_manager, symbol: str, data_dir: str) -> None:
         if df is None or df.empty:
             continue
 
-        csv_path = Path(data_dir) / interval / f'{symbol}_{interval}.csv'
+        csv_path = _kline_csv_path(data_dir, interval, symbol)
         csv_path.parent.mkdir(parents=True, exist_ok=True)
 
         # 合并现有数据
@@ -352,123 +360,27 @@ def preload_klines_to_cache(
     strategy_config: Dict[str, Any] | None = None,
     end_date: str | None = None,
 ) -> None:
-    """预加载 K 线数据到 DataManager 缓存。
+    """预加载 K 线数据到 DataManager 缓存，缺数据时自动从 Binance 下载。
 
     数据源：{data_dir}/{timeframe}/{SYMBOL}_{timeframe}.csv
-    若 CSV 不存在，自动调用 load_klines_data 下载数据。
-    若 CSV 存在但起点不满足 warm-up 需求，自动补齐缺失区间。
-    若 CSV 最新时间早于当前时间，自动补齐到最新。
+    只下载「需要且缺失」的子区间（头部 warm-up 缺口 / 尾部缺口），走
+    scripts/download_data.py 的归档分块链路。
+
+    数据不覆盖回测区间时 **exit 1**，不再静默产出零成交报告。
     """
     warmup_bars = calc_warmup_1m_bars(strategy_config or {})
     bt_start = datetime.strptime(start_date, "%Y%m%d").replace(tzinfo=timezone.utc)
     warmup_start = bt_start - timedelta(minutes=warmup_bars)
-    warmup_start_str = warmup_start.strftime("%Y-%m-%d")
+    sync_end = _resolve_sync_end(end_date)
 
-    # 指定回测结束时间时只补齐到该日期，避免历史回测无意义地同步到今天。
-    if end_date:
-        _, sync_end = parse_date_input(end_date)
-        sync_end = sync_end.replace(hour=23, minute=59, second=59)
-    else:
-        sync_end = datetime.now(timezone.utc)
-    sync_end_str = sync_end.strftime("%Y-%m-%d")
+    proxies = _get_proxies()
 
     for sym in symbols:
-        csv_path = Path(data_dir) / timeframe / f"{sym}_{timeframe}.csv"
-
-        df_1m = None
-        if csv_path.exists():
-            df_1m = _read_klines_csv(csv_path)
-            logger.info(f"{sym} 1m CSV 已加载: {len(df_1m)} 行")
-            _ensure_normalized_csv(csv_path, df_1m)
-
-        if df_1m is None or df_1m.empty:
-            logger.info(f"{sym} CSV 不存在，自动下载历史数据 (warm-up: {warmup_start_str})...")
-            df_1m = load_klines_data(
-                symbol=sym.lower(),
-                start_date=warmup_start_str,
-                end_date=sync_end_str,
-                frequency="1m",
-                instrument_type="um",
-            )
-            if df_1m is not None and not df_1m.empty:
-                save_to_csv(
-                    df_1m, symbol=sym, exchange="binance",
-                    instrument_type="um", frequency="1m",
-                    output_dir=data_dir,
-                )
-                if csv_path.exists():
-                    df_1m = _read_klines_csv(csv_path)
-            else:
-                logger.warning(f"{sym} 下载数据失败，跳过")
-
-        elif df_1m is not None and not df_1m.empty:
-            csv_earliest = df_1m['timestamp'].min()
-            csv_latest = df_1m['timestamp'].max()
-
-            # 检查 warm-up 起始时间
-            if csv_earliest > warmup_start:
-                logger.info(
-                    f"{sym} CSV 起始 {csv_earliest} 晚于 warm-up 需求 {warmup_start}，"
-                    f"自动补齐 {warmup_start_str} ~ {csv_earliest.strftime('%Y-%m-%d')}"
-                )
-                df_gap = load_klines_data(
-                    symbol=sym.lower(),
-                    start_date=warmup_start_str,
-                    end_date=csv_earliest.strftime("%Y-%m-%d"),
-                    frequency="1m",
-                    instrument_type="um",
-                )
-                if df_gap is not None and not df_gap.empty:
-                    if 'timestamp' in df_gap.columns:
-                        df_gap['timestamp'] = _parse_kline_timestamps(df_gap['timestamp'])
-                    elif 'datetime' in df_gap.columns:
-                        df_gap = df_gap.rename(columns={'datetime': 'timestamp'})
-                        df_gap['timestamp'] = _parse_kline_timestamps(df_gap['timestamp'])
-                    df_1m = pd.concat([df_gap, df_1m], ignore_index=True)
-                    df_1m = df_1m.drop_duplicates(subset=['timestamp'], keep='last')
-                    df_1m = df_1m.sort_values('timestamp').reset_index(drop=True)
-                    save_to_csv(
-                        df_1m, symbol=sym, exchange="binance",
-                        instrument_type="um", frequency="1m",
-                        output_dir=data_dir,
-                    )
-                    if csv_path.exists():
-                        df_1m = _read_klines_csv(csv_path)
-                    csv_latest = df_1m['timestamp'].max()
-                else:
-                    logger.warning(f"{sym} warm-up 区间数据下载失败，使用现有数据")
-
-            # 检查回测结束时间（补齐 CSV 最新时间到当前最新时间）
-            if csv_latest < sync_end - timedelta(minutes=5):
-                logger.info(
-                    f"{sym} CSV 最新 {csv_latest} 早于目标时间 {sync_end}，"
-                    f"自动补齐 {csv_latest.strftime('%Y-%m-%d')} ~ {sync_end_str}"
-                )
-                df_gap_end = load_klines_data(
-                    symbol=sym.lower(),
-                    start_date=csv_latest.strftime("%Y-%m-%d"),
-                    end_date=sync_end_str,
-                    frequency="1m",
-                    instrument_type="um",
-                )
-                if df_gap_end is not None and not df_gap_end.empty:
-                    if 'timestamp' in df_gap_end.columns:
-                        df_gap_end['timestamp'] = _parse_kline_timestamps(df_gap_end['timestamp'])
-                    elif 'datetime' in df_gap_end.columns:
-                        df_gap_end = df_gap_end.rename(columns={'datetime': 'timestamp'})
-                        df_gap_end['timestamp'] = _parse_kline_timestamps(df_gap_end['timestamp'])
-                    df_1m = pd.concat([df_1m, df_gap_end], ignore_index=True)
-                    df_1m = df_1m.drop_duplicates(subset=['timestamp'], keep='last')
-                    df_1m = df_1m.sort_values('timestamp').reset_index(drop=True)
-                    save_to_csv(
-                        df_1m, symbol=sym, exchange="binance",
-                        instrument_type="um", frequency="1m",
-                        output_dir=data_dir,
-                    )
-                    if csv_path.exists():
-                        df_1m = _read_klines_csv(csv_path)
-                else:
-                    logger.warning(f"{sym} 回测结束区间数据下载失败，使用现有数据")
+        df_1m = _load_csv_if_present(data_dir, timeframe, sym)
+        df_1m = _fill_gaps(
+            df_1m, sym, timeframe, data_dir, warmup_start, sync_end, proxies,
+        )
+        _verify_data_coverage(sym, df_1m, warmup_start, bt_start, sync_end, timeframe)
 
         if df_1m is not None and not df_1m.empty:
             data_manager.cache.put(sym, "1m", df_1m, force_1m=True)
@@ -479,6 +391,197 @@ def preload_klines_to_cache(
 
         # 保存大周期 CSV（仅回测）
         _save_big_interval_csvs(data_manager, sym, data_dir)
+
+
+def _kline_csv_path(data_dir: str, timeframe: str, symbol: str) -> Path:
+    """K 线 CSV 的落盘路径约定：{data_dir}/{timeframe}/{SYMBOL}_{timeframe}.csv
+
+    与 settings.yaml 的 csv_dir / profile 的 data_dir 约定一致，
+    也与 scripts/download_data.py 的输出路径一致（回测与实盘读同一份 CSV）。
+    """
+    return Path(data_dir) / timeframe / f"{symbol}_{timeframe}.csv"
+
+
+def _resolve_sync_end(end_date: str | None) -> datetime:
+    """数据需要补齐到的终点。
+
+    指定 end_date 时只补到该日期，避免历史回测无意义地同步到今天。
+
+    结果**夹到当前时刻**：end_date 取当天时 23:59:59 比"现在"晚十几小时，
+    等于向交易所索要未来 K 线，还会让尾部缺口判据恒真、每次回测白跑一次下载。
+    """
+    if not end_date:
+        return datetime.now(timezone.utc)
+    _, parsed = parse_date_input(end_date)
+    return min(
+        parsed.replace(hour=23, minute=59, second=59),
+        datetime.now(timezone.utc),
+    )
+
+
+def _load_csv_if_present(
+    data_dir: str, timeframe: str, symbol: str
+) -> pd.DataFrame | None:
+    """读取 1m CSV（不存在则 None），顺便把原始格式规范化为 ISO 时间戳。"""
+    csv_path = _kline_csv_path(data_dir, timeframe, symbol)
+    if not csv_path.exists():
+        return None
+    df = _read_klines_csv(csv_path)
+    logger.info(f"{symbol} 1m CSV 已加载: {len(df)} 行")
+    _ensure_normalized_csv(csv_path, df)
+    return df
+
+
+def _fill_gaps(
+    df_1m: pd.DataFrame | None,
+    symbol: str,
+    timeframe: str,
+    data_dir: str,
+    warmup_start: datetime,
+    sync_end: datetime,
+    proxies: dict | None,
+) -> pd.DataFrame | None:
+    """下载缺失区间并返回补齐后的数据（无缺口时原样返回）。
+
+    下载失败只 warning：由调用方的 _verify_data_coverage 统一按「数据是否够跑」
+    判定。网络抖动但磁盘数据已够用时不该阻断回测。
+    """
+    csv_path = _kline_csv_path(data_dir, timeframe, symbol)
+    gaps = _plan_download_gaps(df_1m, warmup_start, sync_end)
+
+    for gap_start, gap_end, label in gaps:
+        logger.info(
+            f"{symbol} {label}缺口，自动下载 "
+            f"{gap_start:%Y-%m-%d %H:%M} ~ {gap_end:%Y-%m-%d %H:%M}"
+        )
+        try:
+            download_range(
+                symbol, timeframe, gap_start, gap_end, data_dir, proxies,
+                # 不传已读的 df_1m：_read_klines_csv 可能带 close_time/ignore
+                # 等 Binance 原始列，merge 后会把它们连同 NaN 一起写回 CSV，
+                # 破坏 6 列格式。让 download_range 自己读规范化后的文件。
+                existing=None,
+            )
+        except RuntimeError as e:
+            logger.warning(f"{symbol} {label}缺口下载失败: {e}")
+
+    # 循环外只读一次：gaps 在进入循环前已定，逐轮重读不参与缺口规划，
+    # 只有最终值会被 _verify_data_coverage 与缓存消费。1m CSV 可达百万行级
+    # （190 万行读一次 ~3.4s），每个缺口读一遍纯属浪费。
+    if gaps and csv_path.exists():
+        df_1m = _read_klines_csv(csv_path)
+
+    return df_1m
+
+
+def _plan_download_gaps(
+    df_1m: pd.DataFrame | None,
+    warmup_start: datetime,
+    sync_end: datetime,
+) -> List[tuple[datetime, datetime, str]]:
+    """算出需要下载的子区间，返回 [(start, end, label), ...]。
+
+    只补「需要且缺失」的部分，不重下已有数据 —— 本例中尾部缺口是 12 天，
+    而旧实现按 CSV 末根到今天算是 47 天。
+
+    尾部缺口起点取 csv_max **本身**而非 +1 周期：崩溃时未闭合就落盘的残缺末根
+    需要被完整值覆盖（download_range → merge_klines 的 keep="last" 保证覆盖方向）。
+    """
+    if df_1m is None or df_1m.empty:
+        return [(warmup_start, sync_end, "全量")] if warmup_start < sync_end else []
+
+    csv_min, csv_max = _csv_time_bounds(df_1m)
+    gaps: List[tuple[datetime, datetime, str]] = []
+
+    # 头部终点不越过 sync_end；起点不早于 warmup_start（CSV 整段都在回测区间
+    # 之后时不必回补）。两个 min/max 已蕴含「是否存在缺口」的判断，故无需外层守卫。
+    head_end = min(csv_min, sync_end)
+    if warmup_start < head_end:
+        gaps.append((warmup_start, head_end, "warm-up 头部"))
+
+    tail_start = max(csv_max, warmup_start)
+    if tail_start < sync_end:
+        gaps.append((tail_start, sync_end, "尾部"))
+
+    return gaps
+
+
+def _csv_time_bounds(df_1m: pd.DataFrame) -> tuple[datetime, datetime]:
+    """CSV 覆盖的时间范围 (最早, 最晚)，转为 python datetime 便于与区间参数比较。"""
+    return (
+        df_1m["timestamp"].min().to_pydatetime(),
+        df_1m["timestamp"].max().to_pydatetime(),
+    )
+
+
+def _humanize_gap(delta: timedelta) -> str:
+    """把缺口时长渲染成人能判断的字符串。
+
+    不能只用 `.days`：任何不足 24h 的缺口都会整除成 0，打印出
+    「缺口 0 天」却同时 exit 1 —— 读者会以为没缺东西，反而怀疑是误报。
+    """
+    total_minutes = int(delta.total_seconds() // 60)
+    if total_minutes < 60:
+        return f"{total_minutes} 分钟"
+    if total_minutes < 1440:
+        return f"{total_minutes // 60} 小时 {total_minutes % 60} 分钟"
+    return f"{total_minutes // 1440} 天 {(total_minutes % 1440) // 60} 小时"
+
+
+def _verify_data_coverage(
+    symbol: str,
+    df_1m: pd.DataFrame | None,
+    warmup_start: datetime,
+    bt_start: datetime,
+    sync_end: datetime,
+    timeframe: str,
+) -> None:
+    """校验 1m 数据覆盖回测区间，不足则 exit 1。
+
+    旧实现下载失败只打 WARNING 就继续，于是 CSV 只到 07-08、回测窗口是 08-20 起
+    这种情况会跑出「处理 K 线数：0」的零成交报告、退出码 0 —— 看起来像"策略没信号"，
+    实则窗口内一根 K 线都没有。指标数据不足同样是静默的（只 warn 不阻断），
+    故 warm-up 不足也必须硬失败。
+
+    中部空洞不校验：交易所停机是常态（现有 BTCUSDT CSV 在 06-02~07-08 间就缺
+    523 根），端点覆盖才是可执行的信号。
+    """
+    def _die(reason: str, have: str) -> NoReturn:
+        logger.error(
+            f"{symbol} {timeframe} 数据{reason}\n"
+            f"  需要: {warmup_start:%Y-%m-%d %H:%M} ~ {sync_end:%Y-%m-%d %H:%M}"
+            f"（回测窗口自 {bt_start:%Y-%m-%d %H:%M}）\n"
+            f"  实有: {have}\n"
+            f"  请检查网络/代理，或手动执行:\n"
+            f"        python3 scripts/download_data.py --symbol {symbol} "
+            f"--interval {timeframe}"
+        )
+        sys.exit(1)
+
+    if df_1m is None or df_1m.empty:
+        _die("为空", "无数据")
+
+    csv_min, csv_max = _csv_time_bounds(df_1m)
+    have = f"{csv_min:%Y-%m-%d %H:%M} ~ {csv_max:%Y-%m-%d %H:%M}"
+
+    if csv_max < bt_start:
+        _die(
+            f"不覆盖回测区间（窗口内零根 K 线，缺口 {_humanize_gap(bt_start - csv_max)}）",
+            have,
+        )
+
+    if csv_min > warmup_start:
+        _die(
+            f"warm-up 不足（缺口 {_humanize_gap(csv_min - warmup_start)}）"
+            f"—— 指标会静默饥饿，回测结果不可信",
+            have,
+        )
+
+    if csv_max < sync_end - _TAIL_TOLERANCE:
+        logger.warning(
+            f"{symbol} 数据末根 {csv_max:%Y-%m-%d %H:%M} 早于目标 "
+            f"{sync_end:%Y-%m-%d %H:%M}，回测区间尾部数据缺失"
+        )
 
 
 def run_backtest(
@@ -544,7 +647,7 @@ def run_backtest(
     # 2. 创建 DataManager（真实实例，禁用 WS，回测模式返回完整数据）
     dm_config = DataManagerConfig(
         csv_dir=data_dir,
-        klines_service_enabled=False,
+        realtime_enabled=False,
         auto_sync_on_connect=False,
         preload_1m_enabled=False,
         backtest_mode=True,
@@ -789,12 +892,6 @@ def run_backtest(
     logger.info("回测输出文件:")
     for name, path in paths.items():
         logger.info(f"  {name}: {path}")
-
-
-def _find_csv_file(data_dir: str, symbol: str, timeframe: str,
-                    strategy_dir_name: str = "") -> Path:
-    """查找 CSV 文件: {data_dir}/{timeframe}/{SYMBOL}_{timeframe}.csv"""
-    return Path(data_dir) / timeframe / f"{symbol}_{timeframe}.csv"
 
 
 def _find_csv_files(data_dir: str, symbol: str, timeframe: str,

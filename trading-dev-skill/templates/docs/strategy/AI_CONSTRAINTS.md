@@ -12,7 +12,7 @@
 | 2 | 禁止使用 `datetime.now()` 作为信号时间戳 | 应使用 K 线时间，保证可重现 |
 | 3 | 禁止在 State 中使用可变默认值 | `[]`, `{}` 会共享状态 |
 | 4 | 禁止跳过数据不足检查 | 会导致指标计算错误 |
-| 5 | 禁止在回测模式启用 K 线冷却 | 会导致回测信号缺失 |
+| 5 | 禁止假设基类做了入场 K 线冷却 | 基类**没有**；自己实现的冷却必须在回测模式跳过 |
 | 6 | 禁止使用 `datetime.now()` 判断止损日冷却 | 回测时应使用 K 线时间 |
 | 7 | 禁止移动止盈记录止损日期 | 非止损，次日应可开仓 |
 | **8** | **禁止在 Strategy 类中计算技术指标** | 所有指标应在 Core.analyze() 内使用已闭合 K 线计算 |
@@ -32,13 +32,12 @@
 | 1 | 必须使用基类 `get_closed_data()` | 继承 BaseStrategyCore 即可使用 |
 | 2 | 必须在 `analyze()` 中使用已闭合数据 | 核心逻辑类 |
 | 3 | 必须实现 `_get_indicator_timeframes()` | Strategy 类 |
-| 4 | 必须在 `on_start()` 中注册时间框架 | Strategy 类（BaseStrategy 已实现） |
-| 5 | 必须检查数据是否足够 | `analyze()` 开头 |
-| 6 | 必须实现 K 线冷却 | Strategy 类（BaseStrategy 已实现） |
-| 7 | 止损时必须调用 `clear_position(record_stop_loss=True)` | Core 类 `_close()` 方法 |
+| 4 | 必须在 `on_start()` 中注册时间框架 | Strategy 类（BaseStrategy 已实现） || 5 | 必须检查数据是否足够 | `analyze()` 开头 |
+| 6 | 需要"一根大周期只入场一次"必须自己重写 `on_kline()` | Strategy 类（基类**未提供**入场冷却） |
+| 7 | 平仓必须走 `_notify_exit_and_clear(..., is_stop_loss=...)` | Core 类 `_close()` 方法；**不要**自己调 `clear_position()`，基类内部已调用 |
 | **8** | **必须在 `analyze()` 内计算所有技术指标** | Core 类 `analyze()` |
 | **9** | **必须对每个时间框架调用 `get_closed_data()`** | Core 类 `analyze()` |
-| **10** | **必须在 `overrides/{SYMBOL}.yaml` 配置 `*_timeframes`** | per-symbol 配置文件 |
+| **10** | **必须在 `strategies/<name>/overrides/<SYMBOL>.yaml` 的 `params` 中配置 `*_timeframes`** | per-symbol 配置 |
 | **11** | **数组/字典字段必须使用 `field(default_factory=...)`** | State 类 |
 
 ---
@@ -48,25 +47,33 @@
 ### 止损日冷却检查
 
 ```python
-def analyze(self, symbol, klines_data, current_time):
+def analyze(self, symbol, klines_data, current_time, realtime_price=None, current_cash=None):
     state = self._get_state(symbol)
-    today = current_time.date() if current_time else datetime.now(timezone.utc).date()
-    if state.stop_loss_date == today:
+    if current_time is None:
+        return {"action": "hold", "price": 0, "strength": 0,
+                "metadata": {"reason": "K线时间缺失"}}
+    if state.stop_loss_date == current_time.date():
         return {"action": "hold", "price": 0, "strength": 0,
                 "metadata": {"reason": "今日已触发止损，禁止开仓"}}
 ```
 
 ### 止损时记录日期
 
+统一走基类 `_notify_exit_and_clear()`，`is_stop_loss=True` 时内部自动记录
+`stop_loss_date`，不要手写 `state.clear_position(...)`：
+
 ```python
-def _close(self, symbol, state, price, reason, is_stop_loss=False):
-    state.clear_position(record_stop_loss=is_stop_loss)
+def _close(self, symbol, state, price, reason, is_stop_loss=False, current_time=None):
+    return self._notify_exit_and_clear(
+        symbol=symbol, state=state, exit_price=price,
+        exit_reason=reason, is_stop_loss=is_stop_loss, exit_time=current_time,
+    )
 ```
 
 ### 多周期已闭合 K 线获取
 
 ```python
-def analyze(self, symbol, klines_data, current_time):
+def analyze(self, symbol, klines_data, current_time, realtime_price=None, current_cash=None):
     closed_4h = self.get_closed_data(klines_data, "4h", min_rows=30, current_time=current_time)
     closed_1h = self.get_closed_data(klines_data, "1h", min_rows=50, current_time=current_time)
     closed_15m = self.get_closed_data(klines_data, "15m", min_rows=20, current_time=current_time)
@@ -80,9 +87,9 @@ def analyze(self, symbol, klines_data, current_time):
 ### 数据不足检查
 
 ```python
-def analyze(self, symbol, klines_data, current_time):
+def analyze(self, symbol, klines_data, current_time, realtime_price=None, current_cash=None):
     df = self.get_closed_data(klines_data, self.timeframes[0], min_rows=50, current_time=current_time)
-    if df.empty or len(df) < self.min_rows:
+    if df.empty or len(df) < 50:
         return {"action": "hold", "price": 0, "strength": 0,
                 "metadata": {"reason": "K线数据不足"}}
 ```
@@ -98,6 +105,35 @@ if indicator.isna().iloc[-1]:
 
 ### K 线冷却
 
-新架构无需手动编写，基类已自动处理：
-- 同一根大周期 K 线不重复触发
-- 回测模式自动跳过冷却
+**基类不提供入场侧 K 线冷却。** 默认 `on_kline()` 在无持仓时每根 1m K 线都会调
+`analyze()`（`strategy_core/base/strategy.py:373-452`）。
+
+指标用已闭合 K 线、入场价用 `realtime_price`，所以这样不会产生未来函数——
+条件成立就立刻进场，不等收线。多数策略这样就够了。
+
+若确实要求"只在大周期闭合的那一分钟才判断入场"，重写 `on_kline()`：
+
+```python
+def _is_bar_closed(self, current_time) -> bool:
+    if current_time.minute != 0:
+        return False
+    tf = self.timeframes[0] if self.timeframes else self.DEFAULT_TIMEFRAME
+    if not tf.endswith("h"):
+        return True
+    return current_time.hour % int(tf[:-1]) == 0
+
+def on_kline(self, kline):
+    symbol = self._parse_kline_symbol(kline) or self.symbols[0]
+    state = self._core._get_state(symbol)
+    if not state.is_in_position():          # 持仓时照常每分钟查出场
+        self._update_kline_info(kline)
+        ts = self._current_kline_timestamp
+        if ts is None or not self._is_bar_closed(ts):
+            return None
+    return super().on_kline(kline)
+```
+
+完整可运行版本见 `strategies/example_ma_cross/strategy.py` 文件末尾附录。
+
+> `cooldown_timeframe` / `cooldown_bars` / `cooldown_ms` 是死配置，代码里没有任何地方
+> 读取它们（`cooldown_ms` 只被赋值从未使用），写了也不生效。

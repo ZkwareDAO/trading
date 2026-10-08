@@ -1,6 +1,6 @@
 # CTA Strategy Core - 量化交易策略核心系统
 
-模块化量化交易策略执行框架，**平台 + 插件**架构，支持多策略并行运行。每个策略独立进程，由外部 `cta_factory_service` 管理生命周期。
+模块化量化交易策略执行框架，**单体模式**，支持多策略并行运行。每个策略独立进程，直连 Binance 行情与下单。
 
 **版本**: 3.7.0
 **许可证**: Apache-2.0
@@ -36,7 +36,7 @@ python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 2026061
 
 结果输出到 `backtest_output/sar_snt3_v3/<日期>/BTCUSDT/`，含权益曲线、交易明细、信号 CSV 与图表。
 
-回测**不依赖任何外部服务**——回测链路不初始化 factory 与 signal hub 客户端（由代码保证，非配置开关）。
+回测**不依赖任何外部服务**——回测链路不初始化任何交易所客户端（由代码保证，非配置开关）。
 
 ### 3. 下载更多数据（可选）
 
@@ -65,7 +65,7 @@ python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
 
 ```bash
 cp .env.example .env
-# 编辑 .env，按需填服务地址（全部可留空：留空则回退 Binance 公共源、跳过 factory）
+# 编辑 .env，按需填代理地址（可留空：留空则直连 Binance 公共源）
 
 source .env && python3 run_strategies_manager.py
 ```
@@ -91,7 +91,7 @@ source .env && python3 run_strategies_manager.py
 不得覆盖策略参数，只能覆盖时间范围、并发数、输出位置。
 
 > **回测读两份配置**：`config/settings.yaml`（与实盘共用）+ `config/backtest.yaml`
-> （回测运行方式）。前者提供 `strategy_engine.use_bar_high_low_for_exit` —— 决定止损
+> （回测运行方式）。前者提供顶层 `use_bar_high_low_for_exit` —— 决定止损
 > 止盈用 K 线 high/low 还是收盘价判定，**直接影响成交次数与 PnL**，因此必须回测实盘
 > 一致，放在共用层是正确的。
 >
@@ -131,17 +131,12 @@ cta-strategy-code/
 │   │   ├── core.py            #   BaseStrategyCore - 核心逻辑基类
 │   │   ├── state.py           #   BaseState - 状态基类
 │   │   └── indicators.py      #   共享指标计算（ADX, EMA 等）
-│   ├── strategy_engine/       # 策略引擎
-│   │   ├── engine.py          #   策略加载、factory 通信、K 线分发
-│   │   ├── lifecycle.py       #   生命周期管理
-│   │   └── registry.py        #   策略注册表
-│   ├── signal_logging/        # 信号日志
+│   ├── signal_logging/        # 信号日志 + 信号参数构建
 │   │   ├── storage.py         #   Signal 数据模型
-│   │   ├── csv_adapter.py     #   CSV/JSON/Kafka 格式转换
+│   │   ├── csv_adapter.py     #   CSV/JSON 格式转换
+│   │   ├── signal_params.py   #   信号参数构建（overrides → CtaSignalCSV）
 │   │   ├── logger.py          #   SignalStorage + SignalLogger
-│   │   ├── kafka_producer.py  #   Kafka 推送（熔断器+去重）
-│   │   └── http_sender.py     #   HTTP 推送
-│   ├── factory_client.py      # Factory 通信封装（XML-RPC）
+│   │   └── binance_trader.py  #   直连下单执行器（单体模式唯一信号出口）
 │   ├── position_persistence.py# 仓位持久化
 │   └── utils/                 # 工具模块
 │       ├── config_loader.py   #   多环境配置加载
@@ -187,19 +182,6 @@ cta-strategy-code/
 
 ---
 
-## 与 cta_factory_service 的关系
-
-| 功能 | cta_factory_service | cta-strategy-code |
-|------|---------------------|-------------------|
-| 策略注册 | 接收注册 | 发起注册 |
-| 策略启停 | 管理 | 执行 |
-| 策略逻辑 | ❌ | ✅ |
-| 信号生成 | ❌ | ✅ |
-| K 线数据 | ❌ | ✅ (CSV + WS) |
-| 信号日志 | ❌ | ✅ (CSV + Kafka) |
-
----
-
 ## 文档导航
 
 | 文档 | 说明 |
@@ -224,8 +206,7 @@ python3 -m pytest data_manager/tests/ -v
 # 回测框架测试
 python3 -m backtest.tests.test_core
 
-# 策略注册测试
-python3 test_register_factory.py
+
 ```
 
 ---

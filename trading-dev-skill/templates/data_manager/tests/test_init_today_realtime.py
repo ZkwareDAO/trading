@@ -19,9 +19,9 @@ class TestInitTodayRealtime:
     def _make_manager(self, tmp_path: Path) -> DataManager:
         config = DataManagerConfig(
             csv_dir=str(tmp_path / "klines"),
-            klines_service_enabled=True,
-            klines_service_http_url="http://127.0.0.1:17081",
-            klines_service_ws_url="ws://127.0.0.1:17081/ws/klines",
+            realtime_enabled=True,
+            # removed http url #"http://127.0.0.1:17081",
+            # removed ws url #"ws://127.0.0.1:17081/ws/klines",
         )
         dm = DataManager(config)
         dm.enable_kline_repository()
@@ -61,7 +61,7 @@ class TestInitTodayRealtime:
 
             with patch.object(dm, '_load_csv', return_value=df):
                 # mock WS 启动
-                with patch.object(dm, 'start_klines_service_async', return_value=True):
+                with patch.object(dm, 'start_realtime_async', return_value=True):
                     with patch.object(dm, 'subscribe_klines_async', return_value=True):
                         result = await dm.init_today_realtime("BTCUSDT")
 
@@ -81,7 +81,7 @@ class TestInitTodayRealtime:
             df = pd.DataFrame(recent)
 
             with patch.object(dm, '_load_csv', return_value=df):
-                with patch.object(dm, 'start_klines_service_async', return_value=True):
+                with patch.object(dm, 'start_realtime_async', return_value=True):
                     with patch.object(dm, 'subscribe_klines_async', return_value=True):
                         # 即使下载失败，本地有数据时仍应成功
                         result = await dm.init_today_realtime("BTCUSDT")
@@ -94,7 +94,7 @@ class TestInitTodayRealtime:
 
         with patch.object(dm, 'download_daily_data', return_value=False):
             with patch.object(dm, '_load_csv', return_value=None):
-                with patch.object(dm, 'start_klines_service_async', return_value=False):
+                with patch.object(dm, 'start_realtime_async', return_value=False):
                     result = await dm.init_today_realtime("BTCUSDT")
                     assert result is False
 
@@ -108,7 +108,7 @@ class TestInitTodayRealtime:
             df = pd.DataFrame(recent)
 
             with patch.object(dm, '_load_csv', return_value=df):
-                with patch.object(dm, 'start_klines_service_async', return_value=False):
+                with patch.object(dm, 'start_realtime_async', return_value=False):
                     # WS 失败时应降级，但仍然返回 True（本地数据可用）
                     result = await dm.init_today_realtime("BTCUSDT")
                     assert result is True

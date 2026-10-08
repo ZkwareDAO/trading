@@ -1,80 +1,93 @@
 #!/usr/bin/env python3
 """
-测试 SignalLogger.log_signal 的返回值语义：
-- 有 Kafka 且可用 → 返回推送结果
-- 无 Kafka → 返回 True（无操作视为成功）
+测试 SignalLogger 的返回值语义（单体模式）：
+- 未配置 direct_trader → 返回 True（只落存储，不下单）
+- direct_trader 下单成功 → 返回 True
+- direct_trader 下单失败 → 返回 False
+- direct_trader 抛异常 → 不打断主循环，返回 False
+
+原文件测的是 HTTP 推送通道的返回值语义。HTTP 推送通道已随
+单体模式重构移除，现在唯一的下发通道是 direct_trader 直连下单。
 """
 
 from unittest.mock import MagicMock
 from datetime import datetime, timezone
 
-from strategy_core.signal_logging.logger import SignalLogger
-from strategy_core.signal_logging.storage import Signal
+from strategy_core.signal_logging.logger import SignalLogger, SignalStorage
+from strategy_core.signal_logging.storage import Signal, SignalType
 
 
 class TestLogSignalReturnValue:
-    """测试 log_signal 返回值语义"""
+    """测试 log_signal / log_cta_signal 返回值语义"""
 
     def _make_signal(self):
-        signal = MagicMock(spec=Signal)
-        signal.signal_id = "sig-test-001"
-        signal.signal_type = "BUY"
-        signal.symbol = "BTCUSDT"
-        signal.price = 50000.0
-        signal.strength = 0.8
-        signal.timestamp = datetime.now(timezone.utc)
-        signal.metadata = {}
-        return signal
+        return Signal(
+            signal_id="sig-test-001",
+            strategy_id="test_strategy",
+            signal_type=SignalType.BUY,
+            symbol="BTCUSDT",
+            price=50000.0,
+            strength=0.8,
+            timestamp=datetime(2026, 5, 8, 1, 43, 0, tzinfo=timezone.utc),
+        )
 
-    def test_no_kafka_returns_true(self, tmp_path):
-        """没有 Kafka 时返回 True（无操作视为成功）"""
-        from strategy_core.signal_logging.logger import SignalStorage
+    def test_no_trader_returns_true(self, tmp_path):
+        """未配置 direct_trader 时返回 True（只落存储，不下单）"""
         storage = SignalStorage(base_dir=str(tmp_path / "signals"))
-        logger = SignalLogger(storage=storage, kafka_producer=None)
+        logger = SignalLogger(storage=storage)
 
-        signal = self._make_signal()
-        result = logger.log_signal(signal)
+        result = logger.log_signal(self._make_signal())
 
         assert result is True
 
-    def test_kafka_available_returns_true(self, tmp_path):
-        """Kafka 可用且推送成功时返回 True"""
-        from strategy_core.signal_logging.logger import SignalStorage
+    def test_direct_trader_success_returns_true(self, tmp_path):
+        """直连下单成功时返回 True"""
         storage = SignalStorage(base_dir=str(tmp_path / "signals"))
-        kafka_producer = MagicMock()
-        kafka_producer.is_available.return_value = True
-        logger = SignalLogger(storage=storage, kafka_producer=kafka_producer)
+        trader = MagicMock()
+        trader.execute.return_value = True
+        logger = SignalLogger(storage=storage, direct_trader=trader)
 
-        signal = self._make_signal()
-        result = logger.log_signal(signal, strategy_params={"user_id": 1})
+        result = logger.log_signal(self._make_signal(), strategy_params={"user_id": 1})
 
         assert result is True
-        kafka_producer.send_signal.assert_called_once()
+        trader.execute.assert_called_once()
 
-    def test_kafka_unavailable_returns_true(self, tmp_path):
-        """Kafka 不可用时返回 True（跳过不视为失败）"""
-        from strategy_core.signal_logging.logger import SignalStorage
+    def test_direct_trader_failure_returns_false(self, tmp_path):
+        """直连下单失败时返回 False —— 下单类失败必须如实上报"""
         storage = SignalStorage(base_dir=str(tmp_path / "signals"))
-        kafka_producer = MagicMock()
-        kafka_producer.is_available.return_value = False
-        logger = SignalLogger(storage=storage, kafka_producer=kafka_producer)
+        trader = MagicMock()
+        trader.execute.return_value = False
+        logger = SignalLogger(storage=storage, direct_trader=trader)
 
-        signal = self._make_signal()
-        result = logger.log_signal(signal)
-
-        assert result is True
-        kafka_producer.send_signal.assert_not_called()
-
-    def test_kafka_push_exception_returns_false(self, tmp_path):
-        """Kafka 推送异常时返回 False"""
-        from strategy_core.signal_logging.logger import SignalStorage
-        storage = SignalStorage(base_dir=str(tmp_path / "signals"))
-        kafka_producer = MagicMock()
-        kafka_producer.is_available.return_value = True
-        kafka_producer.send_signal.side_effect = RuntimeError("connection lost")
-        logger = SignalLogger(storage=storage, kafka_producer=kafka_producer)
-
-        signal = self._make_signal()
-        result = logger.log_signal(signal)
+        result = logger.log_signal(self._make_signal())
 
         assert result is False
+        trader.execute.assert_called_once()
+
+    def test_direct_trader_exception_does_not_propagate(self, tmp_path):
+        """直连下单抛异常时不应打断策略主循环，返回 False"""
+        storage = SignalStorage(base_dir=str(tmp_path / "signals"))
+        trader = MagicMock()
+        trader.execute.side_effect = RuntimeError("connection lost")
+        logger = SignalLogger(storage=storage, direct_trader=trader)
+
+        # 不应抛出
+        result = logger.log_signal(self._make_signal())
+
+        assert result is False
+
+    def test_log_cta_signal_no_trader_returns_true(self, tmp_path):
+        """log_cta_signal 未配置 direct_trader 时恒返回 True"""
+        storage = SignalStorage(base_dir=str(tmp_path / "signals"))
+        logger = SignalLogger(storage=storage)
+
+        assert logger.log_cta_signal(self._make_signal()) is True
+
+    def test_log_cta_signal_trader_failure_returns_false(self, tmp_path):
+        """log_cta_signal 直连下单失败时返回 False"""
+        storage = SignalStorage(base_dir=str(tmp_path / "signals"))
+        trader = MagicMock()
+        trader.execute.return_value = False
+        logger = SignalLogger(storage=storage, direct_trader=trader)
+
+        assert logger.log_cta_signal(self._make_signal()) is False

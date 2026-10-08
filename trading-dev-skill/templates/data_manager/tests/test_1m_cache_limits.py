@@ -28,7 +28,7 @@ class TestCacheLimits:
         config = DataManagerConfig(
             csv_dir=self.tmpdir,
             cache_1m_max_rows=1000,
-            klines_service_enabled=False,
+            realtime_enabled=False,
         )
         dm = DataManager(config)
         dm.connect()
@@ -56,7 +56,7 @@ class TestCacheLimits:
         config = DataManagerConfig(
             csv_dir=self.tmpdir,
             cache_1m_max_age_days=30,
-            klines_service_enabled=False,
+            realtime_enabled=False,
         )
         dm = DataManager(config)
         dm.connect()
@@ -77,7 +77,7 @@ class TestCacheLimits:
         assert cached_df is None or len(cached_df) == 0
 
     def test_recent_data_kept(self):
-        config = DataManagerConfig(csv_dir=self.tmpdir, klines_service_enabled=False)
+        config = DataManagerConfig(csv_dir=self.tmpdir, realtime_enabled=False)
         dm = DataManager(config)
         dm.connect()
 
@@ -99,7 +99,7 @@ class TestCacheLimits:
         assert len(cached) == 50
 
     def test_cache_status_format(self):
-        config = DataManagerConfig(csv_dir=self.tmpdir, klines_service_enabled=False)
+        config = DataManagerConfig(csv_dir=self.tmpdir, realtime_enabled=False)
         dm = DataManager(config)
         dm.connect()
 
@@ -119,7 +119,7 @@ class TestCacheLimits:
         config = DataManagerConfig(
             csv_dir=self.tmpdir,
             cache_1m_max_rows=100,
-            klines_service_enabled=False,
+            realtime_enabled=False,
         )
         dm = DataManager(config)
         dm.connect()

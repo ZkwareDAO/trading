@@ -40,11 +40,5 @@ types-PyYAML>=6.0
 # Technical indicators
 ta-lib>=0.4.0  # Requires TA-Lib installed system-wide (see docs/TA-Lib-INSTALL.md)
 
-# Security (for XML-RPC)
-defusedxml>=0.7.0  # Prevents XXE attacks on XML-RPC
-
-# Kafka (for real-time signal push)
-kafka-python-ng>=2.2.0
-
 # WebSocket (data_manager/klines_ws_client.py)
 websockets>=12.0

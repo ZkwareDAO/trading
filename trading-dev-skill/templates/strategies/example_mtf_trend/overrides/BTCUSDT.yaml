@@ -1,0 +1,70 @@
+# =============================================================================
+# example_mtf_trend / BTCUSDT — 多周期参考实现 per-symbol 参数
+# =============================================================================
+# 三周期共振：1d 定方向（EMA50）· 4h 找触发（MA10/MA30 交叉）· 1h 做确认（RSI14）
+#
+# ★ 多周期策略的两个配置要点：
+#   1. timeframes[0] 必须是"触发主周期"（这里 4h），基类 main_timeframe 取它
+#   2. params 里每个指标周期都要有 *_timeframes，且 Strategy
+#      ._get_indicator_timeframes() 必须把它们全部收集
+# =============================================================================
+
+example_mtf_trend:
+  enabled: true
+  version: '1'
+  trading_mode: "paper_trading"
+  direction: neutral
+
+  symbols:
+    - BTCUSDT
+
+  # 主周期（触发周期）。订阅全集 = timeframes ∪ trend_timeframe ∪ confirm_timeframe
+  timeframes:
+    - 4h
+
+  params:
+    # ---- 三个周期（命名与 Strategy._get_indicator_timeframes() 对应）----
+    trend_timeframe: 1d      # 趋势过滤
+    confirm_timeframe: 1h    # 动量确认
+
+    # ---- 1d 趋势 ----
+    trend_ema_period: 50
+
+    # ---- 4h 触发 ----
+    ma_fast_period: 10
+    ma_slow_period: 30
+
+    # ---- 1h 确认 ----
+    rsi_period: 14
+    rsi_long_threshold: 55
+    rsi_short_threshold: 45
+
+    # ---- 止损：2 × ATR14(4h) ----
+    atr_period: 14
+    atr_stop_mult: 2.0
+
+    # 与 capital.leverage 保持一致（Core 拿不到 capital 段）
+    leverage: 1
+
+  signal:
+    min_strength: 0.5
+    cooldown_ms: 0
+    order_type: 1
+    slippage: 0
+    exchange: hyperliquid
+
+  capital:
+    max_cash: 200
+    max_parts: 1
+    leverage: 1
+
+  risk:
+    enabled: true
+    fixed_stop_loss_pct: 8.0      # ATR 止损之外的兜底
+    trailing_profit:
+      enabled: true
+      activation_pct: 3.0
+      drawdown_pct: 20.0
+    fixed_take_profit_pct: 0.0
+
+  user_id: 1

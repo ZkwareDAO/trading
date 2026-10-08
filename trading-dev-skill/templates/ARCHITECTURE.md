@@ -1,32 +1,32 @@
 # CTA Strategy Core 系统架构文档
 
 **版本**: 3.7.0
-**更新日期**: 2026-05-29
+**更新日期**: 2026-09-03
 
 ---
 
 ## 1. 系统概述
 
-Strategy Core 是一个模块化的量化交易策略执行框架，采用**平台 + 插件**架构设计，支持多策略并行运行。系统与外部 `cta-factory-service` 配合工作，实现策略的统一管理和信号执行。
+Strategy Core 是一个模块化的量化交易策略执行框架，采用**单体模式**，支持多策略并行运行。每个策略独立进程，直连 Binance 行情与下单（CCXT）。
 
 ### 1.1 核心功能
 
 - **策略执行**: 加载并运行多个交易策略（CTA、ICT、Dolphin 等），每个策略独立进程
 - **数据管理**: 从本地 CSV 文件加载 K 线数据，支持 WS 实时推送、自动同步和多时间框架聚合
 - **信号生成**: 策略根据市场分析生成交易信号
-- **信号持久化**: 信号自动写入 CSV 文件，支持 Kafka/HTTP 推送
+- **信号持久化**: 信号自动写入 CSV 文件，单体模式下由策略进程直连交易所下单
 - **仓位持久化**: 策略重启后自动恢复仓位状态
 
 ### 1.2 系统边界
 
-| 功能 | Strategy Core | cta-factory-service | Go 交易系统 |
-|------|---------------|---------------------|-------------|
-| 策略逻辑实现 | ✅ | ❌ | ❌ |
-| 策略启停控制 | 执行 | 管理 | ❌ |
-| K 线数据获取 | ✅ (CSV/WS) | ❌ | ❌ |
-| 信号生成 | ✅ | ❌ | ❌ |
-| 信号持久化 | ✅ (CSV/Kafka) | ❌ | ❌ |
-| 订单执行 | ❌ | ❌ | ✅ |
+| 功能 | Strategy Core |
+|------|---------------|
+| 策略逻辑实现 | ✅ |
+| 策略启停控制 | ✅（run_strategies_manager 进程监督） |
+| K 线数据获取 | ✅ (CSV/WS 直连 Binance) |
+| 信号生成 | ✅ |
+| 信号持久化 | ✅ (CSV) |
+| 订单执行 | ✅ (direct_trading 直连下单) |
 
 ---
 
@@ -37,21 +37,21 @@ Strategy Core 是一个模块化的量化交易策略执行框架，采用**平�
 ```
 ┌──────────────────────────────────────────────────────────────────────┐
 │                    run_strategies_manager.py                         │
-│                    (策略运行时管理器)                                  │
-│  - 发现 enabled 策略并注册到 factory                                  │
-│  - 查询 factory 上次状态并恢复                                       │
-│  - 接收 factory 回调（start/stop/pause/resume）                      │
-│  - 心跳上报策略状态                                                   │
+│                    (策略进程监督者)                                    │
+│  - 解析 enabled 策略清单                                              │
+│  - 拉起每个策略的独立子进程                                            │
+│  - 监控子进程退出（不自动重启）                                         │
+│  - SIGTERM/SIGINT 优雅停止                                            │
 └──────────────────────────┬───────────────────────────────────────────┘
                            │ 每个策略启动独立进程
                            ▼
 ┌──────────────────────────────────────────────────────────────────────┐
 │                       run_strategy.py (独立进程)                      │
 │                                                                       │
-│  ┌──────────────┐  ┌──────────────────┐  ┌────────────────────┐      │
-│  │ StrategyEngine│  │ SignalLogger     │  │  BaseStrategy      │      │
-│  │ (策略引擎)    │  │ (信号日志+推送)  │  │  (策略基类)         │      │
-│  └──────┬───────┘  └────────┬─────────┘  └────────┬───────────┘      │
+│  ┌──────────────────┐  ┌────────────────────┐                        │
+│  │ SignalLogger     │  │  BaseStrategy      │                        │
+│  │ (信号日志+下单)  │  │  (策略基类)         │                        │
+│  └────────┬─────────┘  └────────┬───────────┘                        │
 │         │                   │                      │                   │
 │  ┌──────┴───────────────────┴──────────────────────┴───────────┐      │
 │  │                     DataManager                             │      │
@@ -75,19 +75,19 @@ Strategy Core 是一个模块化的量化交易策略执行框架，采用**平�
 
 | 组件 | 类型 | 职责 |
 |------|------|------|
-| **strategy_core** | 核心框架 | 策略基类、策略引擎、信号日志、仓位持久化、factory 通信 |
+| **strategy_core** | 核心框架 | 策略基类、信号日志与参数构建、仓位持久化 |
 | **data_manager** | 独立包 | 通用数据接入层（CSV + WS + 缓存 + 聚合 + 指标计算） |
 | **strategies** | 策略插件 | 具体策略逻辑实现（继承 BaseStrategy） |
 | **backtest** | 回测框架 | backtrader 集成、批量回测、绩效分析、报告生成 |
 
 ### 2.3 数据流
 
-1. **策略加载**: `run_strategies_manager.py` 从 `config/settings.yaml` 读取策略列表，注册到 factory
-2. **策略启动**: factory 通过回调启动 `run_strategy.py` 独立进程
-3. **数据获取**: 策略进程内 `DataManager` 初始化，连接 WS 实时推送或降级为 CSV 轮询
+1. **策略加载**: `run_strategies_manager.py` 从 `config/strategies.yaml` 解析 enabled 策略清单
+2. **策略启动**: 每个策略由 manager 拉起为 `run_strategy.py` 独立子进程
+3. **数据获取**: 策略进程内 `DataManager` 初始化，直连 Binance 公共 WS 拉实时（realtime_enabled=false 则只用本地 CSV）
 4. **信号生成**: 策略 Core 的 `analyze()` / `check_realtime_exit()` 生成交易信号
-5. **信号持久化**: 信号通过 `SignalLogger` 写入 CSV 文件，可选 Kafka/HTTP 推送
-6. **外部执行**: Go 系统读取信号 CSV 执行订单
+5. **信号持久化**: 信号通过 `SignalLogger` 写入 CSV 存储，`direct_trading.enabled` 时本进程直连交易所下单
+6. **订单执行**: 单体模式下订单直达交易所；下游系统可读信号 CSV 做对账/复盘
 
 ---
 
@@ -127,24 +127,14 @@ BaseState (strategy_core/base/state.py)
 
 **共享指标模块**: `strategy_core/base/indicators.py` 提供策略共享的指标计算（ADX、EMA 等），优先使用 TA-Lib，不可用时回退手动计算。
 
-### 3.2 Strategy Engine（策略引擎）
+### 3.2 策略进程运行器（StrategyProcessRunner）
 
-**文件**: `strategy_core/strategy_engine/`
+**文件**: `run_strategy.py`
 
-**子模块**:
-
-| 文件 | 类 | 职责 |
-|------|-----|------|
-| `engine.py` | `StrategyEngine` | 策略加载、factory 通信、K 线分发 |
-| `lifecycle.py` | `LifecycleManager` | 策略实例创建、初始化、启停 |
-| `registry.py` | `StrategyRegistry` | 策略元数据管理、状态跟踪 |
-
-**生命周期状态**:
-- `pending` - 已加载未启动
-- `running` - 运行中
-- `paused` - 已暂停
-- `stopped` - 已停止
-- `error` - 错误状态
+单体模式下不再有独立的策略引擎/注册表：每个策略进程直接 `importlib` 加载
+`strategies/<name>/strategy.py` 的 `Strategy` 类并实例化，WS K 线回调直接调用
+`strategy.on_kline()`，产生的信号统一经 `_handle_signal()` 写 CSV 后直连下单
+（见 §3.4）。策略进程退出由 `run_strategies_manager.py` 监控（不自动重启）。
 
 ### 3.3 Data Manager（数据管理器）
 
@@ -194,11 +184,13 @@ BaseState (strategy_core/base/state.py)
 | 文件 | 职责 |
 |------|------|
 | `storage.py` | Signal 数据模型、SignalType 枚举、确定性 signal_id 生成 |
-| `csv_adapter.py` | CtaSignalCSV 格式转换器（CSV/JSON/Kafka 格式） |
+| `csv_adapter.py` | CtaSignalCSV 格式转换器（CSV/JSON 格式） |
+| `signal_params.py` | `build_signal_params`：从 overrides 配置构建 CtaSignalCSV 参数（原引擎 `_build_strategy_params` 内联迁移） |
 | `logger.py` | SignalStorage（CSV 存储）+ SignalLogger（统一接口） |
-| `kafka_producer.py` | Kafka 推送器（熔断器 + 去重 TTL + 指数退避重试） |
-| `http_sender.py` | HTTP 推送器 |
+| `binance_trader.py` | BinanceTrader 直连下单执行器（单体模式唯一信号出口） |
 | `json_exporter.py` | JSON 导出器 |
+
+注：历史上的 `http_sender.py`（signal_hub HTTP 推送）已随单体化删除。
 
 **信号类型**:
 - `BUY` / `SELL` - 开仓信号
@@ -207,17 +199,6 @@ BaseState (strategy_core/base/state.py)
 - `REVERSE_LONG` / `REVERSE_SHORT` - 反手信号
 
 **signal_id 生成规则**: 基于 `strategy_type + symbol + 1m K线时间戳 + signal_type` 的 SHA256 哈希，确保实盘与回测使用相同 K 线数据时 ID 一致。
-
-### 3.5 Factory Client（工厂通信）
-
-**文件**: `strategy_core/factory_client.py`
-
-**职责**:
-- 注册策略到 cta-factory-service（XML-RPC）
-- 查询策略上次运行状态
-- 上报策略状态（心跳）
-- 接收 factory 回调控制（start/stop/pause/resume）
-- 本地 XML-RPC 回调服务器（防 XXE 攻击，使用 defusedxml）
 
 ### 3.6 Position Persistence（仓位持久化）
 
@@ -261,52 +242,41 @@ python3 -m backtest.batch_runner
 
 ### 4.1 策略命名规范
 
-策略运行时名称由配置自动生成：
+策略运行时名称由配置自动生成（prefix 由策略目录名推导，不依赖 `STRATEGY_PREFIX` 常量）：
 
 ```
-{STRATEGY_PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}_{MODE}
+{PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}_{MODE}
 ```
 
-**示例**:
-- `ICT_4H_V2_BTCUSDT_LIVE`
-- `OBVATR_1H_V2_ETHUSDT_PAPER_TRADING`
-- `RBreaker_15M_V2_ETHUSDT_LIVE`
+**示例**（以 `strategies/sar_snt3_v3` 为例）:
+- `sar_snt3_8H_3_BTCUSDT_LIVE`
+- `sar_snt3_8H_3_BTCUSDT_PAPER_TRADING`
 
 ### 4.2 已实现策略
 
+> 本仓库作为**模板**发布，只保留一个完整的参考实现（历史版本曾包含 cta_ict_v3、
+> cta_rbreaker_v3 等多个策略，开源时已移除，见 CHANGELOG）。
+
 | 策略 | 目录 | 说明 | 基类架构 | 时间周期 | 多标的 |
 |------|------|------|----------|----------|--------|
-| **cta_ict_v3** | `strategies/cta_ict_v3/` | ICT 市场结构策略 | ✅ BaseStrategy | 1d/4h/15m | ✅ |
-| **cta_rbreaker_v3** | `strategies/cta_rbreaker_v3/` | R-Breaker 突破/反转策略 | ✅ BaseStrategy | 15m | ✅ |
-| **dolphin_trading_v2** | `strategies/dolphin_trading_v2/` | Dolphin 通道+KD 策略 | ✅ BaseStrategy | 4h/1h/15m | ✅ |
-| **obv_atr_v2** | `strategies/obv_atr_v2/` | OBV+ATR 趋势策略 | ✅ BaseStrategy | 4h/1h | ✅ |
-| **cta_trend** | `strategies/cta_trend/` | 双均线交叉趋势策略 | ✅ BaseStrategy | 15m | ✅ |
-| **bollinger_daily** | `strategies/bollinger_daily/` | 布林带日内策略 | 旧架构 | 5m | 单标的 |
-| **cta_bollinger_oscillator** | `strategies/cta_bollinger_oscillator/` | 布林带震荡策略 | 旧架构 | 15m | 单标的 |
-| **delphi_aggressive** | `strategies/delphi_aggressive/` | Delphi 趋势跟踪 | 旧架构 | 6h/15m | 单标的 |
-| **cta_trend_strength** | `strategies/cta_trend_strength/` | 多周期趋势强弱策略 | 旧架构 | 1d/4h/15m | ✅ |
+| **sar_snt3_v3** | `strategies/sar_snt3_v3/` | SAR + 情绪指标趋势策略 | ✅ BaseStrategy | 1m→多周期 | ✅ |
 
 **新架构策略结构**:
 ```
-strategies/cta_ict_v3/
-├── strategy.py       # 继承 BaseStrategy，~35 行
-├── ict_core.py       # 继承 BaseStrategyCore，实现 analyze/check_realtime_exit
-├── state.py          # 继承 BaseState，添加特有字段
-├── overrides/        # per-symbol 参数（v3.7 唯一事实来源，实盘与回测共用）
+strategies/sar_snt3_v3/
+├── strategy.py       # 继承 BaseStrategy，~190 行
+├── sar_snt3_v3_core.py  # 继承 BaseStrategyCore，实现 analyze/check_realtime_exit
+├── config.yaml       # 策略默认参数
+├── overrides/        # per-symbol 参数（唯一事实来源）
 │   └── BTCUSDT.yaml
-├── .strategy-spec.yaml  # 策略契约（给人和 AI 读，无代码消费）
 └── __init__.py
 ```
 
 ### 4.3 仓位持久化字段
 
-| 策略 | 持久化特有字段 |
+| 策略 | 持久化字段 |
 |------|---------------|
-| `cta_ict_v3` | `confirmed_direction`, `tp_target`, `entry_count`, `avg_entry_price` 等 |
-| `dolphin_trading_v2` | Dolphin 特有状态字段 |
-| `obv_atr_v2` | OBV/ATR 特有状态字段 |
-| `cta_rbreaker_v3` | R-Breaker 特有状态字段 |
-| 旧架构策略 | `position`, `entry_price` 等基础字段 |
+| `sar_snt3_v3` | 继承 `BaseState` 全部字段（position, entry_price, peak_price, stop_price, stop_loss_date 等），特有字段见 `strategies/sar_snt3_v3/` 内 State 定义 |
 
 ---
 
@@ -349,31 +319,23 @@ strategies/cta_ict_v3/
 ### 5.2 系统层：config/settings.yaml
 
 ```yaml
-strategy_engine:
-  factory_endpoint: "${FACTORY_ENDPOINT}"        # 未配置 → 跳过 factory 注册
-  position_proxy_url: "${POSITION_PROXY_URL}"    # 未配置 → 回退本地持久化仓位
-  strategies_dir: "./strategies"
-  use_bar_high_low_for_exit: false               # 止损检测价格源
+use_bar_high_low_for_exit: false                 # 止损检测价格源（顶层键）
 
 data_manager:
   csv_dir: "./data/klines"                       # 与 config/backtest.yaml 的 data_dir 一致（启动时校验）
-  klines_service_ws_url: "${KLINES_WS_URL}"      # 未配置 → 回退 Binance 公共源
-  klines_service_http_url: "${KLINES_HTTP_URL}"
+  realtime_enabled: true                         # 单体模式：直连 Binance 公共 WS + fapi 历史
 
 signal_logging:
   storage:
     type: "csv"
     path: "./data/signals"
-  kafka:
-    enabled: false
-    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"
 
-signal_hub:
-  enabled: true
-  endpoint: "${SIGNAL_HUB_ENDPOINT}"
+direct_trading:          # 单体模式唯一信号出口：存储后直连交易所下单
+  enabled: false
+  testnet: false
 ```
 
-所有外部服务地址均为 `${ENV_VAR}` 占位，未设置时对应功能自动降级（见 §7）。
+外部依赖仅剩 Binance 公共源（无 API key）与可选的直连下单凭证（`.env`）；K 线与下单均直连 Binance。
 
 ### 5.3 编排层：config/strategies.yaml
 
@@ -418,7 +380,7 @@ sar_snt3_v3:
 
 ### 5.5 run-profile：config/backtest.yaml
 
-承载回测的运行方式。回测**不初始化**推送与 factory 客户端，因此不依赖任何外部服务
+承载回测的运行方式。回测**不初始化**推送与下单客户端，因此不依赖任何外部服务
 —— 这由链路保证，不由配置开关表达（但回测确实读 `settings.yaml` 的
 `use_bar_high_low_for_exit`，见 §5.2）：
 
@@ -437,7 +399,7 @@ max_workers: 4
 
 键集合与 `config/settings.yaml` **完全不相交**，故两份配置不存在覆盖关系。
 只写有代码消费的键：`mode` / `signal_hub` / `strategy_engine` 曾写在此处但无任何
-消费者，且与 settings.yaml 同名键取值相反，已删除（见 CONFIG_UNIFICATION_SPEC §4.5）。
+消费者，已删除（见 CONFIG_UNIFICATION_SPEC §4.5）。
 
 ### 5.6 合并优先级
 
@@ -459,26 +421,22 @@ CLI 和 run-profile 不得覆盖策略参数本身，只能覆盖 run-profile �
 ### 6.1 启动流程
 
 ```
-1. run_strategies_manager.py 加载 config/settings.yaml
-2. 解析 strategies 列表，展开每个 symbol 为独立配置
-3. 对每个 enabled 策略:
-   a. 注册到 cta-factory-service
-   b. 查询 factory 获取上次运行状态
-4. factory 通过回调发送 start 命令
-5. 启动 run_strategy.py 独立进程:
-   a. 加载策略配置（config_path 或策略目录 config.yaml）
+1. run_strategies_manager.py 加载 config/strategies.yaml（或 CLI --run）
+2. 解析策略清单，展开每个 symbol 为独立配置
+3. 对每个 enabled 策略启动 run_strategy.py 独立子进程:
+   a. 加载策略配置（strategies/<name>/overrides/<symbol>.yaml）
    b. 初始化 DataManager（预加载 1m 数据、gap 补齐、数据完整性检查）
-   c. 初始化 SignalLogger + KafkaProducer（如启用）
-   d. 连接 factory-service 回调服务
-   e. 连接 klines_service WebSocket（或降级为 CSV 轮询）
+   c. 初始化 SignalLogger（可选 direct_trader 直连下单）
+   d. 直接实例化策略类（importlib，不经注册表/引擎）
+   e. 启动实时数据服务（直连 Binance 公共 WS，realtime_enabled 开关）
    f. 调用 strategy.on_start()（含仓位恢复）
-   g. 进入 K 线事件循环
+   g. WS K 线回调进入事件循环
 ```
 
 ### 6.2 信号生成流程
 
 ```
-1. K 线数据更新（WS 推送 或 CSV 轮询）
+1. K 线数据更新（Binance 公共 WS 推送）
    ↓
 2. DataManager 刷新缓存 + 多时间框架聚合
    ↓
@@ -492,10 +450,23 @@ CLI 和 run-profile 不得覆盖策略参数本身，只能覆盖 run-profile �
    ↓
 7. 生成 Signal 对象（确定性 signal_id）
    ↓
-8. SignalLogger 写入 CSV + 可选 Kafka/HTTP 推送
+8. 进程统一写 CSV + SignalLogger 触发（direct_trader 直连下单）
    ↓
-9. Go 系统读取 CSV 生成订单
+9. 信号已落存储，订单已直达交易所
 ```
+
+**信号异常路径覆盖表**（信号生成→触达执行的异常路径，验收依据）：
+
+| 步骤 | 正常路径 | 异常路径 | 补偿/重试 | 现状 |
+|------|----------|----------|-----------|------|
+| CSV 写入 | 落盘成功 | 磁盘错误/目录缺失 | 进程日志报错 | ⚠️ 写入失败不阻断下单 |
+| 直连下单 | 交易所成交 | 下单 API 异常 | `newClientOrderId=signal_id` 幂等，可安全重试 | 反手先平后开，平仓失败则放弃开仓 |
+| 直连下单 | — | 网络超时 / 5xx | 仅网络异常与 5xx 重试；4xx 一律不重试 | 失败如实返回 False（无第二通道兜底） |
+| 直连下单 | — | 凭证缺失 | — | 进程启动即失败（不静默降级） |
+| WS 断连 | 自动重连 | 退避上限 120s 后仍失败 | 无限重连 + REST 轮询降级 | 数据不丢，策略持续运行 |
+| 信号幂等 | — | 同一信号重复推送 | 确定性 signal_id（SHA256），下游可去重 | 实盘/回测 ID 一致 |
+
+> ⚠️ 标记行对应 CHANGELOG 自曝缺陷：HTTP 通道失败后 `log_signal` 返回 True（信号被丢弃却报告成功）。修复方案评审时以本表为基线。
 
 ### 6.3 仓位持久化流程
 
@@ -510,40 +481,26 @@ SIGTERM → strategy.on_stop() → 保存当前状态 → 进程退出
 
 ## 7. 外部集成
 
-### 7.1 cta-factory-service
+### 7.1 Binance 公共数据源（单体模式内置）
 
-策略工厂服务（外部 Go 项目）负责：
-- 查询策略列表
-- 策略启停控制（通过 XML-RPC 回调）
-- 策略状态监控
+K 线数据的唯一实时来源（单体模式内置，无外部行情服务）：
+- WebSocket 实时 K 线推送：`wss://fstream.binance.com`
+- REST 轮询回退 + 历史数据：`https://fapi.binance.com`
 
-**通信方式**: XML-RPC（使用 defusedxml 防止 XXE 攻击）
+`data_manager.realtime_enabled=false` 时只用本地 CSV，不启动实时服务。
 
-**RPC 接口**:
-- `register(strategy_id, script, params)` - 注册策略
-- `start(strategy_id)` - 启动策略
-- `stop(strategy_id)` - 停止策略
-- `list()` - 列出所有策略
+### 7.2 Go 交易系统
 
-### 7.2 klines_service
-
-K 线推送服务（外部，可选），提供：
-- WebSocket 实时 K 线推送（`${KLINES_WS_URL}`）
-- HTTP API 历史数据下载（`${KLINES_HTTP_URL}`）
-
-未配置时自动回退 Binance 公共源（`wss://fstream.binance.com` + `https://fapi.binance.com`）。
-
-### 7.3 Go 交易系统
-
-Go 系统通过读取 CSV 文件获取信号：
+单体模式下订单已直达交易所，Go 系统如需对账/复盘可读取信号 CSV：
 
 **文件路径**: `data/signals/{strategy_id}/{date}.csv`
 
-### 7.4 Signal Hub
+### 7.3 直连下单（单体模式）
 
-信号中心化服务（可选），通过 HTTP 推送信号到 `${SIGNAL_HUB_ENDPOINT}`。
-未配置时应将 `config/settings.yaml` 的 `signal_hub.enabled` 置 false。
-回测无需设置：回测链路不初始化 signal hub 客户端。
+信号出口仅一条：`direct_trading` 启用时策略进程经 `BinanceTrader` 直接调用
+Binance U 本位合约 API 下单，凭证只从环境变量 `BINANCE_API_KEY` / `BINANCE_API_SECRET` 读取。
+未启用 `direct_trading` 时信号只落 CSV/JSON 存储，不下单。
+回测链路不初始化直连执行器。
 
 ---
 
@@ -553,11 +510,10 @@ Go 系统通过读取 CSV 文件获取信号：
 |------|----------|----------|
 | 策略加载失败 | 缺少 strategy.py 文件 | 检查策略目录结构 |
 | 信号未生成 | 策略冷却中/无新 K 线 | 检查日志确认 K 线更新 |
-| 数据未同步 | klines_service 未运行 | 检查 WS 连接和 HTTP API |
+| 实时数据中断 | Binance WS 断连 | 自动重连（退避上限 120s）+ REST 轮询回退 |
 | CSV 格式错误 | 列重复/缺失 | 运行数据修复脚本 |
 | 仓位未恢复 | 持久化文件损坏/不存在 | 检查 data/positions/ 目录 |
-| WS 频繁断连 | 网络不稳定 | 系统自动重连（退避上限 120s） |
-| Kafka 推送失败 | 连接超时 | 熔断器自动保护，超时后尝试恢复 |
+| 下单失败 | 凭证/网络/交易所拒绝 | 检查进程日志（失败如实上报，不静默降级） |
 
 ---
 
@@ -570,8 +526,6 @@ Go 系统通过读取 CSV 文件获取信号：
 | 策略基类 | `strategy_core/base/strategy.py` | `BaseStrategy` |
 | 核心逻辑基类 | `strategy_core/base/core.py` | `BaseStrategyCore` |
 | 状态基类 | `strategy_core/base/state.py` | `BaseState` |
-| 策略引擎 | `strategy_core/strategy_engine/engine.py` | `StrategyEngine` |
-| Factory 通信 | `strategy_core/factory_client.py` | `FactoryClient` |
 | 数据管理 | `data_manager/manager.py` | `DataManager` |
 | K 线仓库 | `data_manager/kline_repository.py` | `KlineRepository` |
 | WS 客户端 | `data_manager/klines_ws_client.py` | `KlinesWebSocketClient` |

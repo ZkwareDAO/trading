@@ -51,3 +51,39 @@ class TestStrategyProcessLogLevel:
             strategy_config={},
         )
         assert level == "INFO", "默认应为 INFO"
+
+    def test_env_log_level_used_when_no_cli(self):
+        """无 --log-level 时读 LOG_LEVEL 环境变量（manager 透传路径）"""
+        from run_strategy import resolve_effective_log_level
+
+        assert resolve_effective_log_level(None, "DEBUG") == "DEBUG"
+        # 环境变量小写也应归一化
+        assert resolve_effective_log_level(None, "debug") == "DEBUG"
+
+    def test_cli_log_level_overrides_env(self):
+        """--log-level 优先于 LOG_LEVEL 环境变量"""
+        from run_strategy import resolve_effective_log_level
+
+        assert resolve_effective_log_level("INFO", "DEBUG") == "INFO"
+
+    def test_default_log_level_info(self):
+        """CLI 与环境变量都缺省时为 INFO"""
+        from run_strategy import resolve_effective_log_level
+
+        assert resolve_effective_log_level(None, None) == "INFO"
+
+    def test_invalid_env_log_level_falls_back_to_info(self):
+        """LOG_LEVEL 为非法值时回退 INFO"""
+        from run_strategy import resolve_effective_log_level
+
+        assert resolve_effective_log_level(None, "VERBOSE") == "INFO"
+
+    def test_strategy_config_overrides_env_log_level(self):
+        """manager 透传 DEBUG，但策略 overrides 配置的级别仍最高"""
+        from run_strategy import resolve_log_level
+
+        level = resolve_log_level(
+            cli_log_level="DEBUG",
+            strategy_config={"signal": {"diagnostic_log_level": "INFO"}},
+        )
+        assert level == "INFO", "策略配置应优先于环境变量透传值"

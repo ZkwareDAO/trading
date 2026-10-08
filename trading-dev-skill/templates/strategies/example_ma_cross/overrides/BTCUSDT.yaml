@@ -1,0 +1,74 @@
+# =============================================================================
+# example_ma_cross / BTCUSDT — per-symbol 参数（参考实现）
+# =============================================================================
+# 这个文件是策略参数的**唯一事实来源**。
+# 策略目录内不放 config.yaml；另一半配置在 config/strategies.yaml（登记表：
+# 跑哪些 symbol、什么 trading_mode）。
+#
+# 顶层 key 必须等于策略目录名。
+# 每个要跑的 symbol 一个文件：overrides/BTCUSDT.yaml、overrides/ETHUSDT.yaml…
+# =============================================================================
+
+example_ma_cross:
+  enabled: true
+  version: '1'
+  trading_mode: "paper_trading"   # live / paper_trading / smoking
+  # 单向过滤：neutral=多空都做，long=只做多，short=只做空
+  # 基类会把它塞进 params，Core 里用 self.direction 读
+  direction: neutral
+
+  symbols:
+    - BTCUSDT
+
+  # timeframes[0] 是主周期。run_strategy.py 的 --interval 只是可选覆盖
+  timeframes:
+    - 4h
+
+  # ---- 策略参数：Core.__init__ 从这里读 ----
+  params:
+    # 每个指标都要声明自己的周期，并在 Strategy._get_indicator_timeframes()
+    # 里收集进去，否则 klines_data 里不会有这个周期的数据
+    ma_timeframes: 4h
+
+    ma_fast_period: 10
+    ma_slow_period: 30
+    stop_loss_pct: 2.0        # 策略自己的硬止损（%）
+    strong_spread_pct: 0.3    # 均线价差 ≥ 此值算强信号（strength 0.8）
+
+    # 注意：Strategy 层从 capital.leverage 读杠杆，但**不会**传给 Core。
+    # Core 只能从 params 拿，所以这里要和下面 capital.leverage 保持一致。
+    leverage: 1
+
+  # ---- 信号过滤 ----
+  signal:
+    # analyze() 返回的 strength 低于此值，信号会被基类静默丢弃。
+    # 本策略强信号 0.8 / 弱信号 0.6，设 0.5 表示两种都发。
+    min_strength: 0.5
+    cooldown_ms: 0
+    order_type: 1
+    slippage: 0
+    exchange: hyperliquid
+
+  # ---- 资金 ----
+  capital:
+    max_cash: 200     # → 基类以 current_cash 参数传进 analyze()
+    max_parts: 1
+    leverage: 1       # 与 params.leverage 保持一致
+
+  # ---- 统一风控（基类兜底，在策略 check_realtime_exit() 返回 hold 之后生效）----
+  # 百分比一律用数值形式：20 表示 20%
+  risk:
+    enabled: true
+    fixed_stop_loss_pct: 5.0      # 兜底止损，比策略自己的 2% 宽
+    trailing_profit:
+      enabled: true
+      activation_pct: 3.0         # 盈利达到 3% 后激活回落止盈
+      drawdown_pct: 20.0          # 从最大盈利回落 20% 出场
+    fixed_take_profit_pct: 0.0    # 0 = 禁用
+
+  # 信号归属的用户 ID（下游下单系统用；单用户部署保持默认 1 即可）
+  user_id: 1
+
+  # 注意：cooldown_timeframe / cooldown_bars / cooldown_ms 是死配置，
+  # 代码里没有任何地方读取，写了也不生效，所以这里不放。
+  # 需要"一根大周期只入场一次"请重写 on_kline()，见 strategy.py 末尾附录。

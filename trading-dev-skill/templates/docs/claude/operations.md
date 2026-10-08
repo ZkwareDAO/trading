@@ -1,56 +1,117 @@
 # 运维参考
 
+**更新日期**: 2026-09-03
+
 ## 配置
 
 **系统配置**: `config/settings.yaml`
-- `strategy_engine.factory_endpoint` - factory-service 的 RPC 端点
-- `strategy_engine.callback_port` - XML-RPC 回调服务端口
-- `strategy_engine.position_proxy_url` - Position 代理地址（端口 8889）
-- `strategy_engine.position_api_path` - 仓位查询 API 路径（默认 `/api/cta/v1/user-order-positions`）
-- `strategy_engine.use_bar_high_low_for_exit` - 止损止盈检测模式（默认 true）
+- `use_bar_high_low_for_exit` - 止损止盈检测模式（顶层键，默认 true）
   - `true`: 使用 bar_high/bar_low（闭合 K 线的最高/最低价，更准确检测 K 线内价格波动）
   - `false`: 使用 current_price（K 线收盘价，简单但可能遗漏 K 线内的止损触发）
-- `data_manager` - CSV 目录、WS 地址、缓存配置
-- `signal_logging` - 信号存储目录、Kafka 配置
-- `signal_hub` - HTTP 信号推送配置
-  - `enabled` - 是否启用 HTTP 推送
-  - `endpoint` - HTTP 端点地址
-  - `api_path` - API 路径（默认 `/api/v1/kafka/message`）
-    - V1 路径（如 `/api/v1/kafka/message`）：payload 包装为 `{"topic": "...", "message": "..."}`
-    - V2+ 路径（如 `/api/v2/signals`）：payload 直接为 `cta_signal.to_json()`
+- `data_manager` - K 线 CSV 目录与缓存配置（实时数据单体直连 Binance，见 `realtime_enabled`）
+- `signal_logging` - 信号 CSV 存储目录与保留天数
+- `direct_trading` - 直连交易所下单配置（单体模式唯一信号出口，详见下节）
 - `strategies` - 策略列表（每个配置项对应一个独立进程）
 
-**策略配置**: `strategies/{name}/config.yaml` 或 `config/strategies/{name}/{SYMBOL}.yaml`
+### 直连交易所下单（direct_trading）
+单体模式唯一信号出口：信号写入 CSV 存储后，由策略进程直接调用
+Binance U 本位合约 API 下单。
+
 ```yaml
-cta_ict_v3:
+direct_trading:
+  enabled: false        # 默认关闭
+  exchange: "binance"   # 目前仅支持 binance U 本位合约
+  testnet: false        # true → testnet.binancefuture.com
+  recv_window: 5000     # 签名请求有效窗口（毫秒）
+  timeout: 10.0         # 单次请求超时（秒）
+  max_retries: 2        # 仅对网络异常与 5xx 重试；4xx 一律不重试
+```
+
+**凭证只放 `.env`**（配置文件里连 `${VAR}` 占位都不写，避免误填明文被提交）：
+
+```
+BINANCE_API_KEY=
+BINANCE_API_SECRET=
+```
+
+**历史沿革**：早期版本支持 signal_hub HTTP 推送与 Kafka 直推，均已随单体化移除，
+不再存在双通道配置。`direct_trading` 是唯一的下单通道。
+
+**行为约定**：
+
+| 项 | 行为 |
+|---|---|
+| 下单量 | `signal_cash × leverage / price`，按 `exchangeInfo` 的 stepSize **向下**取整；显式 `signal_quantity` 优先 |
+| 开仓订单类型 | 尊重 `signal.order_type`（1=LIMIT GTC，2=MARKET） |
+| 平仓订单类型 | **一律 MARKET + reduceOnly**，忽略 `order_type`（限价平仓挂单不成交会让本地仓位与交易所永久分叉） |
+| 平仓数量 | 取 `positionRisk` 的实际持仓量，不看信号里的数量 |
+| 反手 | `reverse_*` 先平后开；平仓失败则放弃开仓 |
+| 幂等 | `newClientOrderId = signal_id`（确定性哈希），重复信号被交易所以重复单拒绝 |
+| 无持仓时平仓 | 记 warning 并视为成功（幂等），不发单 |
+
+**拒绝下单的情形**（记 error 日志，信号仍写 CSV）：
+
+- `paper_trading` 模式（双重防线：`run_strategy` 不构造执行器，执行器内再校验一次）
+- 信号 `signal.exchange != binance`（如 `hyperliquid`）—— 不同交易所合约规格不同
+- 账户为双向持仓模式（Hedge Mode）—— 仅支持单向持仓（One-way Mode）
+- 下单量低于 `minQty` 或名义价值低于 `minNotional`
+- 平仓方向与交易所实际持仓不一致（避免误平同账户其他策略的反向仓位）
+
+**⚠️ trading_mode 与下单的关系**（这是本功能最容易误判的一点）：
+
+| trading_mode | 是否向交易所下真单 |
+|---|---|
+| `live` | **会下真单** |
+| `smoking` | **会下真单**（冒烟模式的设计意图就是用真单验证全链路） |
+| `paper_trading` | 不下单（唯一有防线的模式） |
+
+`smoking` 字面上像"只是测试"，但它**会真实成交**。只有 `paper_trading` 被拦。
+不想下真单时必须用 `paper_trading`，不要指望 `smoking` 能兜住。
+
+**上线前检查**：API key 只开合约交易权限（**切勿开提现**）、绑定 IP 白名单、
+账户切单向持仓、先用 `testnet: true` 验证。缺凭证时策略进程**启动即失败**，
+不静默降级 —— 开着直连却发不出单等于策略在"以为已成交"的状态下继续跑。
+
+**per-symbol overrides 必改项**：`strategies/<name>/overrides/<SYMBOL>.yaml` 里的
+`signal.exchange` 必须是 `binance`（否则拒单），且建议 `signal.order_type: 2`（市价）。
+
+**已知限制**：LIMIT 开仓挂单不成交时，框架本地仓位账本会认为已持仓，与交易所分叉。
+实盘建议 `signal.order_type: 2`（市价）。本功能不含启动时与交易所的仓位对账。
+
+**策略配置**: `config/strategies.yaml`（登记表：symbols + trading_mode）
++ `strategies/{name}/overrides/{SYMBOL}.yaml`（per-symbol 参数，**唯一事实来源**，
+见 CONFIG_UNIFICATION_SPEC）。**策略目录内不放 `config.yaml`。**
+
+```yaml
+sar_snt3_v3:
   enabled: true
   version: '3'
   symbols: ["BTCUSDT"]
-  timeframes: ["1d", "4h", "15m"]
+  timeframes: ["8h"]
   direction: neutral
   params:
-    stop_loss_roi_pct: 0.2
+    sar_step: 0.015
+    adx_threshold: 25
   signal:
-    min_strength: 0.4
-    cooldown_ms: 60000
-    api_path: "/api/v2/signals"  # 可选，覆盖全局 signal_hub.api_path
+    min_strength: 0.5
+    cooldown_ms: 0
+    exchange: "binance"  # 必须，否则该 symbol 拒单
+    order_type: 2        # 建议，市价单（LIMIT 挂单不成交会让仓位分叉）
   capital:
-    max_cash: 100
+    max_cash: 200
     max_parts: 1
-    leverage: 5
+    leverage: 1
 ```
 
-**API 路径优先级**: `signal.api_path`（策略级） > `signal_hub.api_path`（全局） > `/api/v1/kafka/message`（默认）
+**多环境配置**: `config.yaml` / `config.dev.yaml` / `config.test.yaml` / `config.prod.yaml`
 
-**配置层级**: `config/settings.yaml`（系统） > `config/strategies.yaml`（编排） > `strategies/<name>/overrides/<SYMBOL>.yaml`（策略参数，唯一事实来源）；回测运行方式走 `config/<profile>.yaml`。v3.7 已删除按环境分文件的 `config.yaml` / `config.dev.yaml` / `config.test.yaml` / `config.prod.yaml`
-
-**策略运行时命名**: `{PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}_{MODE}`，如 `ICT_4H_V2_BTCUSDT_LIVE`
+**策略运行时命名**: `{PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}_{MODE}`，如 `SARSNT3_8H_3_BTCUSDT_LIVE`
 
 ## 策略 ID 与数据隔离
 
-**strategy_name_for()**: 返回不含 trading_mode 的名称，用于 Factory 注册和远程仓位查询
+**strategy_name_for()**: 返回不含 trading_mode 的名称
 - 格式: `{PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}`
-- 用途: Factory 注册、信号路由、仓位查询
+- 用途: 信号路由、外部对账
 
 **strategy_id_for()**: 返回含 trading_mode 的完整 ID，用于数据存储路径
 - 格式: `{PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}_{MODE}`
@@ -203,44 +264,13 @@ _on_kline_received(kline):
 所有写入路径统一使用 `save_klines_to_csv`：
 1. 读取现有 CSV → 2. 合并新旧数据 → 3. 按时间戳去重（新覆盖旧） → 4. 按时间戳排序 → 5. 写回 CSV
 
-## 远程仓位同步
-
-策略每根 K 线检查本地持仓时，先同步远程仓位状态：
-
-**同步流程**:
-```
-on_kline()
-  → 有本地持仓?
-    → _sync_remote_position()
-      → factory_client.is_position_open()
-        → HTTP 查询 Position 代理 (8889)
-```
-
-**返回值含义**:
-| 返回值 | 含义 | 处理 |
-|--------|------|------|
-| `(True, dict)` | 远程开启 | 保持本地状态，继续检查出场 |
-| `(False, dict)` | 远程已关闭 | 清除本地状态，记录历史 |
-| `(False, None)` | 远程无仓位记录 | 清除本地状态 |
-| `(None, None)` | 无法判断 | **保持本地状态**（保守策略） |
-
-**无法判断的场景**:
-- HTTP 请求失败（404/500/超时）
-- JSON 解析失败
-- `deleted` 字段缺失
-
-**核心原则**: 只有 API 明确返回"已关闭"或"无仓位记录"时才清除本地状态，无法判断时保守保持。
-
-**字段名兼容**: 自动兼容大小写字段名（`Deleted`/`deleted`、`ID`/`id` 等）。
-
 ## 常见问题
 
 | 问题 | 解决方案 |
 |------|----------|
 | 策略加载失败 | 检查策略目录内是否存在 `strategy.py` |
 | 无信号生成 | 检查日志确认 K 线更新，验证信号强度 >= min_strength |
-| 数据未同步 | 检查 klines_service 是否运行，WS 连接状态 |
+| 实时数据中断 | 检查 Binance 公共 WS 连接状态；`realtime_enabled=false` 时只用本地 CSV |
 | CSV 格式错误 | 检查列重复，运行数据修复脚本 |
 | 仓位未恢复 | 检查 data/positions/ 下 JSON 文件 |
-| 远程仓位同步失败 | 检查 position_proxy_url 配置和 Position 代理服务状态 |
-| 需要下载历史 K 线 | 使用 klines_service HTTP API 或 `klines_loader.py` |
+| 下单失败 | 检查进程日志；确认凭证、网络/代理、单向持仓模式；失败会如实上报不静默 |

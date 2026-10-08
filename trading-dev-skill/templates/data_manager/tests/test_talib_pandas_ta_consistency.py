@@ -3,11 +3,17 @@
 验证 ta-lib 和 pandas-ta 数值一致性测试
 
 用于重构前后对比验证，确保替换为 ta-lib 后数值精度一致。
+
+环境依赖说明：pandas-ta 依赖 numba（仅支持 Python <3.14），当前项目 venv 为
+Python 3.14 无法安装 —— 无 pandas_ta 时整组用例跳过（ta-lib 本身是生产依赖，
+指标正确性由 test_indicators.py 等用例保障；本文件只在双库并存的环境里有意义）。
 """
 
 import numpy as np
 import pandas as pd
 import pytest
+
+pytest.importorskip("pandas_ta", reason="pandas-ta/numba 不支持 Python 3.14，跳过双库一致性对比")
 
 
 def make_kline_df(n: int = 100) -> pd.DataFrame:

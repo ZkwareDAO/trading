@@ -21,15 +21,11 @@ class TestLoadHistoricalData:
         runner = StrategyProcessRunner.__new__(StrategyProcessRunner)
         runner.strategy_name = "cta_rbreaker"
         runner.data_manager = MagicMock()
-        runner.engine = MagicMock()
 
         # 模拟策略实例
         mock_instance = MagicMock()
         mock_instance.subscribed_symbols = {"BTCUSDT", "ETHUSDT"}
-
-        runner.engine.registry.list_strategies.return_value = {
-            "cta_rbreaker_001": MagicMock(instance=mock_instance)
-        }
+        runner.strategy = mock_instance
 
         # Mock 已有方法
         runner.data_manager._preload_all_big_intervals_from_csv = MagicMock()
@@ -51,10 +47,7 @@ class TestLoadHistoricalData:
         runner = StrategyProcessRunner.__new__(StrategyProcessRunner)
         runner.strategy_name = "cta_rbreaker"
         runner.data_manager = MagicMock()
-        runner.engine = MagicMock()
-        runner.engine.registry.list_strategies.return_value = {
-            "cta_rbreaker_001": MagicMock(instance=None)
-        }
+        runner.strategy = None
 
         runner.data_manager._preload_all_big_intervals_from_csv = MagicMock()
         runner.data_manager.sync_to_latest = AsyncMock(return_value=True)
@@ -72,13 +65,10 @@ class TestLoadHistoricalData:
         runner = StrategyProcessRunner.__new__(StrategyProcessRunner)
         runner.strategy_name = "cta_rbreaker"
         runner.data_manager = MagicMock()
-        runner.engine = MagicMock()
 
         mock_instance = MagicMock()
         mock_instance.subscribed_symbols = {"BTCUSDT", "ETHUSDT"}
-        runner.engine.registry.list_strategies.return_value = {
-            "cta_rbreaker_001": MagicMock(instance=mock_instance)
-        }
+        runner.strategy = mock_instance
 
         runner.data_manager._preload_all_big_intervals_from_csv = MagicMock()
         runner.data_manager.sync_to_latest = AsyncMock(side_effect=RuntimeError("API down"))
@@ -95,16 +85,15 @@ class TestLoadHistoricalData:
         runner = StrategyProcessRunner.__new__(StrategyProcessRunner)
         runner.strategy_name = "cta_rbreaker"
         runner.strategy_config = {"symbols": ["BTCUSDT"]}
-        runner.global_config = {"signal_logging": {}, "strategy_engine": {}}
+        runner.global_config = {"signal_logging": {}, "data_manager": {}}
         runner.data_manager = MagicMock()
         runner.data_manager.connect = MagicMock(return_value=True)
-        runner.engine = MagicMock()
         runner.data_manager.set_kline_dispatch_callback = MagicMock()
+        runner.strategy = None
+        runner.load_strategy = MagicMock(return_value=True)
         runner._load_historical_data = AsyncMock()
 
-        # Mock load_strategy 整体跳过内部依赖
-        runner.load_strategy = MagicMock(return_value=True)
-
+        # _resolve_history_days 需要访问 strategy 实例（None 时沿用配置值 30）
         result = await runner.start()
 
         assert result is True

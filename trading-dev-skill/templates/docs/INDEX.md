@@ -1,7 +1,7 @@
 # Strategy Core 文档索引
 
 **版本**: 3.7.0
-**更新日期**: 2026-08-17
+**更新日期**: 2026-09-03
 
 ---
 
@@ -21,8 +21,9 @@
 ### 策略开发
 1. [docs/strategy/DEVELOPMENT_GUIDE.md](strategy/DEVELOPMENT_GUIDE.md) - 开发规范
 2. [docs/strategy/AI_CONSTRAINTS.md](strategy/AI_CONSTRAINTS.md) - AI 编码约束
-3. [docs/strategy/EXAMPLES.md](strategy/EXAMPLES.md) - 参考示例
+3. [docs/strategy/EXAMPLES.md](strategy/EXAMPLES.md) - 常见问题 FAQ
 4. [docs/strategy/REVIEW_CHECKLIST.md](strategy/REVIEW_CHECKLIST.md) - 研发检查表
+5. [docs/strategy/STRATEGY_SPEC.md](strategy/STRATEGY_SPEC.md) - 策略规格文件 schema
 
 ### 技术规范
 1. [docs/CONFIG_UNIFICATION_SPEC.md](CONFIG_UNIFICATION_SPEC.md) - **配置三层模型与回测实盘统一规范（P0）**
@@ -51,8 +52,6 @@
 - [SIGNAL_CSV_FORMAT.md](SIGNAL_CSV_FORMAT.md) - 信号格式规范
 - [SCRIPTS.md](SCRIPTS.md) - 脚本参考
 - [CONFIG_UNIFICATION_SPEC.md](CONFIG_UNIFICATION_SPEC.md) - 配置三层模型与回测实盘统一规范
-- [OPEN_SOURCE_CONFIG_CI.md](OPEN_SOURCE_CONFIG_CI.md) - 配置收敛与 CI 方案
-- [archive/](archive/) - 归档历史文件
 - [claude/architecture.md](claude/architecture.md) - 架构参考
 - [claude/operations.md](claude/operations.md) - 运维参考
 
@@ -61,8 +60,9 @@
 - [QUICKSTART.md](strategy/QUICKSTART.md) - 快速入门
 - [DEVELOPMENT_GUIDE.md](strategy/DEVELOPMENT_GUIDE.md) - 开发规范
 - [AI_CONSTRAINTS.md](strategy/AI_CONSTRAINTS.md) - AI 编码约束
-- [EXAMPLES.md](strategy/EXAMPLES.md) - 参考示例
+- [EXAMPLES.md](strategy/EXAMPLES.md) - 常见问题 FAQ
 - [REVIEW_CHECKLIST.md](strategy/REVIEW_CHECKLIST.md) - 研发检查表
+- [STRATEGY_SPEC.md](strategy/STRATEGY_SPEC.md) - 策略规格文件 schema
 
 ### strategies/ 目录
 - [README.md](../strategies/README.md) - 策略开发入门指南

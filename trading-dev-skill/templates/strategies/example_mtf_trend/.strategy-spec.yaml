@@ -1,0 +1,47 @@
+strategy_name: example_mtf_trend
+prefix: EXAMPLEMTFTREND
+direction: neutral
+timeframes: [4h]
+extra_timeframes: [1d, 1h]
+
+symbols: [BTCUSDT]
+
+entry:
+  description: "三周期共振趋势跟随：1d EMA50 定方向 + 4h MA10/MA30 交叉触发 + 1h RSI14 确认"
+  conditions:
+    - "1d：收盘价 > EMA50 允许做多；< EMA50 允许做空"
+    - "4h：MA10 上穿 MA30（金叉）做多；下穿（死叉）做空"
+    - "1h：RSI14 > 55 确认多头动量；< 45 确认空头动量"
+    - "三个条件同时满足才入场；入场价优先 realtime_price，退回 4h 已闭合收盘价"
+
+exit:
+  stop_loss: "2 × ATR14(4h)，多头 entry-2ATR / 空头 entry+2ATR"
+  trailing_stop: ""
+  signal_reversal: ""
+  note: "回落止盈/固定止盈由 overrides 的 risk 段统一风控兜底"
+
+state_fields:
+  - name: atr_at_entry
+    type: float
+    default: 0.0
+    persist: true
+  - name: trend_ema_at_entry
+    type: float
+    default: 0.0
+    persist: true
+  - name: latest_rsi
+    type: float
+    default: 50.0
+    persist: false
+
+default_params:
+  trend_timeframe: 1d
+  confirm_timeframe: 1h
+  trend_ema_period: 50
+  ma_fast_period: 10
+  ma_slow_period: 30
+  rsi_period: 14
+  rsi_long_threshold: 55
+  rsi_short_threshold: 45
+  atr_period: 14
+  atr_stop_mult: 2.0

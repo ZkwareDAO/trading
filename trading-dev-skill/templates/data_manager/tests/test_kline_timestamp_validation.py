@@ -27,7 +27,7 @@ class TestKlineTimestampValidation:
         config = DataManagerConfig(
             csv_dir=tmpdir,
             preload_1m_enabled=False,
-            klines_service_enabled=False,  # 禁用 WS
+            realtime_enabled=False,  # 禁用 WS
         )
         dm = DataManager(config)
         dm.connect()
@@ -204,7 +204,7 @@ class TestKlineTimestampValidationBacktestMode:
         config = DataManagerConfig(
             csv_dir=tmpdir,
             preload_1m_enabled=False,
-            klines_service_enabled=False,
+            realtime_enabled=False,
             backtest_mode=True,  # 回测模式
         )
         dm = DataManager(config)

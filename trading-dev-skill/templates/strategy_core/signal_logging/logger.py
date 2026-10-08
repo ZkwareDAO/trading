@@ -4,7 +4,6 @@ Signal Logging - 信号日志
 负责信号的持久化存储和查询
 """
 
-import json
 import logging
 import csv
 from typing import List, Optional, Dict, Any
@@ -61,10 +60,6 @@ class SignalStorage:
         strategy_dir = self.base_dir / strategy_id
         strategy_dir.mkdir(parents=True, exist_ok=True)
         return strategy_dir / f"{date_str}.csv"
-
-    def _file_exists(self, strategy_id: str, date: datetime) -> bool:
-        """检查指定策略和日期的 CSV 文件是否存在"""
-        return self._get_file_path(strategy_id, date).exists()
 
     def _init_csv_file(self, strategy_id: str, date: datetime):
         """
@@ -367,70 +362,27 @@ class SignalLogger:
     信号日志器
 
     封装 SignalStorage，提供便捷的信号记录接口。
-    可选集成 Kafka Producer / HTTP Sender 用于实时推送信号。
-    可选启用 JSON 本地备份。
+
+    单体模式：配置 direct_trader（direct_trading.enabled=true）→
+    存储（CSV 由引擎负责）后直接调用交易所下单。
+    未配置 direct_trader 时信号只落存储，不下单。
     """
 
     def __init__(
         self,
         storage: SignalStorage,
-        kafka_producer=None,
-        http_endpoint: Optional[str] = None,
-        http_api_path: Optional[str] = None,
-        json_backup_dir: Optional[str] = None,
-        kafka_topic: Optional[str] = None,
+        direct_trader=None,
     ):
         """
         初始化信号日志器
 
         Args:
             storage: SignalStorage 实例
-            kafka_producer: 可选的 KafkaSignalProducer 实例
-            http_endpoint: 可选的 HTTP 端点 (如 http://127.0.0.1:8888)
-            http_api_path: 可选的 API 路径 (如 /api/v2/signals，默认 /api/v1/kafka/message)
-            json_backup_dir: 可选的 JSON 本地备份目录
-            kafka_topic: Kafka topic 名称（用于 HTTP 发送）
+            direct_trader: 可选的直连下单执行器（如 BinanceTrader）。
+                传入时在信号存储后直接向交易所下单。
         """
         self.storage = storage
-        self.kafka_producer = kafka_producer
-        self.json_backup_dir = json_backup_dir
-        self.kafka_topic = kafka_topic
-
-        # 初始化 HTTP 发送器（延迟导入避免 requests 依赖问题）
-        self._http_sender = None
-        if http_endpoint:
-            from .http_sender import HttpSignalSender
-            self._http_sender = HttpSignalSender(
-                base_url=http_endpoint,
-                api_path=http_api_path,
-            )
-
-    def _write_json_backup(self, signal: Signal, strategy_name: str = "", **params):
-        """将信号写入本地 JSON 文件（失败不阻断）"""
-        if not self.json_backup_dir:
-            return
-        try:
-            cta = CtaSignalCSV.from_signal(signal, strategy_name=strategy_name, **params)
-            data = cta.to_json()
-
-            # 路径: {json_backup_dir}/{strategy_name}/{timestamp}-{signal_id}.json
-            ts_str = signal.timestamp.strftime("%Y%m%d_%H%M%S")
-            if strategy_name:
-                base = Path(self.json_backup_dir) / strategy_name
-            else:
-                base = Path(self.json_backup_dir)
-            base.mkdir(parents=True, exist_ok=True)
-
-            filename = f"{ts_str}-{signal.signal_id}.json"
-            file_path = base / filename
-
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
-
-            logger.debug(f"JSON 备份已保存: {file_path}")
-
-        except Exception as e:
-            logger.warning(f"JSON 备份失败: {signal.signal_id}, 错误: {e}")
+        self._direct_trader = direct_trader
 
     def log_signal(
         self,
@@ -439,77 +391,45 @@ class SignalLogger:
         strategy_params: Optional[Dict[str, Any]] = None,
     ) -> bool:
         """
-        推送信号：优先 HTTP → 降级 Kafka → 始终 CSV（由引擎处理）
-        同时可选写入 JSON 本地备份。
+        存储后直连下单（如启用）；CSV 始终由引擎处理。
 
         Args:
             signal: Signal 对象
-            strategy_name: 策略名称（用于 JSON 备份子目录）
+            strategy_name: 策略名称
             strategy_params: 可选的策略配置参数
 
         Returns:
-            是否至少通过一种方式成功推送
+            是否成功下单（未配置 direct_trader 时恒为 True）
         """
-        # 1. JSON 本地备份（始终尝试，失败不阻断）
-        self._write_json_backup(signal, strategy_name, **(strategy_params or {}))
-
-        # 2. HTTP 发送（如果启用）
-        if self._http_sender:
-            try:
-                # 使用配置的 kafka_topic，或从 strategy_params 获取，或默认值
-                topic = self.kafka_topic or (strategy_params or {}).get("topic", "strategy_signals")
-                # 传递时去掉 topic 避免重复
-                http_params = {k: v for k, v in (strategy_params or {}).items() if k != "topic"}
-                http_ok = self._http_sender.send_signal(
-                    signal, topic=topic, **http_params,
-                )
-                if http_ok:
-                    return True
-                logger.warning(f"HTTP 发送失败，降级到 Kafka: {signal.signal_id}")
-            except Exception as e:
-                logger.warning(f"HTTP 发送异常，降级到 Kafka: {signal.signal_id}, 错误: {e}")
-
-        # 3. Kafka 推送（降级路径）
-        if self.kafka_producer and self.kafka_producer.is_available():
-            try:
-                params = strategy_params or {}
-                self.kafka_producer.send_signal(signal, **params)
-                return True
-            except Exception as e:
-                logger.warning(f"Kafka 推送失败: {signal.signal_id}, 错误: {e}")
-                return False
+        # 直连下单（启用时）
+        if self._direct_trader:
+            cta = CtaSignalCSV.from_signal(
+                signal, strategy_name=strategy_name, **(strategy_params or {})
+            )
+            return self._execute_direct(cta)
 
         return True
 
-    def log_cta_signal(self, cta_signal, topic: Optional[str] = None) -> bool:
+    def _execute_direct(self, cta_signal) -> bool:
+        """交给直连执行器下单（异常不外抛，与其他通道的失败语义一致）"""
+        try:
+            return bool(self._direct_trader.execute(cta_signal))
+        except Exception as e:
+            logger.error(f"直连下单异常: {cta_signal.signal_id}, 错误: {e}")
+            return False
+
+    def log_cta_signal(self, cta_signal) -> bool:
         """
-        统一发送 CtaSignalCSV 对象
+        统一处理 CtaSignalCSV 对象：直连下单（如启用）
 
         Args:
             cta_signal: 已生成的 CtaSignalCSV 对象
-            topic: Kafka topic（可选，默认使用配置的 kafka_topic）
 
         Returns:
-            是否发送成功
+            是否成功下单（未配置 direct_trader 时恒为 True）
         """
-        # 1. HTTP 发送（如果启用）
-        if self._http_sender:
-            try:
-                send_topic = topic or self.kafka_topic or "strategy_signals"
-                http_ok = self._http_sender.send_cta_signal(cta_signal, topic=send_topic)
-                if http_ok:
-                    return True
-                logger.warning(f"HTTP 发送失败，降级到 Kafka: {cta_signal.signal_id}")
-            except Exception as e:
-                logger.warning(f"HTTP 发送异常，降级到 Kafka: {cta_signal.signal_id}, 错误: {e}")
-
-        # 2. Kafka 推送（降级路径）
-        if self.kafka_producer and self.kafka_producer.is_available():
-            try:
-                return self.kafka_producer.send_cta_signal(cta_signal)
-            except Exception as e:
-                logger.warning(f"Kafka 推送失败: {cta_signal.signal_id}, 错误: {e}")
-                return False
+        if self._direct_trader:
+            return self._execute_direct(cta_signal)
 
         return True
 

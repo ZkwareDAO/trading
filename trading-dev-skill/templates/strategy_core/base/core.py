@@ -67,8 +67,7 @@ class BaseStrategyCore(ABC, Generic[StateType]):
     def _init_exit_detection_mode(self, global_config: Optional[Dict[str, Any]]) -> None:
         """初始化止损止盈检测模式"""
         if global_config:
-            engine_config = global_config.get("strategy_engine", {})
-            self.use_bar_high_low_for_exit = engine_config.get("use_bar_high_low_for_exit", True)
+            self.use_bar_high_low_for_exit = global_config.get("use_bar_high_low_for_exit", True)
         else:
             self.use_bar_high_low_for_exit = True
 

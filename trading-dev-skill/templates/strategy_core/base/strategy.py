@@ -15,7 +15,11 @@ from strategy_core.signal_logging import Signal, SignalType
 from strategy_core.position_persistence import PositionPersistence
 from strategy_core.stop_loss_cooldown_persistence import StopLossCoolDownPersistence
 from strategy_core.base.risk_config import RiskControlConfig
-from strategy_core.constants import TF_MINUTES, DEFAULT_MIN_BARS_REQUIRED
+from strategy_core.constants import (
+    TF_MINUTES,
+    DEFAULT_MIN_BARS_REQUIRED,
+    INDICATOR_WARMUP_BARS,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +49,6 @@ class BaseStrategy(ABC):
         config: Optional[Dict[str, Any]] = None,
         strategy_name: Optional[str] = None,
         trading_mode: str = "live",
-        factory_client: Optional[Any] = None,
-        user_id: str = "",
     ):
         # 配置必须由入口注入（来自 per-symbol overrides），不再回退读共享层 config.yaml
         self.config = config or {}
@@ -69,13 +71,6 @@ class BaseStrategy(ABC):
         self._current_kline_timestamp: Optional[datetime] = None
         self._current_price: Optional[float] = None
         self._backtest_mode = False
-
-        # 远程仓位同步
-        self._factory_client = factory_client
-        self._user_id = user_id
-        self._position_cache: Dict[str, bool] = {}
-        self._position_cache_time: Dict[str, datetime] = {}
-        self._cache_ttl_seconds: int = 30
 
         # 创建核心逻辑
         self._core = self._create_core()
@@ -409,21 +404,22 @@ class BaseStrategy(ABC):
 
         state = self._core._get_state(trigger_symbol)
 
-        # 有持仓 → 先同步远程仓位状态
-        if state.is_in_position():
-            self._sync_remote_position(trigger_symbol, self._user_id)
-            # 同步后重新获取状态
-            state = self._core._get_state(trigger_symbol)
-
         # 有持仓 → 检查出场
         if state.is_in_position():
             if current_price and current_price > 0:
                 position_snapshot = self._snapshot_position(state)
+                trail_before = getattr(state, "trail_activated", False)
                 signal = self._check_exit(trigger_symbol, current_price, bar_high, bar_low)
                 self._log_position_diagnostic(trigger_symbol, state, signal, current_price,
                                               position_snapshot=position_snapshot)
                 if signal:
                     return signal
+                # 未出场：若移动止损状态被推进，落盘持久化。
+                # 必须在 signal 判空之后 —— 出场路径已由 _notify_position_exit
+                # 清理持久化，此处再写会把清空后的状态覆盖回磁盘。
+                self._persist_position_update_if_changed(
+                    trigger_symbol, state, position_snapshot, trail_before
+                )
             return None
 
         # 无持仓 → 入场分析
@@ -489,6 +485,33 @@ class BaseStrategy(ABC):
             "peak_price": state.peak_price,
         }
 
+    def _persist_position_update_if_changed(
+        self,
+        symbol: str,
+        state: Any,
+        snapshot: Dict[str, Any],
+        trail_before: bool,
+    ) -> None:
+        """移动止损状态发生变化时触发持久化
+
+        peak_price / stop_price / trail_activated 会在持仓期间被推进
+        （risk_control 的回落止盈、策略的 SAR 跟踪止损等）。这些字段会被
+        state.from_persist_dict() 读回，但此前没有任何写回路径 ——
+        进程重启后峰值归零、已抬高的止损位丢失。
+
+        仅在字段真实变化时写盘，避免每根 K 线都产生 IO。
+        回测模式由 _notify_position_update 内部的 backtest_mode 判据拦下。
+        """
+        if not state.is_in_position():
+            return
+        changed = (
+            state.peak_price != snapshot.get("peak_price")
+            or state.stop_price != snapshot.get("stop_price")
+            or getattr(state, "trail_activated", False) != trail_before
+        )
+        if changed:
+            self._core._notify_position_update(symbol, state)
+
     def _log_position_diagnostic(
         self,
         symbol: str,
@@ -549,173 +572,7 @@ class BaseStrategy(ABC):
         else:
             logger.info(log_msg)
 
-    # ========== 远程仓位同步（基类实现）==========
-
-    def _sync_remote_position(self, symbol: str, user_id: str) -> None:
-        """
-        同步远程仓位状态
-
-        Args:
-            symbol: 交易对
-            user_id: 用户 ID
-
-        Note:
-            回测模式和 paper_trading 模式不需要远程同步功能，直接跳过。
-            只有 live 模式才需要同步真实仓位。
-        """
-        # 回测模式和 paper_trading 模式跳过远程同步
-        if self._backtest_mode or self._paper_trading_mode:
-            logger.debug(f"[{symbol}] 回测/paper模式，跳过远程仓位同步")
-            return
-
-        state = self._core._get_state(symbol)
-
-        # 无本地持仓，无需同步
-        if not state.is_in_position():
-            logger.debug(f"[{symbol}] 无本地持仓，跳过远程同步")
-            return
-
-        # 无 factory_client，跳过同步
-        if not self._factory_client:
-            logger.debug(f"[{symbol}] 无 factory_client，跳过远程同步")
-            return
-
-        # 检查缓存是否有效
-        now = datetime.now(timezone.utc)
-        cache_time = self._position_cache_time.get(symbol)
-        if cache_time and (now - cache_time).total_seconds() < self._cache_ttl_seconds:
-            logger.debug(
-                f"[{symbol}] 远程仓位缓存有效 (缓存时间={cache_time}, TTL={self._cache_ttl_seconds}s)，跳过查询"
-            )
-            return  # 缓存有效，跳过查询
-
-        # 查询远程仓位
-        try:
-            strategy_name = self._external_strategy_name
-
-            # 记录请求 URL（不记录敏感参数）
-            position_proxy_url = getattr(
-                self._factory_client, 'position_proxy_url', 'N/A'
-            )
-            position_api_path = getattr(
-                self._factory_client, 'position_api_path', '/api/position/user-order-positions'
-            )
-            logger.info(
-                f"[{symbol}] 查询远程仓位 | "
-                f"URL={position_proxy_url}{position_api_path} | "
-                f"strategy_name={strategy_name}"
-            )
-
-            is_open, position_detail = self._factory_client.is_position_open(strategy_name, user_id, symbol)
-
-            if is_open is False and position_detail:
-                # 远程已平仓，判断是否今天的止损
-                is_stop_loss = self._is_today_stop_loss(symbol, position_detail)
-
-                # 远程已平仓，记录历史、清理持久化、清除内存状态
-                pnl_value = position_detail.get("PnlValue")
-                logger.info(
-                    f"[{symbol}] 远程仓位已平仓，清除本地状态: "
-                    f"position_id={state.position_id}, "
-                    f"entry_price={state.entry_price:.2f}, "
-                    f"position={state.position}, "
-                    f"PnlValue={pnl_value}, "
-                    f"is_stop_loss={is_stop_loss}"
-                )
-
-                # 记录历史仓位并清理持久化文件
-                self._on_position_exit(
-                    symbol=symbol,
-                    position_id=state.position_id,
-                    state=state,
-                    exit_price=self._current_price or state.entry_price,
-                    exit_reason="remote_closed",
-                    is_stop_loss=is_stop_loss,
-                )
-
-                # 清除内存状态
-                self._clear_position_state(state)
-
-                # 如果止损，设置 stop_loss_date 并持久化
-                if is_stop_loss:
-                    self._save_stop_loss_cooldown(symbol, position_detail, state)
-
-            elif is_open is False and not position_detail:
-                # 防御性分支：is_open=False 时 position_detail 应该存在
-                # 如果出现此情况，记录警告并保持本地状态
-                logger.warning(
-                    f"[{symbol}] 异常状态（is_open=False 无仓位详情），保持本地状态"
-                )
-
-            elif is_open is True:
-                # 远程仍在仓，更新缓存时间
-                logger.info(
-                    f"[{symbol}] 远程仓位确认开启，本地持仓: "
-                    f"position_id={state.position_id}, "
-                    f"entry_price={state.entry_price:.2f}"
-                )
-
-            else:
-                # 查询失败，保持本地状态（保守策略）
-                logger.warning(f"[{symbol}] 远程仓位查询失败，保持本地状态")
-
-            # 更新缓存
-            self._position_cache[symbol] = is_open is True
-            self._position_cache_time[symbol] = now
-            logger.debug(
-                f"[{symbol}] 远程仓位缓存已更新: is_open={is_open}, cache_time={now}"
-            )
-
-        except Exception as e:
-            logger.warning(f"[{symbol}] 远程仓位同步异常: {e}")
-
     # ========== 辅助方法（基类实现）==========
-
-    def _is_today_stop_loss(self, symbol: str, position_detail: dict) -> bool:
-        """判断是否今天的止损（只有今天的亏损才设置冷却）"""
-        pnl_value = position_detail.get("PnlValue")
-        close_time_str = position_detail.get("CloseTime")
-
-        if pnl_value is None or pnl_value >= 0 or not close_time_str:
-            return False
-
-        try:
-            close_time = datetime.fromisoformat(close_time_str)
-            return close_time.date() == date.today()
-        except ValueError:
-            logger.warning(f"[{symbol}] 无法解析 CloseTime: {close_time_str}")
-            return False
-
-    def _clear_position_state(self, state) -> None:
-        """清除内存中的仓位状态"""
-        state.position = None
-        state.position_id = None
-        state.entry_price = 0.0
-        state.entry_time = None
-        state.entry_timestamp = None
-        state.peak_price = 0.0
-        state.stop_price = 0.0
-        state.max_pnl_pct = 0.0
-        state.min_pnl_pct = 0.0
-
-    def _save_stop_loss_cooldown(self, symbol: str, position_detail: dict, state) -> None:
-        """保存止损冷却到独立文件"""
-        close_time_str = position_detail.get("CloseTime")
-        if not close_time_str:
-            return
-
-        try:
-            close_time = datetime.fromisoformat(close_time_str)
-            state.stop_loss_date = close_time.date()
-
-            # 持久化到独立文件
-            cooldown_persistence = StopLossCoolDownPersistence()
-            strategy_id = self._external_strategy_name
-            cooldown_persistence.save(strategy_id, state.stop_loss_date)
-
-            logger.info(f"[{symbol}] 远程止损，设置 stop_loss_date={state.stop_loss_date}")
-        except ValueError:
-            logger.warning(f"[{symbol}] 无法解析 CloseTime: {close_time_str}")
 
     def _check_exit(
         self,
@@ -836,8 +693,17 @@ class BaseStrategy(ABC):
         """
         计算策略所需的历史数据天数，子类可重写。
 
-        默认实现：基于最大时间周期计算，15 根 K 线 + 5 天缓冲。
+        默认实现：基于最大时间周期，按 INDICATOR_WARMUP_BARS 根 K 线 + 5 天缓冲。
         子类可根据具体技术指标需求重写此方法。
+
+        为什么不是 15 根：ADX 的 MIN_ROWS = 100，RSI/ATR 是 period*3
+        （period=14 时 42 根）。原先固定 15 根导致 4h 只补 42 根、8h 只补
+        30 根、1d 只补 20 根 —— 全部低于 ADX 阈值。指标层只 `warnings.warn`
+        不阻断，于是策略拿着不准确的 ADX 照常发信号，且日志里只有一行
+        UserWarning。补齐天数必须以最苛刻的指标为准。
+
+        未登记到 TF_MINUTES 的周期会让 max_minutes=0 而静默退回 7 天，
+        见 constants.py 中的说明。
 
         Returns:
             所需历史数据天数（最小 7 天）
@@ -856,9 +722,8 @@ class BaseStrategy(ABC):
         if max_minutes == 0:
             return 7
 
-        # 15 根 K 线对应的天数 + 5 天缓冲
-        bars_needed = 15
-        days = (bars_needed * max_minutes) / 1440 + 5
+        # 预热根数对应的天数 + 5 天缓冲
+        days = (INDICATOR_WARMUP_BARS * max_minutes) / 1440 + 5
 
         return max(int(days), 7)
 

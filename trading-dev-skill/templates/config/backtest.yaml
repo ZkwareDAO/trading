@@ -5,7 +5,7 @@
 # 绝不含策略参数（策略参数唯一来源是 strategies/<name>/overrides/<SYM>.yaml）。
 #
 # 使用方式：
-#   python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260601
+#   python -m backtest.run_backtest --strategies example_ma_cross:BTCUSDT --start 20260601
 #   python -m backtest.batch_runner
 #
 # 本文件即 --profile 的默认值，日常回测无需传 --profile。
@@ -31,7 +31,7 @@
 # =============================================================================
 
 # 回测时间范围（CLI --start/--end 可覆盖）
-start: "20260601"
+start: "20260928"
 end: ""          # 空则用当前时间
 
 # 资金与费用（回测核算口径，与策略层 capital.max_cash 语义不同）
@@ -42,7 +42,7 @@ commission: 0.0004   # 币安合约 taker 0.04%
 data_dir: "./data/klines"
 output_dir: "./backtest_output"
 use_today_as_output_date: true
-log_level: "INFO"
+log_level: "DEBUG"
 
 # 并发
 max_workers: 4

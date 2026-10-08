@@ -1,22 +1,27 @@
 # Data Manager 使用指南
 
 **版本**: 3.7.0
-**更新日期**: 2026-05-29
+**更新日期**: 2026-09-06
 
 ## 架构设计
 
 ### 数据流程概览
 
 ```
-klines_service              data_manager                     策略
-┌──────────────┐           ┌──────────────────┐            ┌─────────────┐
-│ WS 实时推送   │ ────────▶ │ KlinesWSClient   │            │             │
-│ HTTP API     │ ────────▶ │ DataManager      │ ────────▶ │ get_klines()│
-└──────────────┘           │ KlineRepository  │            │ Kline 对象  │
-                           │ Cache (1m+LRU)   │            └─────────────┘
-本地 CSV 文件 ────────────▶ │                  │
-  {symbol}_{tf}.csv        └──────────────────┘
+Binance 公共源                data_manager                     策略
+┌──────────────────┐        ┌──────────────────┐            ┌─────────────┐
+│ WS 实时推送       │ ─────▶ │ KlinesWSClient   │            │             │
+│ (fstream.        │        │ DataManager      │ ────────▶ │ get_klines()│
+│  binance.com)    │        │ KlineRepository  │            │ Kline 对象  │
+│ REST 历史/轮询    │ ─────▶ │ Cache (1m+LRU)   │            └─────────────┘
+│ (fapi.binance.com)│       │                  │
+└──────────────────┘        └──────────────────┘
+本地 CSV 文件 ────────────▶
+  {symbol}_{tf}.csv
 ```
+
+单体模式：实时数据内置直连 Binance 公共 WS + REST 轮询回退，`realtime_enabled=false`
+时只用本地 CSV。
 
 ## 模块职责
 
@@ -24,7 +29,7 @@ klines_service              data_manager                     策略
 
 | 方法 | 说明 |
 |------|------|
-| `download_daily_data(symbol, day)` | 通过 HTTP API 下载单日数据并保存 CSV |
+| `download_daily_data(symbol, day)` | 通过 Binance fapi REST 下载单日数据并保存 CSV |
 | `batch_download_history(symbol, days)` | 批量下载最近 N 天历史数据 |
 | `init_today_realtime(symbol)` | 初始化今日数据：下载 + 补齐 + 开启 WS 推送 |
 | `manage_memory_cache(symbol)` | 管理内存缓存：保留近 2 天，清理过期数据 |
@@ -51,16 +56,16 @@ klines_service              data_manager                     策略
 
 ### klines_ws_client.py - WebSocket 客户端
 
-与 klines_service 的实时连接：
+与 Binance 公共 fstream 的实时连接：
 
 - 无限重连（指数退避，上限 120s）
-- 心跳检测（30s）
+- REST 轮询回退（WS 推送不可用时）
 - 回调机制支持同步和异步函数
 
 ```python
 from data_manager.klines_ws_client import KlinesWebSocketClient
 
-client = KlinesWebSocketClient(ws_url="${KLINES_WS_URL}")
+client = KlinesWebSocketClient()   # 默认 wss://fstream.binance.com/stream
 await client.connect()
 client.set_on_kline_callback(on_kline)
 await client.subscribe(["BTCUSDT", "ETHUSDT"])
@@ -98,9 +103,7 @@ config = DataManagerConfig(
     preload_days=7,
     cache_1m_max_rows=500000,
     cache_1m_max_age_days=90,
-    klines_service_enabled=True,
-    klines_service_ws_url="${KLINES_WS_URL}",
-    klines_service_http_url="${KLINES_HTTP_URL}",
+    realtime_enabled=True,
     sync_history_days=30,
     auto_sync_on_connect=True,
     persistence_interval_minutes=5,

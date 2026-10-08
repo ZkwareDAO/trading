@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """
 DataManager 新方法测试：load_history, sync_to_latest, cache_recent_data, fetch_klines_range
+
+单体模式：数据拉取统一走 _fetch_from_binance_public（Binance fapi 公共源），
+旧 klines_service 的 _fetch_klines_from_api 已随通道移除。
 """
 
 import asyncio
@@ -61,8 +64,8 @@ def dm(tmp_path):
     """创建 DataManager 实例，使用临时目录"""
     config = DataManagerConfig(
         csv_dir=str(tmp_path / "klines"),
-        klines_service_enabled=True,
-        klines_service_http_url="http://test:17081",
+        realtime_enabled=True,
+        # removed http url #"http://test:17081",
         auto_sync_on_connect=False,  # 关闭自动同步，避免测试中连 API
     )
     dm = DataManager(config)
@@ -114,7 +117,7 @@ class TestFetchKlinesRange:
         start_ms = 1713500000000
         end_ms = 1713500000000 + 60_000 * 10  # 10 分钟后
 
-        with patch.object(dm, '_fetch_klines_from_api', new_callable=AsyncMock) as mock_fetch:
+        with patch.object(dm, '_fetch_from_binance_public', new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = make_api_klines(10, start_ms)
 
             result = await dm.fetch_klines_range("BTCUSDT", "1m", start_ms, end_ms)
@@ -125,7 +128,7 @@ class TestFetchKlinesRange:
             mock_fetch.assert_called_once()
             call_args, call_kwargs = mock_fetch.call_args
             assert call_args[0] == "BTCUSDT"
-            assert call_args[1] == "1m"
+            assert call_kwargs.get("start_time_ms") == start_ms
 
 
 
@@ -134,15 +137,15 @@ class TestSyncToLatest:
 
     @pytest.mark.asyncio
     async def test_sync_to_latest_no_existing_data(self, dm):
-        """无本地数据时，下载完整历史"""
-        with patch.object(dm, 'batch_download_history', new_callable=AsyncMock) as mock_batch:
-            mock_batch.return_value = {"2026-04-19": True}
+        """无本地数据时，走大缺口补齐（download_range）+ init_today_realtime"""
+        with patch.object(dm, '_fill_large_gap_via_download_range', new_callable=AsyncMock) as mock_large:
+            mock_large.return_value = True
             with patch.object(dm, 'init_today_realtime', new_callable=AsyncMock) as mock_today:
                 mock_today.return_value = True
 
                 result = await dm.sync_to_latest("BTCUSDT", max_history_days=1)
-                # 无数据时会调用 batch_download_history + init_today_realtime
-                mock_batch.assert_called_once()
+                # 无数据时会调用大缺口补齐 + init_today_realtime
+                mock_large.assert_called_once()
                 mock_today.assert_called_once()
 
     @pytest.mark.asyncio
@@ -153,7 +156,7 @@ class TestSyncToLatest:
         df = make_df_from_api(make_api_klines(10, int((now - timedelta(hours=2)).timestamp() * 1000)))
         dm.cache.put("BTCUSDT", "1m", df, force_1m=True)
 
-        with patch.object(dm, '_fetch_klines_from_api', new_callable=AsyncMock) as mock_fetch:
+        with patch.object(dm, '_fetch_from_binance_public', new_callable=AsyncMock) as mock_fetch:
             mock_fetch.return_value = make_api_klines(5, int((now - timedelta(minutes=5)).timestamp() * 1000))
 
             result = await dm.sync_to_latest("BTCUSDT", max_history_days=1)
@@ -162,18 +165,24 @@ class TestSyncToLatest:
 
     @pytest.mark.asyncio
     async def test_sync_to_latest_old_data_needs_full_sync(self, dm):
-        """本地数据距今 > 1 天，全量补齐"""
+        """本地数据距今 > 1 天，走大缺口补齐（download_range）"""
         old_time = datetime.now(timezone.utc) - timedelta(days=5)
         df = make_df_from_api(make_api_klines(5, int(old_time.timestamp() * 1000)))
         dm.cache.put("BTCUSDT", "1m", df, force_1m=True)
 
-        with patch.object(dm, 'batch_download_history', new_callable=AsyncMock) as mock_batch:
-            mock_batch.return_value = {}
+        with patch.object(dm, '_fill_large_gap_via_download_range', new_callable=AsyncMock) as mock_large:
+            mock_large.return_value = True
             with patch.object(dm, 'init_today_realtime', new_callable=AsyncMock) as mock_today:
                 mock_today.return_value = True
 
                 result = await dm.sync_to_latest("BTCUSDT", max_history_days=5)
-                mock_batch.assert_called_once()
+                mock_large.assert_called_once()
+                # 起点是缓存末根本身（残缺末根需被完整值覆盖）。
+                # 5 根 K 线从 old_time 起，末根 = old_time + 4 分钟；
+                # K 线 timestamp 为毫秒整数，亚毫秒被截断，按秒比较。
+                start_arg = mock_large.call_args[0][1]
+                expected = (old_time + timedelta(minutes=4)).replace(microsecond=0)
+                assert start_arg.replace(microsecond=0) == expected
 
 
 class TestCacheRecentData:

@@ -1,7 +1,7 @@
 # 脚本参考文档
 
 **版本**: 3.7.0
-**更新日期**: 2026-08-17
+**更新日期**: 2026-10-08
 
 本文档列出系统提供的所有命令行脚本和工具。所有命令均以仓库根目录为工作目录。
 
@@ -15,13 +15,12 @@
 python3 run_strategies_manager.py
 ```
 
-**说明**: 策略运行时管理器。配置了 `FACTORY_ENDPOINT` 时由 `cta_factory_service`
-控制；未配置则跳过 factory 注册与回调，直接本地启动策略进程。
+**说明**: 策略进程监督者。按登记表或 `--run` 清单拉起策略子进程并监控。
 
 **职责**:
 - 按登记表或 `--run` 清单启动策略进程（每策略独立进程）
-- 配置 factory 时：注册策略、恢复上次 running 状态、接收回调、心跳上报
-- 进程退出时优雅停止全部子进程
+- 监控子进程退出（只告警，不自动重启）
+- 收到 SIGTERM/SIGINT 时优雅停止全部子进程（SIGTERM→SIGKILL）
 
 **参数**:
 
@@ -30,10 +29,6 @@ python3 run_strategies_manager.py
 | `--config` | 否 | `config/settings.yaml` | 系统配置文件路径 |
 | `--strategies` | 否 | `config/strategies.yaml` | 策略登记表路径 |
 | `--run` | 否 | 无 | 显式清单 `name:symbol,...`，优先于登记表；缺 overrides 报错 |
-| `--strategies-dir` | 否 | `./strategies` | 策略目录 |
-| `--factory-endpoint` | 否 | 读 settings.yaml | factory-service RPC 端点 |
-| `--callback-host` | 否 | `0.0.0.0` | 回调服务绑定地址 |
-| `--callback-port` | 否 | `8892` | 回调服务端口 |
 | `--log-level` | 否 | `INFO` | 日志级别 |
 
 **示例**:
@@ -42,8 +37,8 @@ python3 run_strategies_manager.py
 # 使用默认配置（读 config/strategies.yaml 登记表）
 python3 run_strategies_manager.py
 
-# 指定系统配置
-python3 run_strategies_manager.py --config config/settings.prod.yaml
+# 指定自定义系统配置（复制 config/settings.yaml 改名维护）
+python3 run_strategies_manager.py --config config/settings.custom.yaml
 
 # 只跑指定组合（不改登记表）
 python3 run_strategies_manager.py --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
@@ -52,8 +47,8 @@ python3 run_strategies_manager.py --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
 一键启停见 [start.sh / stop.sh](#93-一键启停) 与 [9.2 批量实盘](#92-批量实盘多策略--多代币)。
 
 **架构说明**:
-- 每个策略运行在独立进程（`run_strategy.py`）
-- 配置 factory 时，启停与崩溃重启由 factory 控制
+- 每个策略运行在独立进程（`run_strategy.py`），直连 Binance 行情与下单
+- 子进程崩溃后由监控循环告警，不自动重启（由外部 supervisor/systemd 决定拉起策略）
 
 ---
 
@@ -63,7 +58,7 @@ python3 run_strategies_manager.py --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
 python3 run_strategy.py --name sar_snt3_v3 --symbol BTCUSDT --interval 4h --version 3 --trading-mode live
 ```
 
-**说明**: 启动独立策略进程。通常由 `run_strategies_manager.py` 或 `cta_factory_service` 调用，
+**说明**: 启动独立策略进程。通常由 `run_strategies_manager.py` 拉起，
 也可手动单独启动调试。
 
 **参数**:
@@ -111,9 +106,8 @@ python3 run_strategy.py --name sar_snt3_v3 --symbol BTCUSDT --log-level DEBUG
 
 **进程特性**:
 - 独立的 DataManager（专属 CSV 路径）
-- 独立的 SignalLogger + KafkaProducer
-- 独立的 WS 连接
-- 独立注册到 factory-service
+- 独立的 SignalLogger（CSV 存储 + 交易所直连下单）
+- 独立的 WS 连接（直连 Binance 公共源）
 
 ---
 
@@ -157,7 +151,12 @@ HTTPS_PROXY=http://<host>:<port> python3 scripts/download_data.py --symbol ETHUS
 
 **输出路径**: `{data_dir}/{interval}/{SYMBOL}_{interval}.csv`
 
-**数据来源**: Binance 公共 fapi（`/fapi/v1/klines`），分页拉取，单次上限 1500 条。
+**数据来源**: Binance 公共 fapi（`/fapi/v1/klines`），分页拉取，单次上限 1500 条；
+长缺口自动改走归档包（`data.binance.vision`，完整月 monthly zip / 零头天 daily zip）。
+
+**库入口 `download_range()`**: 区间由调用方给定（而非从 CSV 末根推导）。
+`backtest.run_backtest` 发现数据缺口时调用它自动补数，与 CLI 共用同一条
+归档/fapi/merge 链路与落盘格式。无对应 CLI 参数。
 
 ---
 
@@ -202,13 +201,18 @@ python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 202606
 
 | 参数 | 必填 | 默认值 | 说明 |
 |------|------|--------|------|
-| `--strategies` | 是 | - | 运行清单 `name:symbol`，symbol 唯一来源；单次仅支持一个 |
-| `--start` | 是 | - | 开始时间（支持 YYYYMMDD、秒时间戳、毫秒时间戳） |
-| `--end` | 否 | 当前时间 | 结束时间（同上格式） |
+| `--strategies` | 是 | - | 运行清单 `name:symbol`，symbol 唯一来源；**单次仅支持一个**（传多个报错，多标的用 `batch_runner`） |
+| `--start` | 是 | - | 开始时间（支持 YYYYMMDD、秒时间戳、毫秒时间戳），覆盖 profile.start |
+| `--end` | 否 | 当前时间 | 结束时间（同上格式），覆盖 profile.end |
 | `--profile` | 否 | `backtest` | run-profile，读 `config/<name>.yaml` |
-| `--config-path` | 否 | `strategies/<name>/overrides/<SYMBOL>.yaml` | 策略配置完整路径 |
+| `--config-path` | 否 | `strategies/<name>/overrides/<SYMBOL>.yaml` | 策略配置完整路径（文件必须存在，否则报错） |
 | `--overrides` | 否 | - | 配置覆盖字段（JSON 字符串） |
-| `--log-level` | 否 | 跟 profile | 日志级别 |
+| `--log-level` | 否 | 跟 profile | 日志级别（优先级：CLI > 策略配置 > profile） |
+
+注意：`--strategies` 的值是 `name:symbol`（如 `sar_snt3_v3:BTCUSDT`），
+不是纯策略名；且**只接受一对**。底层解析复用
+`run_strategies_manager.parse_explicit_strategies()`（与实盘 `--run`、
+`batch_runner --run` 三处同一实现），传多个 pair 会直接 `exit 1`。
 
 **回测专有参数已下放到 profile**，不再是 CLI 参数：`timeframe`、`data_dir`、
 `output_dir`、`cash`、`commission`、输出日期模式 → 全部读 `config/backtest.yaml`。
@@ -236,13 +240,13 @@ python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 177911
 # 使用毫秒时间戳（精确到毫秒）
 python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 1779118020000
 
-# 指定结束时间与配置文件
-python3 -m backtest.run_backtest --strategies sar_snt3_v3:ETHUSDT --start 20260610 --end 20260708 \
-  --config-path strategies/sar_snt3_v3/overrides/ETHUSDT.yaml
+# 指定结束时间与配置文件（overrides 文件必须真实存在，否则直接报错）
+python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260610 --end 20260708 \
+  --config-path strategies/sar_snt3_v3/overrides/BTCUSDT.yaml
 
 # 用 --overrides 覆盖配置参数
 python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260610 \
-  --overrides '{"params":{"cooldown_bars":30},"capital":{"max_cash":100}}'
+  --overrides '{"params":{"stop_loss_pct":3.0},"capital":{"max_cash":100}}'
 
 # 降日志级别提速
 python3 -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260610 --log-level WARNING
@@ -297,7 +301,10 @@ backtest_output/
 python3 -m backtest.batch_runner
 ```
 
-**说明**: 按 `config/strategies.yaml` 登记的 `策略 × symbol` 并发执行回测任务。
+**说明**: 按 `config/strategies.yaml` 登记的 `策略 × symbol` 并发执行回测任务
+（也可用 `--run` 显式指定清单）。**建议日常直接用
+`./scripts/run_backtest_batch.sh` 包装脚本**（见 [9.1](#91-批量回测多策略--多代币)），
+它负责笛卡尔积/登记表展开与 overrides 预检，最终转调本模块。
 
 **配置结构（三层模型）**:
 
@@ -340,19 +347,20 @@ strategies:
 
 ```yaml
 # config/backtest.yaml - run-profile（回测专有参数，键与 settings.yaml 不相交）
-start: "20260601"
+start: "20260928"
 end: ""                  # 留空则用当前时间
 cash: 5000
 commission: 0.0004       # 币安合约 taker 0.04%
 data_dir: "./data/klines"  # 必须与 settings.yaml 的 csv_dir 一致，启动时校验
 output_dir: "./backtest_output"
+use_today_as_output_date: true
+log_level: "DEBUG"
 max_workers: 4
-log_level: "INFO"
 ```
 
-profile 只写有代码消费的键；"回测不推信号 / 不注册 factory"由回测链路本身保证
-（回测不初始化这些客户端），无需也不应在此写开关。注意回测**确实**读
-`config/settings.yaml` 的 `strategy_engine.use_bar_high_low_for_exit`（影响止损判定）。
+profile 只写有代码消费的键；"回测不下单"由回测链路本身保证
+（回测不初始化直连执行器），无需也不应在此写开关。注意回测**确实**读
+`config/settings.yaml` 的顶层 `use_bar_high_low_for_exit`（影响止损判定）。
 
 **示例**:
 
@@ -366,11 +374,8 @@ python3 -m backtest.batch_runner --start 20260610 --end 20260708
 # 用自定义 profile（复制 config/backtest.yaml 改参数）
 python3 -m backtest.batch_runner --profile myrun
 
-# 只跑部分标的（不改登记表），格式同实盘 --run
+# 只跑部分标的（不改登记表），格式同实盘 --run，逗号分隔多个 name:symbol
 python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
-
-# 多策略多标的
-python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,obv_atr_v2:ETHUSDT
 
 # 后台运行
 python3 -m backtest.batch_runner --daemon
@@ -430,12 +435,12 @@ python3 backtest/daily_backtest.py --yesterday
 # 回测最近 30 天（滚动窗口）
 python3 backtest/daily_backtest.py --days 30
 
+```bash
 # 回测指定日期
 python3 backtest/daily_backtest.py --start 20260612 --end 20260612
 
 # 指定配置和日志级别
 python3 backtest/daily_backtest.py --start 20260612 --config config/strategies.yaml --log-level DEBUG
-
 # 查看帮助（透传给 batch_runner）
 python3 backtest/daily_backtest.py --help
 ```
@@ -481,7 +486,7 @@ python3 -m pytest --cov=. --cov-report=html
 1. 下载历史数据（大周期由回测自动聚合，无需重采样）
    python3 scripts/download_data.py --symbol BTCUSDT,ETHUSDT --interval 1m --days 40
 
-2. 批量回测
+2. 批量回测（overrides 缺失会预检拒绝）
    ./scripts/run_backtest_batch.sh --strategies sar_snt3_v3 --symbols BTCUSDT,ETHUSDT \
        --start 20260610 --end 20260708
 
@@ -498,24 +503,33 @@ python3 -m pytest --cov=. --cov-report=html
 ### 5.2 数据流向
 
 ```
-Binance 公共 fapi
+Binance 公共 fapi + 归档（data.binance.vision）
          ↓
 scripts/download_data.py
-         ↓
+  ├─ CLI（人工前置备料：--symbol/--days）
+  └─ download_range()  ←──────────┐  回测发现缺口时自动调用
+         ↓                        │
 ./data/klines/{INTERVAL}/{SYMBOL}_{INTERVAL}.csv
-         ↓
-    ┌────┴────────────────────────┐
-    ↓                             ↓
-backtest.run_backtest      run_strategies_manager.py
-（backtrader 驱动）              ↓
-    ↓                     run_strategy.py（每策略独立进程）
-./backtest_output/...            ↓
-                          ./data/signals/{STRATEGY_ID}/{DATE}.csv
-                                 ↓
-                          signal hub / Kafka（可选）
-                                 ↓
-                          下游交易系统（读取信号并执行）
+         ↓                        │
+    ┌────┴────────────────────────┼───┐
+    ↓                             │   ↓
+backtest.run_backtest ────────────┘  run_strategies_manager.py
+（backtrader 驱动）                        ↓
+    ↓                              run_strategy.py（每策略独立进程）
+./backtest_output/...                     ↓
+                                   ./data/signals/{STRATEGY_ID}/{DATE}.csv
+                                          ↓
+                                   signal hub（可选）
+                                          ↓
+                                   下游交易系统（读取信号并执行）
 ```
+
+回测启动时校验 1m 数据覆盖 `[warm-up 起点, 回测结束]`：
+- 缺头部（warm-up 不足）或缺尾部 → 自动调 `download_range()` 只补缺失的子区间
+- 补齐后仍不覆盖 → **exit 1**，打印「需要 / 实有 / 缺口天数」与手动补数命令。
+  不覆盖时硬失败而非继续：跑出来的会是「处理 K 线数：0」的零成交报告，
+  看起来像"策略没信号"，实则窗口内一根数据都没有。
+- 中部空洞不阻断（交易所停机属常态），由 data_manager 的连续性扫描负责。
 
 回测与实盘**读同一份 CSV**（`./data/klines/`），走同一个 `on_kline()`，
 只在成交与信号推送环节分叉。
@@ -524,23 +538,21 @@ backtest.run_backtest      run_strategies_manager.py
 
 ## 6. 环境变量
 
-全部环境变量都是**可选**的——未设置时 `${VAR}` 占位符解析为 `None`，
-对应功能优雅降级（跳过 factory 注册、回退 Binance 公共数据源、不推信号）。
-所以回测与本地开发无需配置任何环境变量。
+全部环境变量都是**可选**的——单体模式直连 Binance 公共源，本地开发/回测
+无需配置任何环境变量。
 
 来源：`.env.example`（复制为 `.env` 后填写）。
 
 | 变量 | 必填 | 说明 | 示例 |
 |------|------|------|------|
-| `KLINES_WS_URL` | 否 | K 线 WebSocket 地址；留空回退 Binance 公共源 | `ws://<host>:<port>/ws` |
-| `KLINES_HTTP_URL` | 否 | K 线 HTTP 地址；留空回退 Binance 公共源 | `http://<host>:<port>` |
-| `FACTORY_ENDPOINT` | 否 | factory-service 地址；留空跳过注册与回调 | `http://<host>:<port>` |
-| `POSITION_PROXY_URL` | 否 | Position 代理地址（远程仓位查询） | `http://<host>:<port>` |
-| `SIGNAL_HUB_ENDPOINT` | 否 | 信号推送地址；留空只写本地 CSV | `http://<host>:<port>` |
-| `KAFKA_BOOTSTRAP_SERVERS` | 否 | Kafka 地址；留空不推 Kafka | `<host>:9092` |
 | `DATA_PATH` | 否 | 按日 ZIP 原始数据根目录 | `./data` |
 | `LOG_LEVEL` | 否 | 日志级别，由管理器传给子进程 | `INFO` |
-| `HTTPS_PROXY` / `HTTP_PROXY` | 否 | 代理地址，`scripts/download_data.py` 国内网络需要 | `http://<host>:<port>` |
+| `HTTPS_PROXY` / `HTTP_PROXY` | 否 | 代理地址，国内网络访问 Binance 公共源时需要；注意 websockets 对 `ws://` 回环地址会显式绕过代理 | `http://<host>:<port>` |
+| `BINANCE_API_KEY` / `BINANCE_API_SECRET` | 直连下单时必填 | 只放 `.env`，配置文件不出现（详见 direct_trading 配置） | — |
+
+（历史上的 `KLINES_WS_URL` / `KLINES_HTTP_URL` / `FACTORY_ENDPOINT` /
+`POSITION_PROXY_URL` / `SIGNAL_HUB_ENDPOINT` 已随单体化移除：
+K 线直连 Binance 公共源，下单走交易所直连，无外部服务。）
 
 ---
 
@@ -624,7 +636,7 @@ strategies:
     trading_mode: "paper_trading"
     symbols: [BTCUSDT, ETHUSDT]
 
-  obv_atr_v2:                      # 另一个策略，完全不同的币
+  obv_atr_v2:                      # 示例占位：实际使用时替换为已实现的策略目录名
     trading_mode: "paper_trading"
     symbols: [SOLUSDT, XRPUSDT, DOGEUSDT]
 ```
@@ -650,13 +662,13 @@ strategies:
 ./scripts/run_backtest_batch.sh --strategies sar_snt3_v3 --symbols BTCUSDT,ETHUSDT \
     --start 20260610 --end 20260708
 
-# 2 策略 × 3 币 = 6 个任务
+# 2 策略 × 3 币 = 6 个任务（第二项为示例占位，替换为实际策略名）
 ./scripts/run_backtest_batch.sh --strategies sar_snt3_v3,obv_atr_v2 \
     --symbols BTCUSDT,ETHUSDT,SOLUSDT --start 20260610
 ```
 
 ⚠️ **`--strategies` 只写策略名**（`sar_snt3_v3`），Python 侧才是 `name:symbol`。
-两种模式互斥，同时指定会报错。
+两种模式互斥，同时指定会报错。任务数 > 6 时会交互式确认，CI 用 `--yes` 跳过。
 
 **参数**: `--config`（登记表）或 `--strategies` + `--symbols`（笛卡尔积），
 `--start` 必需；`--end` / `--profile` / `--log-level` / `--daemon` / `--yes` 可选。

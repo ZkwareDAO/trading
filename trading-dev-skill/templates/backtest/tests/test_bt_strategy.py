@@ -247,7 +247,7 @@ class TestBacktestBTStrategy:
                 csv_dir=tmpdir,
                 backtest_mode=True,
                 preload_1m_enabled=False,
-                klines_service_enabled=False,
+                realtime_enabled=False,
             )
             dm = DataManager(dm_config)
             dm.connect()

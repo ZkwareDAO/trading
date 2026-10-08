@@ -58,6 +58,18 @@ class KlineRepository:
     # 超出则判定重叠过深，回退全量合并。
     _TAIL_SCAN_BYTES = 1024 * 1024
 
+    # 聚合时源数据读取行数的下界与"窗口天数"上界。
+    # 下界保证即使目标 CSV 刚更新过也读到足够上下文。
+    # 上界防止目标 CSV 长期未更新（策略停跑多日）时把读取退化成全量扫描，
+    # 同时必须足够大以补齐停跑期间缺失的大周期 K 线——夹太小会在 CSV 中
+    # 留下永久空洞（末根写上了，中间补不回）。14 天覆盖绝大多数停机场景，
+    # 1m 源下约 2 万行，实测聚合 ~30ms，可接受。
+    MIN_SOURCE_LIMIT = 1000
+    MAX_SOURCE_WINDOW_DAYS = 14
+    # 目标 CSV 为空（冷启动）时的读取行数：一次性多读些把近期历史建起来，
+    # 该分支只在首次聚合走到，不影响稳态开销。
+    COLD_START_SOURCE_LIMIT = 20000
+
     def __init__(self, csv_dir: str = "./data/klines"):
         """
         初始化 K 线仓库
@@ -328,37 +340,153 @@ class KlineRepository:
             return None
 
     def _get_last_kline_time(self, symbol: str, timeframe: str) -> Optional[datetime]:
-        """获取 CSV 文件中最后一条 K 线的时间"""
+        """获取 CSV 文件中最后一条 K 线的时间
+
+        必须读文件尾部：曾用 pd.read_csv(nrows=1) 读到的是**首行**
+        （最早的 K 线），使 _get_aggregation_start_time 算出的 start_ts
+        早于全部源数据，增量聚合的时间过滤退化为空操作。
+
+        本方法每分钟每周期各调用一次，不能复用 _read_csv_tail —— 它对
+        < 10MB 的文件走全量读。这里只需最后一行的第一个字段，
+        直接按字节回扫即可，开销与文件大小无关。
+        """
         filepath = self._get_file_path(symbol, timeframe)
 
         if not filepath.exists():
             return None
 
         try:
-            df = pd.read_csv(filepath, nrows=1)
-            if df.empty:
+            last_line = self._read_last_line(filepath)
+            if not last_line:
                 return None
 
-            last_ts = pd.to_datetime(df.iloc[-1]["timestamp"], utc=True)
+            ts_field = last_line.split(",", 1)[0].strip()
+            if not ts_field or ts_field.lower() == "timestamp":
+                return None
+
+            last_ts = pd.to_datetime(ts_field, utc=True)
+            if pd.isna(last_ts):
+                return None
             return last_ts
 
         except Exception as e:
             logger.debug(f"获取 {symbol} {timeframe} 最后时间失败：{e}")
             return None
 
-    def _get_interval_hours(self, timeframe: str) -> Optional[int]:
-        """获取时间周期对应的小时数"""
-        if timeframe.endswith("h"):
-            try:
-                return int(timeframe[:-1])
-            except ValueError:
+    @staticmethod
+    def _read_last_line(filepath: Path, probe_bytes: int = 4096) -> Optional[str]:
+        """读取文件最后一行非空文本，开销与文件大小无关。
+
+        从尾部回扫 probe_bytes，逐步加倍直到确认拿到的是完整的一行：
+        seek 可能落在行中间，只有读到 >= 2 行（或已覆盖整个文件）才能保证
+        最后一行未被截断。返回 None 表示文件为空或读取失败。
+        """
+        try:
+            size = filepath.stat().st_size
+            if size == 0:
                 return None
-        elif timeframe.endswith("m"):
+
+            span = min(probe_bytes, size)
+            while True:
+                with open(filepath, "rb") as f:
+                    f.seek(size - span)
+                    lines = [ln for ln in f.read(span).split(b"\n") if ln.strip()]
+                if len(lines) >= 2 or span >= size:
+                    break
+                span = min(span * 2, size)
+
+            if not lines:
+                return None
+            return lines[-1].decode("utf-8", errors="replace")
+        except Exception:
+            return None
+
+    def _get_interval_minutes(self, timeframe: str) -> int:
+        """时间框架换算为分钟数，无法解析时返回 0。"""
+        tf = timeframe.lower().strip()
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1])
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 60
+            if tf.endswith("d"):
+                return int(tf[:-1]) * 1440
+            if tf.endswith("w"):
+                return int(tf[:-1]) * 1440 * 7
+        except ValueError:
             return 0
-        elif timeframe.endswith("d"):
-            return 24
-        elif timeframe.endswith("w"):
-            return 24 * 7
+        return 0
+
+    def _resolve_source_limit(
+        self,
+        source_tf: str,
+        start_ts: Optional[datetime],
+        period_minutes: int,
+    ) -> int:
+        """计算源数据读取行数：覆盖 start_ts，且不超出有界窗口。
+
+        _get_dataframe 按"尾部 N 行"截断，而 start_ts 是周期边界对齐的
+        时间点。两者不协商时，尾部窗口的起点会落在目标周期桶中间，
+        且策略停跑多日后重启时读不到停跑区间，
+        大周期 CSV 会留下永久空洞（末根写上了，中间补不回）。
+        这里按 start_ts 到当前时间的跨度反推行数。
+
+        上界按 MAX_SOURCE_WINDOW_DAYS 天与 3 个目标周期取大：前者把稳态开销
+        钉在毫秒级，后者保证 1d 这类大周期仍能覆盖到 start_ts。
+
+        Args:
+            source_tf: 源时间框架（决定每行代表多少分钟）
+            start_ts: 聚合起始时间，None 表示目标 CSV 为空（冷启动）
+            period_minutes: 目标周期的分钟数，用作冗余余量
+
+        Returns:
+            读取行数，落在 [MIN_SOURCE_LIMIT, 有界上限] 内
+        """
+        if start_ts is None:
+            # 冷启动：目标 CSV 为空，一次性多读些把近期历史建起来
+            return self.COLD_START_SOURCE_LIMIT
+
+        source_minutes = self._get_interval_minutes(source_tf) or 1
+
+        # 有界窗口上限：max(N 天, 3 个目标周期)，换算成源数据行数
+        window_minutes = max(
+            self.MAX_SOURCE_WINDOW_DAYS * 24 * 60, period_minutes * 3
+        )
+        max_limit = int(window_minutes / source_minutes) + 1
+
+        start = pd.Timestamp(start_ts)
+        if start.tzinfo is None:
+            start = start.tz_localize("UTC")
+        # 时钟漂移可能让 start_ts 落在未来，钳到 0 避免负数行数
+        span_minutes = max(
+            0.0, (pd.Timestamp.now(tz="UTC") - start).total_seconds() / 60
+        )
+
+        # 跨度换算成源数据行数，再加一个目标周期的冗余，
+        # 抵消源数据缺口与尾部读取的行对齐误差。
+        limit = int((span_minutes + period_minutes) / source_minutes) + 1
+
+        return max(self.MIN_SOURCE_LIMIT, min(limit, max_limit))
+
+    def _get_interval_hours(self, timeframe: str) -> Optional[int]:
+        """获取时间周期对应的小时数，分钟级返回 0，无法解析返回 None。
+
+        d/w 必须带上倍数：曾经无条件返回 24 / 168，于是 "3d" 被当成 "1d"，
+        _get_aggregation_start_time 只往回退 1 天而非 3 天，源数据窗口不足
+        一个完整周期，首桶残缺（靠 drop_partial_head 兜掉，表现为少一根）。
+        """
+        tf = timeframe.lower().strip()
+        try:
+            if tf.endswith("h"):
+                return int(tf[:-1])
+            if tf.endswith("m"):
+                return 0
+            if tf.endswith("d"):
+                return int(tf[:-1]) * 24
+            if tf.endswith("w"):
+                return int(tf[:-1]) * 24 * 7
+        except ValueError:
+            return None
         return None
 
     def update_from_1m(
@@ -446,16 +574,15 @@ class KlineRepository:
         Returns:
             是否成功
         """
-        # 从源 CSV 读取数据：根据目标周期动态计算需要多少源数据行
-        interval_hours = self._get_interval_hours(target_tf)
-        if interval_hours is not None and interval_hours > 0:
-            # 需要约 2 个目标周期的源数据，4x 安全边际
-            source_minutes_per_period = interval_hours * 60
-            limit = max(1000, source_minutes_per_period * 4)
-        elif interval_hours == 0:
-            limit = 500  # 分钟级目标周期
-        else:
-            limit = 5000  # fallback
+        # 先确定聚合起始时间，再据此决定要读多少源数据。
+        # 顺序不能反：start_ts 决定"该从哪聚合"，limit 决定"实际读到哪"，
+        # 若 limit 用写死的公式，其起点可能晚于 start_ts，落在目标周期桶
+        # 中间；且策略停跑多日后重启时读不到停跑区间，
+        # 大周期 CSV 会留下永久空洞。
+        start_ts = self._get_aggregation_start_time(symbol, target_tf)
+
+        period_minutes = self._get_interval_minutes(target_tf) or 24 * 60
+        limit = self._resolve_source_limit(source_tf, start_ts, period_minutes)
 
         df_source = self._get_dataframe(symbol, source_tf, limit=limit)
 
@@ -463,10 +590,7 @@ class KlineRepository:
             logger.debug(f"{symbol}: 没有 {source_tf} 数据，无法聚合 {target_tf}")
             return False
 
-        # 确定需要聚合的起始时间
-        start_ts = self._get_aggregation_start_time(symbol, target_tf)
-
-        # 过滤需要聚合的数据
+        # 过滤需要聚合的数据（start_ts 已在读取前算出）
         if start_ts:
             df_to_aggregate = df_source[df_source["timestamp"] >= start_ts]
         else:
@@ -480,8 +604,12 @@ class KlineRepository:
         logger.debug(
             f"{symbol}: 从 {len(df_to_aggregate)} 条 {source_tf} K 线聚合 {target_tf}..."
         )
+        # start_ts 已 floor 到周期边界，但 df_source 是 limit 尾部切片：
+        # start_ts 为 None 或早于切片起点时，首桶仍会残缺。下游按时间戳
+        # 覆盖写 CSV，残缺桶会顶掉已有的完整桶，故统一丢弃。
         df_aggregated = resample_ohlcv(
-            df_to_aggregate, target_tf, datetime_column="timestamp"
+            df_to_aggregate, target_tf, datetime_column="timestamp",
+            drop_partial_head=True,
         )
 
         if df_aggregated.empty:
@@ -580,7 +708,16 @@ class KlineRepository:
 
         interval_hours = self._get_interval_hours(target_tf)
 
-        if interval_hours and interval_hours > 0:
+        if interval_hours and interval_hours >= 24:
+            # 日线及以上：对齐到当日午夜，再往回退一个完整周期。
+            # 不能走下面的 `hour // interval_hours` 分支 —— 那个式子对
+            # interval_hours >= 24 恒等于 0，只是碰巧等价于"取午夜"，
+            # 语义上是巧合而非意图。
+            start_ts = pd.Timestamp(last_ts).normalize() - pd.Timedelta(
+                hours=interval_hours
+            )
+            return start_ts.to_pydatetime()
+        elif interval_hours and interval_hours > 0:
             # 向下对齐到周期边界
             # 将 datetime 转换为 pandas Timestamp 以使用 floor 方法
             last_ts_pd = pd.Timestamp(last_ts)
@@ -666,10 +803,32 @@ class KlineRepository:
         """追加 DataFrame 到已有 CSV 文件（不读全量，极快）。
 
         列顺序与已有 CSV header 对齐，时间戳格式与 _save_dataframe 一致。
+
+        Raises:
+            ValueError: 待写入列集与 CSV header 不一致（缺列或多列）。
+                两个方向都必须拒绝，否则各有一种静默损坏：
+
+                - 缺列：写出短行。header 仍是 N 列而数据行只有 N-1 个值，
+                  pandas 按位置解析导致后续列整体左移（quote_volume 被
+                  相邻列的值顶掉）。已落盘即不可逆。
+                - 多列：多余列被静默丢弃，文件永远停在旧 schema。这是
+                  data/klines 全部停留在 6 列的原因——实盘 API 明明写
+                  10 列也扩不回去。
+
+                抛错后 _smart_merge_save 回退到全量合并路径，那里用
+                pd.concat 取列的并集（缺失处补 NaN），既不错位也能让
+                header 自然升级到更宽的 schema。
         """
         existing_cols = pd.read_csv(filepath, nrows=0).columns.tolist()
+        missing = [c for c in existing_cols if c not in df.columns]
+        extra = [c for c in df.columns if c not in existing_cols]
+        if missing or extra:
+            raise ValueError(
+                f"追加数据列集与 CSV header 不一致 (缺少={missing}, 多余={extra})，"
+                f"拒绝追加以免列错位/丢列，回退全量合并"
+            )
         # 对齐列顺序，再格式化时间戳
-        save_df = df[[c for c in existing_cols if c in df.columns]]
+        save_df = df[existing_cols]
         save_df = self._format_timestamp_for_csv(save_df)
         filepath.parent.mkdir(parents=True, exist_ok=True)
         save_df.to_csv(filepath, mode="a", header=False, index=False)

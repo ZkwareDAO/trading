@@ -1,41 +1,21 @@
 # =============================================================================
-# 系统配置 - 实盘/回测共用（开源示例配置）
+# 系统配置 - 实盘/回测共用
 # =============================================================================
-# 此文件包含系统级配置（数据管理、信号日志、策略引擎等）
+# 此文件包含系统级配置（数据管理、信号日志、止损检测模式等）
 # 策略运行配置在 strategies/<name>/overrides/<symbol>.yaml 中（per-symbol）
 #
 # 使用方式：
 #   实盘: python run_strategies_manager.py
 #   单策略: python run_strategy.py --name <name> --symbol <SYMBOL>
 #   回测: python -m backtest.run_backtest
-#
-# 注意：外部服务地址均用 ${ENV_VAR} 占位，未设置时对应功能自动降级：
-#   - KLINES_WS_URL / KLINES_HTTP_URL 未设 → 回退 Binance 公共源
-#   - FACTORY_ENDPOINT / POSITION_PROXY_URL 未设 → 跳过 factory 注册与远程仓位
-#   - KAFKA_BOOTSTRAP_SERVERS 未设 → kafka.enabled=false 已禁用
-#   - SIGNAL_HUB_ENDPOINT 未设 → signal_hub.enabled 应置 false
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 策略引擎配置
+# 止损止盈检测模式
 # -----------------------------------------------------------------------------
-strategy_engine:
-  # factory-service RPC 端点与仓位代理。未配置（环境变量未设）时：
-  #   - 跳过 factory-service 注册/心跳/回调
-  #   - 远程仓位查询不可用，策略以本地持久化仓位为准
-  factory_endpoint: "${FACTORY_ENDPOINT}"
-  position_proxy_url: "${POSITION_PROXY_URL}"
-  strategies_dir: "./strategies"
-
-  # 回调服务配置（仅 factory_endpoint 配置时生效）
-  # factory-service 通过此端口反向通知策略启停/暂停/参数变更
-  callback_port: 8892
-  callback_host: "0.0.0.0"  # 局域网访问 0.0.0.0，仅本机 127.0.0.1
-
-  # 止损止盈检测模式
-  # true:  使用 bar_high/bar_low（闭合 K 线的最高/最低价，更准确检测 K 线内价格波动）
-  # false: 使用 current_price（K 线收盘价，简单但可能遗漏 K 线内的止损触发）
-  use_bar_high_low_for_exit: false
+# true:  使用 bar_high/bar_low（闭合 K 线的最高/最低价，更准确检测 K 线内价格波动）
+# false: 使用 current_price（K 线收盘价，简单但可能遗漏 K 线内的止损触发）
+use_bar_high_low_for_exit: false
 
 # -----------------------------------------------------------------------------
 # 数据管理器配置
@@ -46,13 +26,11 @@ data_manager:
   cache_max_size: 10000
   auto_load: true
 
-  # 实时数据源（WebSocket）。未配置时回退 Binance 公共 WS + fapi
-  klines_service_enabled: true
-  klines_service_ws_url: "${KLINES_WS_URL}"
-  klines_service_http_url: "${KLINES_HTTP_URL}"
+  # 实时数据源：单体模式直连 Binance（公共 WS 实时 + fapi 历史）
+  realtime_enabled: true
 
   # 启动时补齐历史数据的天数上限（run_strategy.py 读取）
-  sync_history_days: 30
+  sync_history_days: 365
 
 # -----------------------------------------------------------------------------
 # 信号日志配置
@@ -62,23 +40,33 @@ signal_logging:
     type: "csv"
     path: "./data/signals"
   retention_days: 90
-  enable_realtime_push: true
-  kafka:
-    enabled: false
-    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"
-    topic: "strategy_signals"
-    max_retries: 3
-    retry_backoff_ms: 1000
-    acks: "all"
-    compression: "gzip"
-    dedup_file: "./data/signals/.kafka_sent_ids"
-    dedup_max_size: 10000
 
 # -----------------------------------------------------------------------------
-# Signal Hub 配置（HTTP 推送信号到 Kafka 入口）
+# 直连交易所下单配置（单体模式唯一信号出口：存储信号后直接下单）
 # -----------------------------------------------------------------------------
-signal_hub:
+# enabled: true 时，信号写入 CSV 存储后由策略进程直接调用
+# Binance U 本位合约 API 下单。
+#
+# 凭证只放 .env，不写在本文件（连 ${VAR} 占位也不写，避免误填明文被提交）：
+#   BINANCE_API_KEY / BINANCE_API_SECRET
+# 缺凭证时策略进程启动即失败 —— 开着直连却下不了单比进程起不来危险得多。
+#
+# 前置要求：
+#   - 账户必须是单向持仓模式（One-way Mode），双向持仓会被拒绝下单
+#   - API key 只需合约交易权限，切勿开启提现权限，建议绑定 IP 白名单
+#   - per-symbol overrides 里的 signal.exchange 必须是 binance（否则该 symbol 拒单），
+#     且建议 signal.order_type: 2（市价）—— 限价挂单不成交会让本地仓位与交易所分叉
+#
+# trading_mode 与下单的关系（容易误判，务必看清）：
+#   live    → 会下真单
+#   smoking → 会下真单（冒烟模式就是用真单验证全链路）
+#   paper_trading → 不下单（唯一有防线的模式）
+# 不想下真单时必须用 paper_trading，smoking 兜不住。
+direct_trading:
   enabled: true
-  endpoint: "${SIGNAL_HUB_ENDPOINT}"
-  # API 路径（v1 包装结构 / v2 直接序列化，由 http_sender 按版本号决定 payload）
-  api_path: "/api/v1/kafka/message"
+  exchange: "binance"   # 目前仅支持 binance U 本位合约
+  testnet: true        # true → testnet.binancefuture.com
+  recv_window: 5000     # 签名请求有效窗口（毫秒）
+  timeout: 10.0         # 单次请求超时（秒）
+  max_retries: 2        # 仅对网络异常与 5xx 重试；4xx 一律不重试
+

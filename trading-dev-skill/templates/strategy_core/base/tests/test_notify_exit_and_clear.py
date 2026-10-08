@@ -186,8 +186,16 @@ class TestNotifyExitAndClear:
 
         assert state.stop_loss_date is None
 
-    def test_skips_notify_when_no_position_id(self):
-        """无 position_id 时跳过通知"""
+    def test_still_notifies_when_no_position_id(self):
+        """无 position_id 时**仍要**通知，否则持久化 JSON 残留
+
+        部分策略入场时未生成 position_id。早期实现在 position_id 为 None
+        时跳过通知，导致 _on_position_exit 里的 PositionPersistence
+        .clear_on_exit() 永不执行，JSON 文件永久残留。
+        core.py 的 `即使 position_id 为 None 也要调用` 注释即为此而写。
+
+        本测试锚定「无 ID 也通知」这一修复后的行为。
+        """
         core = MockCore()
         state = core._get_state("BTCUSDT")
         state.position = "long"
@@ -203,7 +211,11 @@ class TestNotifyExitAndClear:
             exit_time=datetime(2026, 1, 1, 12, 0, tzinfo=timezone.utc),
         )
 
-        assert core.exit_notified is False
+        assert core.exit_notified is True, (
+            "position_id 为 None 时跳过了通知 —— 持久化清理路径不会执行，JSON 将残留"
+        )
+        # 无论是否有 ID，状态都必须被清除
+        assert state.position is None
 
     def test_passes_all_params_to_notify(self):
         """传递所有参数到 _notify_position_exit"""

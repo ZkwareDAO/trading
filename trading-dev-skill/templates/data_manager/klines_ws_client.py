@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Klines WebSocket 客户端模块
+Binance 公共 WebSocket 客户端模块
 
-提供与 klines_service 的 WebSocket 连接，接收实时 K 线推送
+连接 Binance fstream combined-stream，接收实时 1m K 线推送。
+单体模式：数据层直连交易所，streams 固定在连接 URL 中，
+运行中新增 symbol 需重建连接（由 DataManager.subscribe_klines_async 负责）。
 """
 
 import asyncio
@@ -21,18 +23,17 @@ logger = logging.getLogger(__name__)
 
 class KlinesWebSocketClient:
     """
-    klines_service WebSocket 客户端
+    Binance 公共 WebSocket 客户端
 
     功能:
-    - 连接 klines_service WebSocket
-    - 订阅/取消订阅 symbol
+    - 连接 Binance fstream combined-stream
     - 接收实时 K 线推送
-    - 自动重连
+    - 自动重连（streams 在 URL 里，重连后无需重新订阅）
     """
 
     def __init__(
         self,
-        ws_url: str = "ws://127.0.0.1:17081/ws/klines",
+        ws_url: str = "wss://fstream.binance.com/stream",
         symbols: Optional[List[str]] = None,
         reconnect_delay: float = 5.0,
         max_reconnect: int = 5,
@@ -42,8 +43,8 @@ class KlinesWebSocketClient:
         初始化 WebSocket 客户端
 
         Args:
-            ws_url: WebSocket 地址
-            symbols: 初始订阅的 symbol 列表
+            ws_url: WebSocket 地址（combined-stream，含 streams 列表）
+            symbols: 订阅的 symbol 列表（仅记录用途）
             reconnect_delay: 重连延迟（秒）
             max_reconnect: 最大重试次数（0 表示无限）
             max_backoff: 重连退避上限（秒），默认 120s
@@ -107,7 +108,7 @@ class KlinesWebSocketClient:
             return False
 
     async def connect(self) -> bool:
-        """连接到 WebSocket 服务"""
+        """连接到 Binance WebSocket"""
         try:
             connect_kwargs = dict(
                 ping_interval=30,
@@ -115,8 +116,8 @@ class KlinesWebSocketClient:
                 close_timeout=10,
                 open_timeout=30,
             )
-            # Binance 公共 WS（wss://）走 HTTP 代理
             if self.ws_url.startswith("wss://"):
+                # Binance 公共 WS（wss://）走 HTTP 代理（如 .env 配置了）
                 proxy = (
                     os.environ.get("HTTPS_PROXY")
                     or os.environ.get("https_proxy")
@@ -126,6 +127,12 @@ class KlinesWebSocketClient:
                 if proxy:
                     connect_kwargs["proxy"] = proxy
                     logger.info(f"WebSocket 通过代理连接：{proxy}")
+            else:
+                # 非 wss（如 ws://127.0.0.1 测试地址）必须显式禁用代理。
+                # websockets>=13 默认 proxy=True 会自动读环境变量 —— klines_loader
+                # 的 load_dotenv() 把代理注入环境后，回环连接也会被劫持到代理，
+                # 得到 InvalidMessage/超时而非预期的 ConnectionRefused。
+                connect_kwargs["proxy"] = None
             self._ws = await websockets.connect(self.ws_url, **connect_kwargs)
             self._connected = True
             self._running = True
@@ -163,59 +170,10 @@ class KlinesWebSocketClient:
 
         logger.info("WebSocket 已断开")
 
-    async def subscribe(self, symbols: List[str]) -> bool:
-        """订阅 symbol（自动去重）"""
-        if not self._connected or self._ws is None:
-            logger.warning("WebSocket 未连接，无法订阅")
-            raise RuntimeError("Not connected")
-
-        try:
-            message = {
-                "action": "subscribe",
-                "symbols": symbols
-            }
-            await self._ws.send(json.dumps(message))
-
-            # 去重添加：只添加尚未订阅的 symbol
-            for symbol in symbols:
-                if symbol not in self.symbols:
-                    self.symbols.append(symbol)
-
-            logger.info(f"已订阅：{symbols}")
-            return True
-
-        except Exception as e:
-            logger.error(f"订阅失败：{e}")
-            return False
-
-    async def unsubscribe(self, symbols: List[str]) -> bool:
-        """取消订阅 symbol"""
-        if not self._connected or self._ws is None:
-            logger.warning("WebSocket 未连接，无法取消订阅")
-            return False
-
-        try:
-            message = {
-                "action": "unsubscribe",
-                "symbols": symbols
-            }
-            await self._ws.send(json.dumps(message))
-
-            for symbol in symbols:
-                if symbol in self.symbols:
-                    self.symbols.remove(symbol)
-
-            logger.info(f"已取消订阅：{symbols}")
-            return True
-
-        except Exception as e:
-            logger.error(f"取消订阅失败：{e}")
-            return False
-
     async def _receive_loop(self):
         """接收消息循环"""
         assert self._ws is not None
-        logger.debug(f"[WS-RECV] receive_loop 启动，等待消息 (binance_mode={getattr(self, '_binance_mode', False)})")
+        logger.debug("[WS-RECV] receive_loop 启动，等待消息")
         try:
             async for message in self._ws:
                 try:
@@ -233,26 +191,14 @@ class KlinesWebSocketClient:
             await self._handle_disconnect()
 
     async def _message_handler(self, data: Dict[str, Any]):
-        """消息处理器"""
+        """消息处理器：Binance combined-stream {"stream":"...","data":{"e":"kline","k":{...}}}"""
         # 首帧到达，唤醒可能正在 probe 的协程
         if self._first_frame_event is not None and not self._first_frame_event.is_set():
             self._first_frame_event.set()
 
-        # Binance combined-stream 回退协议：{"stream":"...","data":{"e":"kline","k":{...}}}
-        if getattr(self, "_binance_mode", False):
-            kline = self._parse_binance_kline(data)
-            if kline is not None and self._on_kline_callback:
-                await self._call_callback(self._on_kline_callback, kline)
-            return
-
-        msg_type = data.get('type', '')
-
-        if msg_type == 'kline':
-            kline = self._parse_kline_data(data)
-            if self._on_kline_callback:
-                await self._call_callback(self._on_kline_callback, kline)
-        else:
-            logger.debug(f"收到未知消息类型：{msg_type}")
+        kline = self._parse_binance_kline(data)
+        if kline is not None and self._on_kline_callback:
+            await self._call_callback(self._on_kline_callback, kline)
 
     def _parse_binance_kline(self, data: Dict[str, Any]) -> Optional[Kline]:
         """解析 Binance combined-stream kline 消息"""
@@ -285,16 +231,6 @@ class KlinesWebSocketClient:
             logger.warning(f"Binance kline 解析失败: {e}")
             return None
 
-    def _parse_kline_data(self, data: Dict[str, Any]) -> Kline:
-        """解析 K 线数据"""
-        kline_data = data.get('data', {})
-
-        # 从外层或内层获取 symbol
-        if 'symbol' not in kline_data:
-            kline_data['symbol'] = data.get('symbol', '')
-
-        return Kline.from_dict(kline_data)
-
     async def _call_callback(self, callback: Callable, *args):
         """调用回调（支持同步和异步）"""
         try:
@@ -320,7 +256,11 @@ class KlinesWebSocketClient:
         await self._reconnect()
 
     async def _reconnect(self):
-        """重连逻辑：无限重连（max_reconnect=0）或有限次数，退避有上限"""
+        """重连逻辑：无限重连（max_reconnect=0）或有限次数，退避有上限。
+
+        Binance combined-stream 的 streams 固定在 URL 里，
+        重连（复用同一 URL）后无需重新订阅。
+        """
         if not self._running:
             return
 
@@ -350,9 +290,6 @@ class KlinesWebSocketClient:
                 await asyncio.sleep(wait_time)
 
                 if await self.connect():
-                    # 重连成功后重新订阅（Binance 回退模式 streams 在 URL 里，无需 subscribe）
-                    if self.symbols and not getattr(self, "_binance_mode", False):
-                        await self.subscribe(self.symbols)
                     # 通知重连回调
                     if self._on_reconnect_callback:
                         await self._call_callback(self._on_reconnect_callback)

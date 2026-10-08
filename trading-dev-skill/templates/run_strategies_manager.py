@@ -1,18 +1,12 @@
 #!/usr/bin/env python3
 """
-Strategies Runtime — 策略运行时（由 cta_factory_service 管理）
+Strategies Runtime — 策略进程监督者
 
 职责：
-- 发现 enabled 策略并注册到 factory
-- 查询 factory 上次状态并恢复 running 的策略
-- 接收 factory 回调（start/stop/pause/resume）
-- 心跳上报策略状态
-- 进程退出时通知 factory（不再自动重启）
-
-不再负责：
-- 自主启动策略（由 factory 控制）
-- 进程崩溃自动重启（由 factory 控制）
-- 策略内部逻辑（K 线分发、信号生成）
+- 解析 enabled 策略清单（config/strategies.yaml 或 CLI --run）
+- 拉起每个策略的独立子进程（run_strategy.py）
+- 监控子进程退出（只告警，不自动重启）
+- 收到 SIGTERM/SIGINT 时优雅停止所有子进程（SIGTERM→SIGKILL）
 
 配置文件分离：
 - config/settings.yaml - 系统配置（data_manager, signal_logging 等）
@@ -20,52 +14,30 @@ Strategies Runtime — 策略运行时（由 cta_factory_service 管理）
 
 使用方式:
     python run_strategies_manager.py
-    python run_strategies_manager.py --config config/settings.yaml --strategies config/strategies.yaml
+    python run_strategies_manager.py --run sar_snt3_v3:BTCUSDT,obv_atr_v2:ETHUSDT
 """
 
 import argparse
 import asyncio
 import logging
 import os
-import re
 import signal as signal_lib
 import sys
 import yaml
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 
-from strategy_core.factory_client import FactoryClient
 from strategy_core.utils.strategy_naming import build_strategy_id_from_overrides
 from strategy_core.utils.log_handlers import DailyDirectoryFileHandler
 from strategy_core.utils.strategies_loader import StrategiesLoader
+from strategy_core.utils.env_placeholders import (
+    resolve_env_placeholders as _resolve_env_placeholders,
+)
 
 logger = logging.getLogger(__name__)
 
 # 策略进程启动命令
 STRATEGY_PROCESS_CMD = [sys.executable, str(Path(__file__).parent / "run_strategy.py")]
-
-# ${VAR} 占位符正则
-_ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
-
-
-def _resolve_env_placeholders(obj: Any) -> Any:
-    """递归解析配置中的 ${VAR} 占位符为环境变量值
-
-    环境变量未设置时替换为 None（而非保留字面量 ${VAR}），
-    让下游判断 None 走回退逻辑。
-    """
-    if isinstance(obj, dict):
-        return {k: _resolve_env_placeholders(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_resolve_env_placeholders(v) for v in obj]
-    if isinstance(obj, str):
-        m = _ENV_PATTERN.fullmatch(obj.strip())
-        if m:
-            return os.environ.get(m.group(1))
-        return _ENV_PATTERN.sub(
-            lambda mm: (os.environ.get(mm.group(1)) or ""), obj
-        )
-    return obj
 
 
 def load_yaml_config(config_path: str) -> Dict[str, Any]:
@@ -77,31 +49,6 @@ def load_yaml_config(config_path: str) -> Dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
     return _resolve_env_placeholders(raw)
-
-
-def load_engine_config(system_config_path: str = "config/settings.yaml") -> Dict[str, Any]:
-    """加载系统配置，返回 strategy_engine 段
-
-    manager 只需要 strategy_engine 段（factory_endpoint / position_proxy_url 等），
-    策略运行清单由 StrategiesLoader 从 strategies.yaml 独立读取，无需合并。
-    """
-    system_config = load_yaml_config(system_config_path)
-    return system_config.get("strategy_engine", {}) or {}
-
-
-def merge_configs(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
-    """合并两个配置字典（override 覆盖 base）
-
-    仅供 load_merged_config（向后兼容）使用。
-    """
-    result = dict(base)
-    for key, value in override.items():
-        if key in result and isinstance(result[key], dict) and isinstance(value, dict):
-            # 递归合并字典
-            result[key] = merge_configs(result[key], value)
-        else:
-            result[key] = value
-    return result
 
 
 def parse_explicit_strategies(raw: Optional[str]) -> List[tuple]:
@@ -138,19 +85,6 @@ def parse_explicit_strategies(raw: Optional[str]) -> List[tuple]:
             raise ValueError(f"运行清单格式错误: '{item}'，name 和 symbol 不能为空")
         pairs.append((name, symbol))
     return pairs
-
-
-def load_merged_config(
-    system_config_path: str = "config/settings.yaml",
-    strategies_config_path: str = "config/strategies.yaml",
-) -> Dict[str, Any]:
-    """已废弃：manager 现用 load_engine_config 只读 strategy_engine 段
-
-    保留仅为向后兼容（外部可能 import），内部不再调用。
-    """
-    system_config = load_yaml_config(system_config_path)
-    strategies_config = load_yaml_config(strategies_config_path)
-    return merge_configs(system_config, strategies_config)
 
 
 def parse_strategies_from_loader(loader: StrategiesLoader) -> List[Dict[str, Any]]:
@@ -383,44 +317,25 @@ async def _forward_stream(stream, prefix: str):
 
 class StrategyRuntime:
     """
-    策略运行时（由 cta_factory_service 管理）
+    策略进程监督者
 
     流程：
-    1. 发现 enabled 策略
-    2. 注册到 factory
-    3. 查询 factory 上次状态
-    4. 恢复 running 的策略
-    5. 启动回调 server
-    6. 心跳上报
-    7. 进程监控（退出时通知 factory，不自动重启）
-
-    配置分离：
-    - system_config_path: 系统配置（settings.yaml）
-    - strategies_config_path: 策略配置（strategies.yaml）
+    1. 解析 enabled 策略清单
+    2. 拉起每个策略的独立子进程
+    3. 监控子进程退出（只告警，不自动重启）
+    4. 收到停止信号时优雅停止所有子进程
     """
 
     def __init__(
         self,
         system_config_path: str = "config/settings.yaml",
         strategies_config_path: str = "config/strategies.yaml",
-        strategies_dir: str = "./strategies",
-        factory_endpoint: Optional[str] = None,
-        callback_port: int = 8892,
-        callback_host: str = "0.0.0.0",
         log_level: str = "INFO",
-        engine: Optional[Any] = None,
         explicit_strategies: Optional[str] = None,
     ):
         self.system_config_path = system_config_path
         self.strategies_config_path = strategies_config_path
-        self.strategies_dir = strategies_dir
         self.log_level = log_level
-        self.callback_port = callback_port
-        self.callback_host = callback_host
-
-        # 只读 strategy_engine 段（factory_endpoint / position_proxy_url 等）
-        # 策略运行清单由 StrategiesLoader 独立读取，不与 settings.yaml 合并
-        engine_config = load_engine_config(system_config_path)
 
         # 解析策略配置（使用 StrategiesLoader）
         loader = StrategiesLoader(strategies_config_path).load()
@@ -439,144 +354,13 @@ class StrategyRuntime:
             key = cfg["strategy_id"]
             self.enabled_strategies[key] = cfg
 
-        # Factory client
-        callback_url = f"http://{callback_host}:{callback_port}"
-
-        # engine_config 已在 __init__ 顶部加载（strategy_engine 段）
-        # 地址来自 settings.yaml 的 ${ENV_VAR} 占位；缺失时管理器仍可运行，仅对应功能不可用
-        resolved_factory_endpoint = factory_endpoint or engine_config.get("factory_endpoint")
-        if not resolved_factory_endpoint:
-            logger.warning("未配置 strategy_engine.factory_endpoint，跳过 factory-service 连接")
-        position_proxy_url = engine_config.get("position_proxy_url")
-        if not position_proxy_url:
-            logger.warning("未配置 strategy_engine.position_proxy_url，远程仓位查询不可用")
-        position_api_path = engine_config.get("position_api_path", "/api/position/user-order-positions")
-
-        self.factory_client = FactoryClient(
-            factory_endpoint=resolved_factory_endpoint,
-            callback_url=callback_url,
-            engine=engine,
-            global_config_path=system_config_path,
-            log_level=log_level,
-            position_proxy_url=position_proxy_url,
-            position_api_path=position_api_path,
-        )
-
         # 进程管理
         self.processes: Dict[str, asyncio.subprocess.Process] = {}
         self._running = False
         self._shutdown_event = asyncio.Event()
 
-        # 心跳间隔（秒）
-        self.heartbeat_interval = 30
-
-    def _register_all_to_factory(self) -> Dict[str, bool]:
-        """注册所有 enabled 策略到 factory"""
-        results = {}
-        for cfg in self.strategy_configs:
-            strategy_id = cfg["strategy_id"]
-
-            result = self.factory_client.register({
-                "strategy_id": strategy_id,
-                "strategy_name": cfg["strategy_name"],
-                "name": cfg["name"],
-                "user_id": cfg.get("user_id", "0"),
-                "interval": cfg.get("interval", "4h"),
-                "version": cfg.get("version", "v2"),
-                "symbol": cfg["symbol"],
-                "trading_mode": cfg.get("trading_mode", "live"),
-                "script": str(Path(__file__).parent / "run_strategy.py"),
-                "config_path": cfg.get("config_path"),
-            })
-
-            results[strategy_id] = result.get("status") in ("success", "skipped")
-            if results[strategy_id]:
-                if result.get("status") == "skipped":
-                    logger.info(f"策略 {strategy_id} 跳过 factory 注册（endpoint 未配置，本地模式）")
-                else:
-                    logger.info(f"策略 {strategy_id} 注册成功")
-            else:
-                logger.warning(f"策略 {strategy_id} 注册失败: {result}")
-        return results
-
-    def _restore_running_strategies(self) -> Dict[str, bool]:
-        """恢复 factory 中标记为 running 的策略，或首次启动"""
-        results = {}
-        for cfg in self.strategy_configs:
-            strategy_id = cfg["strategy_id"]
-            status = self.factory_client.query_status(strategy_id)
-            logger.info(f"查询策略 {strategy_id} 状态: {status}")
-
-            if status.get("running", False):
-                # 恢复运行中的策略
-                if self.factory_client.engine:
-                    success = self.factory_client.engine.start_strategy(strategy_id)
-                    results[strategy_id] = success
-                    logger.info(f"恢复策略 {strategy_id}: {success}")
-                else:
-                    # 多进程模式：直接调用启动回调
-                    result = self.factory_client._on_strategy_start(strategy_id)
-                    results[strategy_id] = result.get("status") == "success"
-                    logger.info(f"恢复策略 {strategy_id} (子进程): {result}")
-            elif status.get("registered", False) and not status.get("running", False):
-                # 已注册但未运行，请求启动
-                logger.info(f"策略 {strategy_id} 已注册未运行，请求启动")
-                start_result = self.factory_client.request_start(strategy_id)
-                logger.info(f"策略 {strategy_id} 启动请求结果: {start_result}")
-
-                # factory 返回 internal 模式时，需要本地启动子进程
-                if start_result.get("status") == "success" and start_result.get("mode") == "internal":
-                    logger.info(f"策略 {strategy_id} factory 使用 internal 模式，本地启动子进程")
-                    if self.factory_client.engine:
-                        success = self.factory_client.engine.start_strategy(strategy_id)
-                        results[strategy_id] = success
-                    else:
-                        result = self.factory_client._on_strategy_start(strategy_id)
-                        results[strategy_id] = result.get("status") == "success"
-                        logger.info(f"策略 {strategy_id} 子进程启动: {result}")
-                elif start_result.get("status") == "success":
-                    # factory 会通过回调触发启动
-                    results[strategy_id] = True
-                else:
-                    # factory 启动失败，本地启动
-                    logger.warning(f"策略 {strategy_id} factory 启动失败，本地启动")
-                    if self.factory_client.engine:
-                        success = self.factory_client.engine.start_strategy(strategy_id)
-                        results[strategy_id] = success
-                    else:
-                        result = self.factory_client._on_strategy_start(strategy_id)
-                        results[strategy_id] = result.get("status") == "success"
-        return results
-
-    def _start_callback_server(self) -> None:
-        """启动回调服务器（接收 factory 控制指令）"""
-        self.factory_client.start_callback_server(host=self.callback_host, port=self.callback_port)
-        logger.info(f"回调服务器已启动，监听 {self.callback_host}:{self.callback_port}")
-
-    async def _heartbeat_loop(self) -> None:
-        """心跳上报循环"""
-        while self._running:
-            try:
-                running_strategies = self.factory_client.get_running_strategies()
-
-                for cfg in self.strategy_configs:
-                    strategy_id = cfg["strategy_id"]
-                    status = "running" if strategy_id in running_strategies else "stopped"
-                    self.factory_client.report_status(strategy_id, status)
-
-                logger.debug(f"心跳上报完成，共 {len(self.strategy_configs)} 个策略，运行中: {len(running_strategies)}")
-            except Exception as e:
-                logger.warning(f"心跳上报失败: {e}")
-
-            await asyncio.sleep(self.heartbeat_interval)
-
-    def _handle_strategy_exit(self, strategy_id: str, exit_code: int) -> None:
-        """处理策略进程退出（通知 factory，不自动重启）"""
-        logger.warning(f"策略进程 {strategy_id} 退出 (code={exit_code})")
-        self.factory_client.report_status(strategy_id, "stopped")
-
-    async def start_all_processes(self) -> None:
-        """启动所有策略进程（降级流程）"""
+    async def start(self) -> None:
+        """启动所有策略子进程"""
         self._running = True
         logger.info(f"策略运行时启动，共 {len(self.strategy_configs)} 个策略")
 
@@ -590,46 +374,11 @@ class StrategyRuntime:
             except Exception as e:
                 logger.error(f"启动策略 {strategy_id} 失败: {e}")
 
-    async def initialize_with_factory(self) -> bool:
-        """
-        新流程：初始化（注册 + 恢复状态 + 回调 server）
-
-        factory 未配置时降级为本地自主管理：注册返回 skipped，
-        跳过回调 server 与状态恢复，直接启动所有策略子进程。
-
-        Returns:
-            是否成功初始化
-        """
-        self._running = True
-
-        # factory 未配置：跳过 RPC 流程，直接本地启动
-        if not self.factory_client.factory_enabled:
-            logger.info("factory_endpoint 未配置，跳过 factory 注册/回调，直接本地启动策略进程")
-            await self.start_all_processes()
-            return True
-
-        # 1. 注册所有策略到 factory
-        reg_results = self._register_all_to_factory()
-        if not any(reg_results.values()):
-            logger.warning("所有策略注册失败，降级为本地自主管理")
-            # 降级：启动所有策略进程
-            await self.start_all_processes()
-            return True
-
-        # 2. 先启动回调 server（factory 需要能回调通知策略启动）
-        self._start_callback_server()
-
-        # 3. 再恢复/请求启动策略
-        self._restore_running_strategies()
-
-        logger.info("策略运行时初始化完成")
-        return True
-
     async def monitor_loop(self) -> None:
         """
-        监控循环（不再自动重启）
+        监控循环（不自动重启）
 
-        检测进程退出，通知 factory。
+        检测进程退出，记录告警日志。
         """
         logger.info("监控循环已启动")
 
@@ -638,7 +387,7 @@ class StrategyRuntime:
                 # asyncio.subprocess.Process 无 poll()，直接检查 returncode
                 if proc.returncode is not None:
                     returncode = proc.returncode
-                    self._handle_strategy_exit(strategy_id, returncode)
+                    logger.warning(f"策略进程 {strategy_id} 退出 (code={returncode})")
                     del self.processes[strategy_id]
 
             await asyncio.sleep(2)
@@ -683,18 +432,6 @@ class StrategyRuntime:
         logger.info("策略运行时停止中...")
         self._running = False
 
-        # 通知 factory 所有策略已停止
-        for cfg in self.strategy_configs:
-            strategy_id = cfg["strategy_id"]
-            result = self.factory_client.request_stop(strategy_id)
-            logger.info(f"通知 factory 策略 {strategy_id} 停止: {result}")
-
-        # 停止回调 server
-        self.factory_client.stop_callback_server()
-
-        # 停止所有子进程（通过 FactoryClient）
-        self.factory_client.stop_all_subprocesses()
-
         # 停止本地管理的子进程：每个进程独立 SIGTERM→SIGKILL，并发回收避免单个卡死阻塞全部
         if self.processes:
             await asyncio.gather(
@@ -706,15 +443,8 @@ class StrategyRuntime:
         logger.info("策略运行时已停止")
 
     async def run_forever(self) -> None:
-        """运行直到收到停止信号
-
-        factory 未配置时跳过心跳循环（report_status 直接 skip，
-        get_running_strategies 遍历空 dict，本地模式下纯空转）。
-        """
-        tasks = [self.monitor_loop(), self._shutdown_event.wait()]
-        if self.factory_client.factory_enabled:
-            tasks.append(self._heartbeat_loop())
-        await asyncio.gather(*tasks)
+        """运行直到收到停止信号"""
+        await asyncio.gather(self.monitor_loop(), self._shutdown_event.wait())
 
 
 async def main():
@@ -729,27 +459,6 @@ async def main():
         "--strategies",
         default="config/strategies.yaml",
         help="策略配置文件路径（默认 config/strategies.yaml）",
-    )
-    parser.add_argument(
-        "--strategies-dir",
-        default="./strategies",
-        help="策略目录路径",
-    )
-    parser.add_argument(
-        "--factory-endpoint",
-        default=None,
-        help="factory-service RPC 端点（默认读 settings.yaml 的 ${FACTORY_ENDPOINT}）",
-    )
-    parser.add_argument(
-        "--callback-port",
-        default=8892,
-        type=int,
-        help="回调服务器端口",
-    )
-    parser.add_argument(
-        "--callback-host",
-        default="0.0.0.0",
-        help="回调服务器绑定地址",
     )
     parser.add_argument(
         "--log-level",
@@ -793,10 +502,6 @@ async def main():
     runtime = StrategyRuntime(
         system_config_path=args.config,
         strategies_config_path=args.strategies,
-        strategies_dir=args.strategies_dir,
-        factory_endpoint=args.factory_endpoint,
-        callback_port=args.callback_port,
-        callback_host=args.callback_host,
         log_level=args.log_level,
         explicit_strategies=args.run,
     )
@@ -813,9 +518,8 @@ async def main():
             lambda: asyncio.create_task(runtime.stop_all()),
         )
 
-    ok = await runtime.initialize_with_factory()
-    if ok:
-        await runtime.run_forever()
+    await runtime.start()
+    await runtime.run_forever()
 
 
 if __name__ == "__main__":

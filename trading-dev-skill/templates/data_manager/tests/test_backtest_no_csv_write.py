@@ -23,7 +23,7 @@ def _make_dm(tmpdir: str, backtest_mode: bool) -> DataManager:
         csv_dir=tmpdir,
         backtest_mode=backtest_mode,
         preload_1m_enabled=False,
-        klines_service_enabled=False,
+        realtime_enabled=False,
     )
     dm = DataManager(dm_config)
     dm.connect()

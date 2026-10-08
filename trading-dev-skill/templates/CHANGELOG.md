@@ -9,6 +9,14 @@
 ## [Unreleased]
 
 ### 已添加
+- signal_logging: 新增 `direct_trading` 配置与 `BinanceTrader` —— 直连 Binance U 本位合约下单
+  - 启用后信号不再经 HTTP 推送，由策略进程直接下单；与 `signal_hub` 互斥
+    （同时开启时自动禁用 HTTP，避免重复开仓）
+  - 凭证只从 `.env` 读（`BINANCE_API_KEY` / `BINANCE_API_SECRET`），缺失时进程启动即失败
+  - 数量按 `signal_cash × leverage / price` 折算，精度取 `exchangeInfo` 的 stepSize 并**向下**取整
+  - 平仓一律 MARKET + reduceOnly 且数量取交易所实际持仓；反手先平后开，平仓失败则放弃开仓
+  - `newClientOrderId = signal_id` 作幂等键；仅 `paper_trading` 不下单
+    （`live` 与 `smoking` 都会真实成交）
 - backtest: 回测时自动保存大周期 CSV（15m/4h/1d），解决大周期数据不同步问题
   - 新增 `_save_big_interval_csvs()` 函数
   - 回测完成后自动更新 `{data_dir}/{interval}/{symbol}_{interval}.csv`
@@ -18,7 +26,39 @@
   - 止盈目标计算现在基于 `SwingPoint.price` 属性
 - ICT: 新增 7 个测试覆盖止盈目标计算逻辑（`test_tp_target.py`）
 
+### 已移除
+- signal_logging: **移除 Kafka 直推通道**（`kafka_producer.py`、`retry_queue.py`）
+  - 删除 `KafkaSignalProducer`（含熔断器、去重 TTL、指数退避）与 `_SignalJSONEncoder`
+  - 删除 `retry_queue.py`（失败信号持久化队列）—— 生产代码零调用，属死代码
+  - `SignalLogger` 移除 `kafka_producer` / `kafka_topic` 参数；`kafka_topic` 更名为 `topic`
+  - 配置删除 `signal_logging.kafka` 整段、`.env.example` 删 `KAFKA_BOOTSTRAP_SERVERS`、
+    `requirements.txt` 删 `kafka-python-ng`
+  - **保留** HTTP v1 payload 的 `topic` 字段（Signal Hub 的路由参数，与 Kafka 客户端无关），
+    值改为 `logger.DEFAULT_SIGNAL_TOPIC = "strategy_signals"`，不再暴露为配置项
+  - 删除 63 个测试用例，全部是已删除代码的测试（29+9+12 个整文件 + 13 个类级）。
+    其中测 `CtaSignalCSV` 的用例已改写保留 —— `from_signal` 的 metadata 清理现在是
+    HTTP 通道的**唯一**防线（不再有 encoder 兜第二层），
+    见 `test_signal_metadata_serialization.py`（原 `test_kafka_metadata_serialization.py`）
+  - ⚠️ 副作用：HTTP 推送失败后不再有降级兜底。当前 `log_signal` 在无通道/推送失败时
+    仍返回 `True`（信号被丢弃却报告成功），该缺陷影响面因此变大，待后续修复
+
 ### 已修复
+- backtest: 回测缺数据时的「自动下载」根本不联网 — 改走 `scripts/download_data.py`
+  - 原走 `data_manager.load_klines_data`，它只扫本地按日 ZIP 解包目录
+    （`$DATA_PATH/binance/futures/um/daily/...`），干净环境永远返回空 DataFrame
+  - 新增 `download_data.download_range()`（区间由调用方给定，复用归档分块 + merge 链路），
+    `preload_klines_to_cache` 只走这一条下载路径，删除 `load_klines_data`/`save_to_csv` 引用
+  - 只补「需要且缺失」的子区间（头部 warm-up 缺口 / 尾部缺口），
+    报障 case 从「CSV 末根到今天 47 天」收窄为实际需要的 12 天
+- backtest: 数据不覆盖回测区间时改为 **exit 1**，不再静默产出零成交报告
+  - 原实现下载失败只打 WARNING 继续跑，CSV 只到 07-08 而回测窗口自 08-20 起时，
+    产出「处理 K 线数：0」的报告且退出码 0 —— 看起来像"策略没触发信号"
+  - 错误信息含需要/实有区间、缺口天数与手动补数命令
+  - warm-up 不足同样硬失败（指标数据不足只 warn 不阻断，属静默失真）
+  - 中部空洞不阻断（交易所停机属常态），端点覆盖才是可执行信号
+- backtest: `sync_end` 夹到当前时刻，不再向交易所索要未来 K 线
+  - `--end` 取当天时会算出今天 23:59:59（比"现在"晚十几小时），
+    使尾部缺口判据恒真，每次回测都白跑一次注定拿不到数据的下载
 - data_manager: KlineRepository CSV 写入性能优化 — 每次 WS K 线到达时不再全量读写 CSV
   - 新增 `_try_fast_append()` / `_read_csv_tail()` / `_append_to_csv()` 智能保存方法
   - 无时间戳重叠时直接追加（~1ms），仅重叠时回退全量合并（~2s）

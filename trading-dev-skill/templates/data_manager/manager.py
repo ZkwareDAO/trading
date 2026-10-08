@@ -16,10 +16,18 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
+import numpy as np
 import pandas as pd
 import aiohttp
+
+# 大缺口补齐复用运维脚本的下载链路（monthly/daily 归档 zip + fapi 分页）。
+# scripts/download_data.py 只依赖 stdlib/pandas/requests/dotenv，无循环导入；
+# backtest/run_backtest.py 已有同款 import 先例。
+# 注意：_fetch_gap_range 不用 fetch_klines —— 测试统一 mock
+# _fetch_from_binance_public，绕开它会打到真实网络。
+from scripts.download_data import download_range, fetch_range_rows, _get_proxies
 
 from data_manager.kline_repository import KlineRepository
 
@@ -53,15 +61,11 @@ class DataManagerConfig:
     cache_1m_max_rows: int = 500000
     cache_1m_max_age_days: int = 90
 
-    # klines_service 集成配置
-    # 未配置时回退到 Binance 公共 API（wss://fstream.binance.com 实时 + fapi.binance.com 历史）
-    klines_service_enabled: bool = True
-    klines_service_ws_url: Optional[str] = None
-    klines_service_http_url: Optional[str] = None
-    klines_service_history_days: int = 7
+    # 实时行情：直连 Binance 公共 WS（wss://fstream.binance.com）+ REST 轮询回退
+    realtime_enabled: bool = True
 
     # 启动时自动同步配置
-    sync_history_days: int = 30  # 启动时补齐历史天数
+    sync_history_days: int = 365  # 启动时补齐历史天数
     auto_sync_on_connect: bool = True  # 是否启动时自动同步
 
     # 定时持久化配置
@@ -69,38 +73,6 @@ class DataManagerConfig:
 
     # 回测模式：禁用增量返回，每次调用返回完整数据
     backtest_mode: bool = False
-
-    def __post_init__(self):
-        """初始化后处理"""
-        pass
-
-    @classmethod
-    def from_env(cls, **kwargs) -> "DataManagerConfig":
-        """
-        从环境变量创建配置，支持覆盖
-
-        环境变量:
-        - KLINES_WS_URL: WebSocket URL
-        - KLINES_HTTP_URL: HTTP URL
-
-        Args:
-            **kwargs: 直接传入的参数，优先级最高
-
-        Returns:
-            DataManagerConfig 实例
-        """
-        # 环境变量覆盖（未设置环境变量时为 None，回退到 Binance 公共 API）
-        ws_url = os.environ.get("KLINES_WS_URL")
-        http_url = os.environ.get("KLINES_HTTP_URL")
-
-        # 合并参数：kwargs > env > default(None)
-        config_kwargs = {
-            "klines_service_ws_url": ws_url,
-            "klines_service_http_url": http_url,
-        }
-        config_kwargs.update(kwargs)
-
-        return cls(**config_kwargs)
 
 
 class DataCache:
@@ -262,34 +234,51 @@ class DataManager:
             logger.info("KlineRepository 已启用")
 
     def _parse_interval_to_minutes(self, interval: str) -> int:
-        """解析时间周期为分钟数"""
-        interval = interval.lower()
-        if interval.endswith("m"):
-            try:
-                return int(interval[:-1])
-            except ValueError:
-                return 1
-        elif interval.endswith("h"):
-            try:
-                return int(interval[:-1]) * 60
-            except ValueError:
-                return 60
-        elif interval.endswith("d"):
-            try:
-                return int(interval[:-1]) * 1440
-            except ValueError:
-                return 1440
-        return 1
+        """解析时间周期为分钟数，无法解析时返回 0。
+
+        与 KlineRepository._get_interval_minutes 保持一致（含 w 分支）。
+        唯一调用方 _update_big_intervals_from_cache 用它算增量切片行数
+        （tail_rows = period_minutes * 3），因此：
+        - 漏掉 w 分支会让 1w 落到 fallback，tail_rows=3 → 增量桶只含 3 分钟
+          数据，覆盖掉 CSV 里完整的同名周桶。
+        - 无法解析时必须返回 0 而非 1：调用方按 `period_minutes > 0` 判断是否
+          走增量，返回 0 才能安全退化到全量聚合路径。
+        """
+        tf = interval.lower().strip()
+        try:
+            if tf.endswith("m"):
+                return int(tf[:-1])
+            if tf.endswith("h"):
+                return int(tf[:-1]) * 60
+            if tf.endswith("d"):
+                return int(tf[:-1]) * 1440
+            if tf.endswith("w"):
+                return int(tf[:-1]) * 1440 * 7
+        except ValueError:
+            return 0
+        return 0
 
     def aggregate_1m_to_interval(
-        self, df_1m: pd.DataFrame, target_interval: str
+        self, df_1m: pd.DataFrame, target_interval: str,
+        drop_partial_head: bool = False,
     ) -> pd.DataFrame:
-        """从 1m 数据聚合生成目标周期"""
+        """从 1m 数据聚合生成目标周期
+
+        Args:
+            df_1m: 1m K 线数据
+            target_interval: 目标周期
+            drop_partial_head: 源数据起点未对齐到周期边界时丢弃残缺首桶。
+                切片聚合（增量、被裁剪的缓存）必须开启，否则首桶的
+                open/high/low/volume 会失真并覆盖已有正确值。
+        """
         if df_1m is None or df_1m.empty:
             return pd.DataFrame()
 
         from data_manager.klines_loader import resample_ohlcv
-        return resample_ohlcv(df_1m, target_interval, datetime_column="timestamp")
+        return resample_ohlcv(
+            df_1m, target_interval, datetime_column="timestamp",
+            drop_partial_head=drop_partial_head,
+        )
 
     def register_timeframes_for_symbol(self, symbol: str, timeframes: List[str]):
         """注册策略需要的时间框架"""
@@ -364,7 +353,13 @@ class DataManager:
             return
 
         for interval in big_intervals:
-            df = self.aggregate_1m_to_interval(df_1m, interval)
+            # 1m 缓存起点通常不落在大周期边界上（CSV 被裁剪、增量补齐等），
+            # 首桶只含所属周期的后半段。_merge_kline_data 用 keep='last'
+            # 让新值覆盖旧值，若不丢弃这个残缺桶，它会顶掉 CSV 里那根
+            # 完整的同名桶，造成信息净损失。
+            df = self.aggregate_1m_to_interval(
+                df_1m, interval, drop_partial_head=True,
+            )
             if df is None or df.empty:
                 continue
 
@@ -394,7 +389,7 @@ class DataManager:
             symbol: 交易对名称
             intervals: 需要检查的 K 线周期列表
             days: 加载最近 N 天的数据
-            exchange: 交易所（binance, okx）— 兼容参数，当前仅使用 klines_service API
+            exchange: 交易所（binance, okx）— 兼容参数，数据直连 Binance 公共 API
             instrument_type: 交易类型（um=合约，spot=现货）— 兼容参数
 
         Returns:
@@ -468,7 +463,10 @@ class DataManager:
 
             df_1m = self.cache.get_1m_data(symbol_upper)
             if df_1m is not None and not df_1m.empty:
-                df_agg = self.aggregate_1m_to_interval(df_1m, interval)
+                # 1m 缓存起点未必对齐大周期边界，残缺首桶不能落盘
+                df_agg = self.aggregate_1m_to_interval(
+                    df_1m, interval, drop_partial_head=True,
+                )
                 if df_agg is not None and not df_agg.empty:
                     if self.kline_repo:
                         kline_dicts = []
@@ -496,6 +494,11 @@ class DataManager:
             except asyncio.CancelledError:
                 pass
         self._background_tasks.clear()
+
+        # Binance 回退模式的 REST 轮询任务是独立字段（不在 _background_tasks
+        # 里），必须单独取消 —— 否则策略进程关停后该协程仍在后台轮询。
+        # 之前唯一取消它的 stop_realtime() 未被关停路径调用。
+        await self._cancel_binance_poll_task()
 
         for symbol in list(self._ws_buffer.keys()):
             buf = self._ws_buffer.pop(symbol, [])
@@ -531,6 +534,15 @@ class DataManager:
         """
         获取 CSV 文件中最后一条数据的时间戳
 
+        必须读文件**尾部**：曾用 `pd.read_csv(csv_path, nrows=5)` 配
+        `.iloc[-1]`，而 nrows 取的是**前** 5 行，于是拿到第 5 根 K 线
+        （最早的数据）。connect_and_sync 据此算 missing_days，会把
+        "数据只差 1 分钟"误判成缺失数天，触发无谓的历史重下。
+
+        KlineRepository._get_last_kline_time 已踩过同一个坑并修好，
+        这里复用它的 _read_last_line（按字节回扫，开销与文件大小无关），
+        不再写第二份尾读实现。
+
         Args:
             symbol: 交易对
 
@@ -555,17 +567,28 @@ class DataManager:
             return None
 
         try:
-            # 只读最后一行，避免加载大文件
-            df = pd.read_csv(csv_path, nrows=0)  # 只读列名
-            if 'timestamp' not in df.columns:
+            header = pd.read_csv(csv_path, nrows=0)
+            if 'timestamp' not in header.columns:
+                return None
+            # timestamp 恒为首列（_save_dataframe / _append_to_csv 保证），
+            # 故取末行第一个字段即可
+            if list(header.columns).index('timestamp') != 0:
+                logger.warning(
+                    f"{csv_path}: timestamp 非首列，跳过尾读以免取错字段"
+                )
                 return None
 
-            # 读取最后 5 行
-            tail = pd.read_csv(csv_path, nrows=5)
-            if tail.empty:
+            last_line = KlineRepository._read_last_line(csv_path)
+            if not last_line:
                 return None
 
-            ts = pd.to_datetime(tail['timestamp'].iloc[-1], utc=True)
+            ts_field = last_line.split(",", 1)[0].strip()
+            if not ts_field or ts_field.lower() == 'timestamp':
+                return None
+
+            ts = pd.to_datetime(ts_field, utc=True)
+            if pd.isna(ts):
+                return None
             if hasattr(ts, 'to_pydatetime'):
                 ts = ts.to_pydatetime()
             if ts.tzinfo is None:
@@ -684,21 +707,21 @@ class DataManager:
         """
         self._kline_dispatch_callback = callback
 
-    async def start_klines_service_async(self, symbols: Optional[List[str]] = None) -> bool:
+    async def start_realtime_async(self, symbols: Optional[List[str]] = None) -> bool:
         """
-        启动实时数据服务 (WebSocket)
+        启动实时数据服务（单体模式：直连 Binance 公共 WebSocket）
 
-        优先连 klines_service 自建 WS；未配置 ws_url 时回退到 Binance 公共 WS。
-        Binance 回退模式需要 symbols 来拼 combined-stream URL，因此应先传 symbols 再启动。
+        combined-stream URL 由 _ws_subscribed_symbols 拼出，应先传 symbols 再启动。
+        WS 推送不可用（风控限推等）时自动降级到 fapi REST 轮询。
 
         Args:
-            symbols: 订阅的 symbol 列表（Binance 回退模式必须，自建模式可省略）
+            symbols: 订阅的 symbol 列表
 
         Returns:
             是否启动成功
         """
-        if not self.config.klines_service_enabled:
-            logger.info("klines_service 已禁用，跳过启动")
+        if not self.config.realtime_enabled:
+            logger.info("realtime_enabled=False，跳过实时数据服务启动")
             return False
 
         # 已连接则跳过，防止重复创建导致重复回调
@@ -706,43 +729,19 @@ class DataManager:
             logger.debug("WS 已连接，跳过重复启动")
             return True
 
-        # 预登记 symbols（Binance 回退模式拼 URL 需要）
+        # 登记 symbols（拼 combined-stream URL 需要）
         if symbols:
             self._ws_subscribed_symbols.update(s.upper() for s in symbols)
 
-        ws_url = self.config.klines_service_ws_url
-        if not ws_url:
-            # 未配置自建 WS，回退到 Binance 公共 WS
-            logger.info("未配置 klines_service_ws_url，回退到 Binance 公共 WebSocket")
-            return await self._start_binance_ws()
-
-        try:
-            self._ws_client = KlinesWebSocketClient(
-                ws_url=ws_url,
-                reconnect_delay=self.WS_RECONNECT_DELAY,
-                max_reconnect=self.WS_MAX_RECONNECT,
-                max_backoff=self.WS_MAX_BACKOFF,
-            )
-            self._ws_client.set_on_kline_callback(self._on_kline_received)
-
-            connected = await self._ws_client.connect()
-            if connected:
-                self._connected = True
-                logger.info(f"klines_service 连接成功：{ws_url}")
-                return True
-            else:
-                logger.warning("klines_service 连接失败")
-                return False
-        except Exception as e:
-            logger.error(f"klines_service 连接异常：{e}")
-            return False
+        return await self._start_binance_ws()
 
     async def subscribe_klines_async(self, symbols: List[str]) -> bool:
         """
-        订阅 K 线数据 (WebSocket)
+        订阅 K 线数据（单体模式：streams 固定在连接 URL 里）
 
-        自建 klines_service：通过 WS subscribe 消息订阅。
-        Binance 回退模式：先登记 symbol，重连时重建 streams URL。
+        登记 symbol；若实时通道已在运行且出现新 symbol，则重建通道 ——
+        combined-stream 的 URL 在连接时固定，运行中追加的 symbol 不重连
+        就收不到推送。单体模式下这是唯一实时数据源，不能静默丢订阅。
 
         Args:
             symbols: 要订阅的 symbol 列表
@@ -750,40 +749,56 @@ class DataManager:
         Returns:
             是否订阅成功
         """
-        # 登记 symbol（两种模式都需要）
+        added = {s.upper() for s in symbols} - self._ws_subscribed_symbols
         self._ws_subscribed_symbols.update(s.upper() for s in symbols)
 
-        if not self._ws_client:
-            logger.warning("无可用的实时数据源 (WebSocket)")
-            return False
-
-        # Binance 回退模式：无需发送 subscribe 消息，streams 在连接 URL 里已固定
-        if getattr(self._ws_client, "_binance_mode", False):
-            logger.info(f"Binance WS 已在连接 URL 订阅: {symbols}")
+        if not added:
             return True
 
-        if not self._ws_client._connected:
-            logger.warning("WebSocket 未连接，无法订阅")
+        running = (
+            (self._ws_client is not None and self._ws_client._connected)
+            or (self._binance_poll_task is not None
+                and not self._binance_poll_task.done())
+        )
+        if not running:
+            logger.info(f"已登记待订阅 symbol: {sorted(added)}")
+            return True
+
+        logger.info(f"检测到新增订阅 {sorted(added)}，重建实时通道")
+        all_symbols = list(self._ws_subscribed_symbols)
+        await self.stop_realtime()
+        # stop_realtime 会清空登记表，恢复后按全量 symbol 重启
+        self._ws_subscribed_symbols.update(all_symbols)
+        return await self.start_realtime_async(all_symbols)
+
+    async def _cancel_binance_poll_task(self) -> bool:
+        """取消 Binance REST 轮询任务并清空字段
+
+        close() 与 stop_realtime() 两条清理路径共用。异常只记日志不外抛 ——
+        关停流程不能因清理失败而中断。
+
+        Returns:
+            是否确实取消了一个在跑的任务（供调用方决定是否打日志）
+        """
+        task = self._binance_poll_task
+        if not task or task.done():
+            self._binance_poll_task = None
             return False
 
+        task.cancel()
         try:
-            await self._ws_client.subscribe(symbols)
-            logger.info(f"WebSocket 订阅: {symbols}")
-            return True
+            await task
+        except asyncio.CancelledError:
+            pass  # 预期路径：任务响应取消
         except Exception as e:
-            logger.error(f"WebSocket 订阅失败: {e}")
-            return False
+            logger.warning(f"取消 Binance 轮询任务时异常：{e}")
+        self._binance_poll_task = None
+        return True
 
     async def stop_realtime(self):
         """停止实时数据服务"""
         # 停止 Binance REST 轮询任务
-        if self._binance_poll_task and not self._binance_poll_task.done():
-            self._binance_poll_task.cancel()
-            try:
-                await self._binance_poll_task
-            except (asyncio.CancelledError, Exception):
-                pass
-            self._binance_poll_task = None
+        if await self._cancel_binance_poll_task():
             logger.info("Binance REST 轮询已停止")
 
         # 停止 WebSocket
@@ -803,23 +818,30 @@ class DataManager:
         获取实时数据服务状态
 
         Returns:
-            状态字典
+            状态字典（mode: binance_ws / binance_rest / none）
         """
         if self._ws_client:
             return {
-                "mode": "websocket",
+                "mode": "binance_ws",
                 "connected": self._ws_client._connected,
                 "subscribed_symbols": list(self._ws_subscribed_symbols),
-                "ws_url": self.config.klines_service_ws_url,
+                "ws_url": self._ws_client.ws_url,
+            }
+
+        if self._binance_poll_task is not None and not self._binance_poll_task.done():
+            return {
+                "mode": "binance_rest",
+                "connected": True,
+                "subscribed_symbols": list(self._ws_subscribed_symbols),
             }
 
         return {"mode": "none", "connected": False}
 
-    def is_klines_service_available(self) -> bool:
+    def is_realtime_available(self) -> bool:
         """检查实时数据服务是否可用"""
         return self._ws_client is not None
 
-    # ==================== Binance 公共数据回退 ====================
+    # ==================== Binance 公共数据源 ====================
 
     BINANCE_WS_BASE = "wss://fstream.binance.com"
     BINANCE_FAPI_BASE = "https://fapi.binance.com"
@@ -828,7 +850,7 @@ class DataManager:
 
     async def _start_binance_ws(self) -> bool:
         """
-        启动 Binance 实时数据回退（未配置自建 klines_service_ws_url 时使用）。
+        启动 Binance 实时数据源（单体模式唯一实时通道）。
 
         实现说明：
         - 优先尝试 fstream WebSocket 推送（部分出口 IP 可用）。
@@ -868,7 +890,6 @@ class DataManager:
                 max_backoff=self.WS_MAX_BACKOFF,
             )
             self._ws_client.set_on_kline_callback(self._on_kline_received)
-            self._ws_client._binance_mode = True
             self._ws_client._subscribed_symbols_snapshot = list(self._ws_subscribed_symbols)
 
             connected = await self._ws_client.connect()
@@ -967,84 +988,7 @@ class DataManager:
             self._on_kline_received(kline)
 
 
-    # ==================== API 调用 ====================
-
-    async def _fetch_klines_from_api(
-        self,
-        symbol: str,
-        interval: str,
-        start_time_ms: Optional[int] = None,
-        end_time_ms: Optional[int] = None,
-        days: Optional[int] = None,
-        limit: int = 1500,
-    ) -> Optional[List]:
-        """
-        从 klines_service API 获取 K 线数据
-
-        - 传入 startTime/endTime 时使用 GET /api/v1/klines（时间范围查询）
-        - 传入 day 时使用 POST /api/v1/klines/daily（单日下载）
-
-        未配置 klines_service_http_url 时返回 None，由调用方回退到 Binance 公共 API。
-        """
-        http_url = self.config.klines_service_http_url
-        if not http_url:
-            logger.info(f"{symbol} {interval}: 未配置 klines_service_http_url，跳过 klines_service")
-            return None
-
-        if start_time_ms is not None or end_time_ms is not None:
-            # 时间范围查询：使用 GET /api/v1/klines
-            url = f"{http_url}/api/v1/klines"
-            params: Dict[str, Any] = {
-                "symbol": symbol.upper(),
-                "interval": interval,
-                "limit": limit,
-            }
-            if start_time_ms is not None:
-                params["startTime"] = start_time_ms
-            if end_time_ms is not None:
-                params["endTime"] = end_time_ms
-
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, params=params) as resp:
-                        if resp.status != 200:
-                            text = await resp.text()
-                            logger.error(f"API 请求失败 {symbol} {interval}: {resp.status} {text}")
-                            return None
-                        data = await resp.json()
-                        if data and "data" in data:
-                            return data["data"]
-                        return data
-            except Exception as e:
-                logger.error(f"API 请求异常 {symbol} {interval}: {e}")
-                return None
-        else:
-            # 单日下载：使用 POST /api/v1/klines/daily
-            url = f"{http_url}/api/v1/klines/daily"
-            body: Dict[str, Any] = {
-                "symbol": symbol.upper(),
-                "interval": interval,
-                "limit": limit,
-            }
-            if days is not None:
-                body["day"] = days
-
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=body) as resp:
-                        if resp.status != 200:
-                            text = await resp.text()
-                            logger.error(f"API 请求失败 {symbol} {interval}: {resp.status} {text}")
-                            return None
-                        data = await resp.json()
-                        if data and "data" in data:
-                            return data["data"]
-                        return data
-            except Exception as e:
-                logger.error(f"API 请求异常 {symbol} {interval}: {e}")
-                return None
-
-    # ==================== Binance 公共 API 回退 ====================
+    # ==================== Binance 公共 API ====================
 
     async def _fetch_from_binance_public(
         self, symbol: str, day: Optional[str] = None, limit: int = 1500,
@@ -1125,9 +1069,7 @@ class DataManager:
 
     async def download_daily_data(self, symbol: str, day: str) -> bool:
         """
-        下载指定日期的 K 线数据并保存到 CSV
-
-        优先使用 klines_service API，失败或返回空时回退到 Binance 公共 API。
+        下载指定日期的 K 线数据并保存到 CSV（Binance 公共 API）
 
         Args:
             symbol: 交易对（如 "BTCUSDT"）
@@ -1138,42 +1080,21 @@ class DataManager:
         """
         symbol_upper = symbol.upper()
 
-        # 1. 优先使用 klines_service（未配置 http_url 时直接跳过，回退到 Binance 公共 API）
-        http_url = self.config.klines_service_http_url
-        if http_url:
-            url = f"{http_url}/api/v1/klines/daily"
-            payload = {"symbol": symbol_upper, "day": day}
-
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(url, json=payload) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            klines = data.get("data") if isinstance(data, dict) else data
-                            if klines:
-                                return self._save_klines_and_cache(symbol_upper, klines, day)
-
-                # 2. klines_service 返回空，回退到 Binance 公共 API
-                logger.info(f"{symbol_upper} {day}: klines_service 无数据，回退到 Binance 公共 API")
-            except Exception as e:
-                logger.error(f"下载 {symbol_upper} {day} 异常：{e}")
-        else:
-            logger.info(f"{symbol_upper} {day}: 未配置 klines_service_http_url，直接使用 Binance 公共 API")
-
-        # 回退到 Binance 公共 API（klines_service 不可用 / 返回空 / 抛异常）
         klines = await self._fetch_from_binance_public(symbol_upper, day)
         if not klines:
-            logger.warning(f"{symbol_upper} {day}: 所有数据源均返回空")
+            logger.warning(f"{symbol_upper} {day}: Binance 公共 API 返回空")
             return False
         return self._save_klines_and_cache(symbol_upper, klines, day)
 
-    def _save_klines_and_cache(
-        self, symbol_upper: str, klines: List, day: str,
-    ) -> bool:
-        """解析 K 线数据、保存到 CSV 并更新缓存"""
-        rows = []
-        for kline in klines:
-            rows.append({
+    @staticmethod
+    def _parse_binance_klines(klines: List) -> List[Dict]:
+        """将 Binance 数组格式 K 线解析为 dict 列表
+
+        Binance 数组下标：0=开盘时间 1=开 2=高 3=低 4=收 5=成交量
+        7=成交额 8=成交笔数 9=主动买入量 10=主动买入成交额
+        """
+        return [
+            {
                 'timestamp': kline[0],
                 'open': float(kline[1]),
                 'high': float(kline[2]),
@@ -1184,7 +1105,15 @@ class DataManager:
                 'trade_num': int(kline[8]),
                 'active_buy_volume': float(kline[9]),
                 'active_buy_quote_volume': float(kline[10]),
-            })
+            }
+            for kline in klines
+        ]
+
+    def _save_klines_and_cache(
+        self, symbol_upper: str, klines: List, day: str,
+    ) -> bool:
+        """解析 K 线数据、保存到 CSV 并更新缓存"""
+        rows = self._parse_binance_klines(klines)
 
         df = pd.DataFrame(rows)
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
@@ -1254,7 +1183,7 @@ class DataManager:
         end_time_ms: Optional[int] = None,
     ) -> Optional[List[Dict[str, Any]]]:
         """
-        通过 API 读取时间范围的 K 线数据
+        通过 Binance 公共 API 读取时间范围的 K 线数据
 
         Args:
             symbol: 交易对
@@ -1265,16 +1194,45 @@ class DataManager:
         Returns:
             API 原始返回数据（Binance 格式列表）或 None
         """
-        # 优先 klines_service，未配置或失败时回退到 Binance 公共 API
-        data = await self._fetch_klines_from_api(
-            symbol, interval, start_time_ms=start_time_ms, end_time_ms=end_time_ms,
-        )
-        if data:
-            return data
-        logger.info(f"{symbol} {interval}: klines_service 无数据，回退到 Binance 公共 API")
         return await self._fetch_from_binance_public(
             symbol, start_time_ms=start_time_ms, end_time_ms=end_time_ms,
         )
+
+    async def _fill_large_gap_via_download_range(
+        self, symbol_upper: str, start_dt: datetime, end_dt: datetime,
+    ) -> bool:
+        """大缺口补齐：转调 scripts/download_data.py::download_range。
+
+        download_range 走归档分块（monthly/daily zip）+ fapi 分页 + 自动重试，
+        一年缺口约 12 次请求，替代按天循环的 batch_download_history（每天一次
+        请求且单次 1500 条上限无分页）。
+
+        **仅限 WS 未启动的启动期调用**（sync_to_latest 在 init_today_realtime
+        之前）：download_range 合并后整文件重写 CSV，不经过 kline_repo 的
+        threading.RLock，与 WS 追加写并发会竞态丢数据。运行期中部空洞
+        （scan_and_fill_holes）走 fetch_range_rows 只取数不落盘，合并仍走
+        加锁路径。
+
+        Returns:
+            是否补齐成功（download_range 返回 None 视为失败）
+        """
+        proxies = _get_proxies()
+        try:
+            path = await asyncio.to_thread(
+                download_range, symbol_upper, "1m",
+                start_dt, end_dt, str(self.csv_dir), proxies,
+            )
+        except RuntimeError as e:
+            logger.warning(f"{symbol_upper}: 大缺口补齐失败 ({start_dt} ~ {end_dt}): {e}")
+            return False
+        if path is None:
+            logger.warning(f"{symbol_upper}: 大缺口补齐无数据返回 ({start_dt} ~ {end_dt})")
+            return False
+        # download_range 已合并去重、ISO 规范化落盘，从 CSV 重载缓存
+        df = self.load_history(symbol_upper)
+        if df is not None and not df.empty:
+            self.cache.put(symbol_upper, "1m", df, force_1m=True)
+        return True
 
     async def sync_to_latest(
         self, symbol: str, max_history_days: int = 7,
@@ -1284,9 +1242,9 @@ class DataManager:
 
         逻辑：
         1. 检查缓存中是否有数据
-        2. 若无，调用 batch_download_history + init_today_realtime
+        2. 若无，走大缺口补齐（download_range 归档分块）+ init_today_realtime
         3. 若有，计算距今时间差：
-           - > 1 天：全量补齐（batch_download_history + init_today_realtime）
+           - > 1 天：走大缺口补齐 + init_today_realtime
            - ≤ 1 天：只通过 API 补齐 gap
 
         Args:
@@ -1301,13 +1259,13 @@ class DataManager:
         # 检查缓存中已有数据
         cached = self.cache.get_1m_data(symbol_upper)
         if cached is None or cached.empty or 'timestamp' not in cached.columns:
-            # 无本地数据，全量补齐
+            # 无本地数据，全量补齐（归档分块 + fapi 分页）
             logger.info(f"{symbol_upper}: 无本地数据，全量补齐 {max_history_days} 天")
-            batch_result = await self.batch_download_history(
-                symbol_upper, days=max_history_days - 1
+            now = datetime.now(timezone.utc)
+            ok = await self._fill_large_gap_via_download_range(
+                symbol_upper, now - timedelta(days=max_history_days), now,
             )
-            success_count = sum(1 for v in batch_result.values() if v)
-            if success_count == 0:
+            if not ok:
                 logger.warning(f"{symbol_upper}: 历史数据下载全部失败")
             today_ok = await self.init_today_realtime(symbol_upper)
             return today_ok
@@ -1323,18 +1281,13 @@ class DataManager:
         gap_days = gap_seconds / 86400
 
         if gap_days > 1:
-            # 差距 > 1 天，全量补齐
+            # 差距 > 1 天，走大缺口补齐（归档分块 + fapi 分页）
             logger.info(
                 f"{symbol_upper}: 数据距今 {gap_days:.1f} 天，全量补齐"
             )
-            capped_days = min(int(gap_days) + 1, max_history_days)
-            if capped_days > 1:
-                batch_result = await self.batch_download_history(
-                    symbol_upper, days=capped_days - 1
-                )
-                success_count = sum(1 for v in batch_result.values() if v)
-                if success_count == 0:
-                    logger.warning(f"{symbol_upper}: 历史数据下载全部失败")
+            await self._fill_large_gap_via_download_range(
+                symbol_upper, latest_ts, datetime.now(timezone.utc),
+            )
             today_ok = await self.init_today_realtime(symbol_upper)
             return today_ok
         else:
@@ -1342,16 +1295,15 @@ class DataManager:
             logger.info(
                 f"{symbol_upper}: 数据距今 {gap_seconds/60:.0f} 分钟，补齐 gap"
             )
-            gap_start_ms = int((latest_ts + timedelta(minutes=1)).timestamp() * 1000)
-            api_data = await self._fetch_klines_from_api(
-                symbol_upper, "1m", start_time_ms=gap_start_ms,
+            # 起点取 latest_ts 本身而非 +1min：进程被杀时最后一根 1m 往往是
+            # 未闭合状态就落了盘（WS 缓冲区满 10 条即写 CSV），volume/high 残缺。
+            # 跳过它则该根永不重取，聚合到大周期后永久失真。重复拉取安全 ——
+            # save_klines_to_csv / _merge_api_data_to_cache 均按 timestamp
+            # keep="last" 去重，API 的完整值会覆盖残缺值。
+            gap_start_ms = int(latest_ts.timestamp() * 1000)
+            api_data = await self._fetch_from_binance_public(
+                symbol_upper, start_time_ms=gap_start_ms,
             )
-            if not api_data:
-                # klines_service 未配置或失败，回退到 Binance 公共 API
-                logger.info(f"{symbol_upper}: klines_service gap 补齐失败，回退 Binance 公共 API")
-                api_data = await self._fetch_from_binance_public(
-                    symbol_upper, start_time_ms=gap_start_ms,
-                )
             if api_data:
                 return self._merge_api_data_to_cache(symbol_upper, api_data)
             logger.warning(f"{symbol_upper}: API 返回空数据，gap 未填充 (start_ms={gap_start_ms})")
@@ -1393,20 +1345,7 @@ class DataManager:
         self, symbol: str, api_data: List,
     ) -> bool:
         """将 API 返回的数据合并到缓存"""
-        rows = []
-        for kline in api_data:
-            rows.append({
-                'timestamp': kline[0],
-                'open': float(kline[1]),
-                'high': float(kline[2]),
-                'low': float(kline[3]),
-                'close': float(kline[4]),
-                'volume': float(kline[5]),
-                'quote_volume': float(kline[7]),
-                'trade_num': int(kline[8]),
-                'active_buy_volume': float(kline[9]),
-                'active_buy_quote_volume': float(kline[10]),
-            })
+        rows = self._parse_binance_klines(api_data)
 
         df_new = pd.DataFrame(rows)
         df_new['timestamp'] = pd.to_datetime(df_new['timestamp'], unit='ms', utc=True)
@@ -1507,31 +1446,15 @@ class DataManager:
 
             gap_seconds = (datetime.now(timezone.utc) - latest_ts).total_seconds()
             if gap_seconds > 120:
-                gap_start = latest_ts + timedelta(minutes=1)
+                # 含最后一根：崩溃时它可能是未闭合状态落盘的残缺根，
+                # 见 sync_to_latest 中的同款注释
+                gap_start = latest_ts
                 start_ms = int(gap_start.timestamp() * 1000)
-                api_data = await self._fetch_klines_from_api(
-                    symbol_upper, "1m", start_time_ms=start_ms,
+                api_data = await self._fetch_from_binance_public(
+                    symbol_upper, start_time_ms=start_ms,
                 )
-                if not api_data:
-                    logger.info(f"{symbol_upper}: klines_service gap 补齐失败，回退 Binance 公共 API")
-                    api_data = await self._fetch_from_binance_public(
-                        symbol_upper, start_time_ms=start_ms,
-                    )
                 if api_data:
-                    rows = []
-                    for kline in api_data:
-                        rows.append({
-                            'timestamp': kline[0],
-                            'open': float(kline[1]),
-                            'high': float(kline[2]),
-                            'low': float(kline[3]),
-                            'close': float(kline[4]),
-                            'volume': float(kline[5]),
-                            'quote_volume': float(kline[7]),
-                            'trade_num': int(kline[8]),
-                            'active_buy_volume': float(kline[9]),
-                            'active_buy_quote_volume': float(kline[10]),
-                        })
+                    rows = self._parse_binance_klines(api_data)
                     df_new = pd.DataFrame(rows)
                     df_new['timestamp'] = pd.to_datetime(df_new['timestamp'], unit='ms', utc=True)
                     df_new = df_new.sort_values('timestamp').reset_index(drop=True)
@@ -1549,12 +1472,9 @@ class DataManager:
         # 4. 开启 WebSocket
         ws_ok = False
         if self.cache.get_1m_data(symbol_upper) is not None:
-            # Binance 回退模式需要 symbol 预注册进 WS URL，提前传入
-            ws_ok = await self.start_klines_service_async([symbol_upper])
-            if ws_ok and not getattr(self._ws_client, "_binance_mode", False):
-                await self.subscribe_klines_async([symbol_upper])
+            ws_ok = await self.start_realtime_async([symbol_upper])
             if not ws_ok:
-                logger.warning(f"{symbol_upper}: WS 启动失败，降级到 CSV 模式")
+                logger.warning(f"{symbol_upper}: 实时行情启动失败，降级到 CSV 模式")
 
         # 5. 确认有数据
         return self.cache.get_1m_data(symbol_upper) is not None
@@ -1563,7 +1483,11 @@ class DataManager:
 
     def manage_memory_cache(self, symbol: str) -> None:
         """
-        管理内存缓存：保留近 2 天数据，淘汰更旧数据
+        管理内存缓存：按 cache_1m_max_age_days / cache_1m_max_rows 裁剪 1m 数据
+
+        注意：只裁剪 1m 缓存。大周期由 1m 聚合而来，裁剪后若某周期的
+        大周期缓存尚未建立，可用桶数会随之减少 —— 已落盘的大周期 CSV
+        由 _preload_all_big_intervals_from_csv 负责兜住历史。
 
         Args:
             symbol: 交易对
@@ -1573,13 +1497,17 @@ class DataManager:
         if cached is None or cached.empty:
             return
 
-        # 1. 按时间裁剪：保留近 2 天
-        cutoff = datetime.now(timezone.utc) - timedelta(days=2)
+        # 1. 按时间裁剪：保留 cache_1m_max_age_days 天
+        #    以前这里硬编码 2 天，与配置项不一致（配了也不生效）
+        max_age_days = self.config.cache_1m_max_age_days
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
         if 'timestamp' in cached.columns:
             filtered = cached[cached['timestamp'] >= cutoff].copy()
             if len(filtered) < len(cached):
                 removed = len(cached) - len(filtered)
-                logger.info(f"{symbol_upper}: 淘汰 {removed} 条超过 2 天的旧数据")
+                logger.info(
+                    f"{symbol_upper}: 淘汰 {removed} 条超过 {max_age_days} 天的旧数据"
+                )
         else:
             filtered = cached
 
@@ -1627,6 +1555,15 @@ class DataManager:
         else:
             self.cache.put(symbol, '1m', df_new, force_1m=True)
 
+    def _utcnow(self) -> datetime:
+        """当前 UTC 时间（可在测试中覆盖）
+
+        `_on_kline_received` 的滞后校验依赖真实挂钟，这让「窗口相对 4h
+        网格的位置」随运行时刻漂移，测试难以稳定构造场景。抽成方法供测试
+        patch，生产行为不变。
+        """
+        return datetime.now(timezone.utc)
+
     def _on_kline_received(self, kline: Kline):
         """K 线数据回调 — 验证时间戳、连续性，gap 补齐，写入缓存，更新大周期
 
@@ -1656,7 +1593,7 @@ class DataManager:
             return
 
         # 时间戳验证（仅实时模式）：K 线时间滞后超过 5 分钟则跳过
-        now = datetime.now(timezone.utc)
+        now = self._utcnow()
         kline_ts = kline.timestamp
         if kline_ts.tzinfo is None:
             kline_ts = kline_ts.replace(tzinfo=timezone.utc)
@@ -1742,34 +1679,110 @@ class DataManager:
             f"close={kline.close} vol={kline.volume}"
         )
 
+    async def _fetch_gap_range(
+        self, symbol: str, last_ts: datetime, new_ts: datetime,
+    ) -> List:
+        """取回 [last_ts, new_ts) 区间的原始 API 数据，**不写缓存**。
+
+        与 `_fill_gap_range` 的区别：这里只负责取，由调用方决定何时合并。
+        `scan_and_fill_holes` 需要"全部取回后一次性合并"来避免策略读到
+        部分补齐的中间态，故不能用会立即写缓存的 `_fill_gap_range`。
+
+        分页说明：单次请求 1500 条上限，超过时分页翻页拉完整个区间
+        （Binance fapi 协议）。曾用单次请求：20160 根的洞每轮 5 分钟维护
+        只推进 1500 根，磨了 ~1 小时才补完。
+
+        Returns:
+            Binance 格式的原始 K 线列表；失败或无数据返回 []
+        """
+        # 起点含 last_ts 本身：WS 断连时缓存里那根往往停在未闭合状态，
+        # volume 残缺。跳过它则该根永不重取，见 sync_to_latest 同款注释。
+        start_ms = int(last_ts.timestamp() * 1000)
+        end_ms = int(new_ts.timestamp() * 1000)
+
+        # 单次请求 1500 条上限，按末根开盘时间 +1 分钟翻页直到覆盖整个区间。
+        # 曾用单次请求：20160 根的洞每轮 5 分钟维护只推进 1500 根，磨了 ~1 小时。
+        all_rows: List = []
+        cursor = start_ms
+        try:
+            while cursor < end_ms:
+                rows = await self._fetch_from_binance_public(
+                    symbol, start_time_ms=cursor, end_time_ms=end_ms,
+                )
+                if not rows:
+                    break
+                all_rows.extend(rows)
+                cursor = int(rows[-1][0]) + 60_000  # 1m
+            return all_rows
+        except Exception as e:
+            logger.warning(f"{symbol}: gap 拉取失败 ({last_ts} ~ {new_ts}): {e}")
+            return []
+
+    async def _fetch_hole_rows_archive_first(
+        self, symbol: str, last_ts: datetime, new_ts: datetime,
+    ) -> List:
+        """运行时补洞：归档优先，fapi 分页兜底，**不写缓存**。
+
+        先走 scripts/download_data.py::fetch_range_rows（整月/整日一次
+        归档 zip，几乎不占 fapi 限额）；归档链路整体失败或返回空时退回
+        _fetch_gap_range（fapi 分页）。历史大洞（如 CSV 只从某日开始）
+        单轮即可补完，不再每次维护只推进 1500 根。
+
+        区间含 last_ts 本身（残缺根需被完整值覆盖），与 _fetch_gap_range
+        的 [含, 不含) 语义一致。
+        """
+        try:
+            rows = await asyncio.to_thread(
+                fetch_range_rows, symbol, "1m", last_ts, new_ts, _get_proxies(),
+            )
+            if rows:
+                return rows
+            logger.debug(
+                f"{symbol}: 归档链路未取到数据 ({last_ts} ~ {new_ts})，fapi 兜底"
+            )
+        except Exception as e:
+            logger.warning(
+                f"{symbol}: 归档补齐失败 ({last_ts} ~ {new_ts})，fapi 兜底: {e}"
+            )
+        return await self._fetch_gap_range(symbol, last_ts, new_ts)
+
+    async def _fill_gap_range(
+        self, symbol: str, last_ts: datetime, new_ts: datetime,
+    ) -> int:
+        """通过 API 补齐 [last_ts, new_ts) 区间并写入缓存，返回补齐条数。
+
+        Args:
+            symbol: 交易对
+            last_ts: 区间起点（含）
+            new_ts: 区间终点（不含）
+
+        Returns:
+            实际补齐的条数，失败或无数据返回 0
+        """
+        api_data = await self._fetch_gap_range(symbol, last_ts, new_ts)
+        if api_data:
+            self._merge_api_data_to_cache(symbol, api_data)
+            return len(api_data)
+        return 0
+
     def _fill_ws_gap_async(
         self, symbol: str, last_ts: datetime, new_ts: datetime,
     ):
         """
         WS 检测到 gap 时，通过 API 补齐缺失数据
 
+        注意：只能发现"末尾断档"（缓存末根 vs 新推送）。序列**中部**的洞
+        对这条路径不可见 —— 由 scan_and_fill_holes 在定时任务里兜住。
+
         Args:
             symbol: 交易对
             last_ts: 缓存中最后一条时间
             new_ts: 新接收到的时间
         """
-        start_ms = int((last_ts + timedelta(minutes=1)).timestamp() * 1000)
-        end_ms = int(new_ts.timestamp() * 1000)
-
         async def _do_fill():
-            try:
-                api_data = await self._fetch_klines_from_api(
-                    symbol, "1m", start_time_ms=start_ms, end_time_ms=end_ms,
-                )
-                if not api_data:
-                    api_data = await self._fetch_from_binance_public(
-                        symbol, start_time_ms=start_ms, end_time_ms=end_ms,
-                    )
-                if api_data:
-                    self._merge_api_data_to_cache(symbol, api_data)
-                    logger.info(f"{symbol}: WS gap 已补齐 {len(api_data)} 条")
-            except Exception as e:
-                logger.warning(f"{symbol}: WS gap 补齐失败: {e}")
+            n = await self._fill_gap_range(symbol, last_ts, new_ts)
+            if n:
+                logger.info(f"{symbol}: WS gap 已补齐 {n} 条")
 
         # 在已有事件循环中创建后台任务
         try:
@@ -1781,6 +1794,107 @@ class DataManager:
             loop.create_task(_do_fill())
         else:
             asyncio.run(_do_fill())
+
+    def find_holes(
+        self, symbol: str, max_holes: int = 50,
+    ) -> List[Tuple[datetime, datetime]]:
+        """扫描 1m 缓存，返回中部空洞的 [起点, 终点) 区间列表。
+
+        `_on_kline_received` 的连续性检查只比较缓存末根与新推送，
+        发现不了序列中部的洞；而聚合遇到洞既不报错也不丢桶，只让
+        volume 静默偏低（桶还在、时间戳连续，结构上看不出异常）。
+        所以必须有一条独立的全序列扫描。
+
+        Args:
+            symbol: 交易对
+            max_holes: 单次最多返回多少个洞。超出时截断并告警 ——
+                洞太多说明数据源有系统性问题，逐个补齐意义不大，
+                应走全量重下。
+
+        Returns:
+            [(起点, 终点), ...]，起点为洞前最后一根，终点为洞后第一根。
+            与 _fill_gap_range 的 [含, 不含) 语义一致。
+        """
+        df = self.cache.get_1m_data(symbol.upper())
+        if df is None or df.empty or "timestamp" not in df.columns:
+            return []
+        if len(df) < 2:
+            return []
+
+        ts = df["timestamp"]
+        # 1m 数据相邻间隔应为 60 秒。用 90 秒阈值与 _on_kline_received 对齐，
+        # 容忍交易所时间戳的秒级抖动。
+        diffs = ts.diff().dt.total_seconds()
+        breaks = diffs > 90
+
+        holes: List[Tuple[datetime, datetime]] = []
+        for pos in np.flatnonzero(breaks.to_numpy()):
+            prev_ts = ts.iloc[pos - 1]
+            curr_ts = ts.iloc[pos]
+            if hasattr(prev_ts, "to_pydatetime"):
+                prev_ts = prev_ts.to_pydatetime()
+            if hasattr(curr_ts, "to_pydatetime"):
+                curr_ts = curr_ts.to_pydatetime()
+            holes.append((prev_ts, curr_ts))
+
+        if len(holes) > max_holes:
+            logger.warning(
+                f"{symbol}: 检测到 {len(holes)} 个数据空洞，超出单次上限 "
+                f"{max_holes}，本轮只补前 {max_holes} 个（数据源可能有"
+                f"系统性问题，建议全量重下）"
+            )
+            holes = holes[:max_holes]
+
+        return holes
+
+    async def scan_and_fill_holes(self, symbol: str) -> int:
+        """扫描并补齐 1m 缓存中部的空洞，返回补齐条数。
+
+        由定时维护任务调用（方案 C）：不碰 `_on_kline_received` 热路径，
+        代价是洞最多存在一个维护周期（默认 5 分钟）。对 1h/8h 策略无
+        实质影响，且洞主要来自 WS 断连，断连后本就有重连流程。
+
+        Returns:
+            实际补齐的条数
+        """
+        symbol_upper = symbol.upper()
+        holes = self.find_holes(symbol_upper)
+        if not holes:
+            return 0
+
+        logger.warning(
+            f"{symbol_upper}: 检测到 {len(holes)} 个 1m 数据空洞，开始补齐"
+        )
+        # 先把所有洞的数据【全部取回】，再一次性合并 —— 不要逐洞写缓存。
+        #
+        # 策略计算是纯同步的（strategy.py 里没有 async def），所以它一旦
+        # 开始取数就不会被打断；但每次 API 调用之间有 await，事件循环会
+        # 在此切到策略回调。若逐洞写缓存，策略就可能读到"洞1已补、洞2未补"
+        # 的中间态 1m 序列（实测：180→200→220→240 四种行数）。
+        # 全部取回后单次 cache.put 是原子的（per-symbol RLock + 整体替换
+        # DataFrame 引用），策略只能看到补齐前或补齐后，不存在中间态。
+        collected: List = []
+        for last_ts, new_ts in holes:
+            missing = int((new_ts - last_ts).total_seconds() // 60) - 1
+            # 归档优先（月/日 zip 一次拉完），失败再走 fapi 分页
+            api_data = await self._fetch_hole_rows_archive_first(
+                symbol_upper, last_ts, new_ts,
+            )
+            collected.extend(api_data)
+            logger.info(
+                f"{symbol_upper}: 空洞 [{last_ts} ~ {new_ts}) "
+                f"缺 {missing} 根，取回 {len(api_data)} 条"
+            )
+
+        if not collected:
+            logger.warning(f"{symbol_upper}: 空洞补齐未取到任何数据")
+            return 0
+
+        # 单次原子合并 + 重算大周期，避免大周期桶残留偏低的 volume
+        self._merge_api_data_to_cache(symbol_upper, collected)
+        self._update_big_intervals_from_cache(symbol_upper)
+        logger.info(f"{symbol_upper}: 空洞补齐完成，共合并 {len(collected)} 条")
+        return len(collected)
 
     def _update_big_intervals_from_cache(self, symbol: str) -> Dict[str, bool]:
         """
@@ -1828,11 +1942,16 @@ class DataManager:
 
                 if (cached_agg is not None and not cached_agg.empty
                         and not self.config.backtest_mode and period_minutes > 0):
-                    # 增量路径：只 resample 尾部 3 个周期的 1m 数据
+                    # 增量路径：只 resample 尾部 3 个周期的 1m 数据。
+                    # 切片起点按行数取，通常落在桶中间，故必须丢弃残缺首桶
+                    # —— 否则它会覆盖缓存里那根完整的同名桶，且此后不再被
+                    # 任何路径重算。
                     tail_rows = period_minutes * 3
                     df_tail = (df_1m.iloc[-tail_rows:]
                                if len(df_1m) > tail_rows else df_1m)
-                    df_inc = self.aggregate_1m_to_interval(df_tail, interval)
+                    df_inc = self.aggregate_1m_to_interval(
+                        df_tail, interval, drop_partial_head=True,
+                    )
 
                     # 增量起点必须晚于缓存起点，否则 keep 为空 → 退化成截断
                     if (df_inc is not None and not df_inc.empty
@@ -1844,8 +1963,15 @@ class DataManager:
                         new_rows = df_inc  # 仅新增/更新的行需要落 CSV
 
                 if df_agg is None:
-                    # 全量路径：冷启动 / 回测模式 / 缓存为空 / 增量前置条件不满足
-                    df_agg = self.aggregate_1m_to_interval(df_1m, interval)
+                    # 全量路径：冷启动 / 回测模式 / 缓存为空 / 增量前置条件不满足。
+                    # 与增量路径同样需要丢弃残缺首桶：1m 缓存起点由
+                    # default_1m_rows_limit 裁剪决定，落在任意分钟而非周期边界，
+                    # 首桶只含所属周期的后半段（实测 8h 仅 59%、1h 仅 72%）。
+                    # 该残缺根会经下方 save_klines_to_csv 按时间戳覆盖写进 CSV，
+                    # 顶掉原本完整的同名根，且窗口滑过后不再被任何路径重算。
+                    df_agg = self.aggregate_1m_to_interval(
+                        df_1m, interval, drop_partial_head=True,
+                    )
                     new_rows = df_agg
 
                 if df_agg is None or df_agg.empty:
@@ -1974,7 +2100,11 @@ class DataManager:
                 df_1m = df_1m[df_1m['timestamp'] <= bt_ts]
                 if df_1m.empty:
                     return None
-            df = self.aggregate_1m_to_interval(df_1m, interval)
+            # 回退: 从 1m 聚合。1m 缓存起点未必对齐大周期边界，残缺首桶
+            # 会让策略在失真的 open/high/low 上算指标，必须丢弃。
+            df = self.aggregate_1m_to_interval(
+                df_1m, interval, drop_partial_head=True,
+            )
             return df.tail(limit).copy() if df is not None and not df.empty else None
 
         return None
@@ -2035,8 +2165,10 @@ class DataManager:
                 if df_1m_filtered.empty:
                     return []
 
-                # 重新聚合
-                df_agg = self.aggregate_1m_to_interval(df_1m_filtered, interval)
+                # 重新聚合。与实盘路径保持相同的首桶语义，避免回测失真。
+                df_agg = self.aggregate_1m_to_interval(
+                    df_1m_filtered, interval, drop_partial_head=True,
+                )
                 if df_agg is None or df_agg.empty:
                     return []
 
@@ -2089,23 +2221,6 @@ class DataManager:
             new_klines = new_klines[-limit:]
 
         return new_klines
-
-    async def get_klines_async(self, symbol: str, interval: str,
-                               limit: int = 10) -> List[Kline]:
-        """
-        异步版本：在增量返回基础上，1m 有新数据时自动持久化 + 聚合大周期
-
-        供 main.py 轮询任务在异步上下文中调用。
-        """
-        symbol_upper = symbol.upper()
-        result = self.get_klines(symbol_upper, interval, limit=limit)
-
-        # 1m 有新数据 → 持久化 + 聚合
-        if interval == '1m' and result and self.kline_repo:
-            kline_dicts = [k.to_dict() for k in result]
-            self.kline_repo.update_from_1m(symbol_upper, kline_dicts)
-
-        return result
 
     def get_klines_sync(self, symbol: str, interval: str,
                         limit: int = 100) -> List[Kline]:
@@ -2233,9 +2348,15 @@ class DataManager:
 
     def start_periodic_persistence(self) -> asyncio.Task:
         """
-        启动定时持久化后台任务
+        启动定时维护后台任务
 
-        每 N 分钟将内存缓存中的 1m 数据刷新到 CSV 文件。
+        每 N 分钟：
+        1. 扫描并补齐 1m 缓存中部的空洞（WS 路径发现不了，见 find_holes）
+        2. 将内存缓存中的 1m 数据刷新到 CSV
+        3. 按 cache_1m_max_age_days / cache_1m_max_rows 裁剪 1m 缓存
+
+        补洞放在持久化**之前**，让补回的数据在同一轮落盘；
+        裁剪放在持久化之后，确保被淘汰的数据已落盘。
 
         Returns:
             创建的 asyncio.Task 对象
@@ -2243,13 +2364,27 @@ class DataManager:
         interval = self.config.persistence_interval_minutes
 
         async def _persistence_loop():
-            logger.info(f"定时持久化已启动，每 {interval} 分钟执行一次")
+            logger.info(f"定时维护已启动，每 {interval} 分钟执行一次")
             while True:
                 await asyncio.sleep(interval * 60)
+                # 先补洞：WS 的连续性检查只看末根，中部空洞只能在这里发现。
+                # 回测模式跳过 —— 数据已预加载，且不应触发网络请求。
+                if not self.config.backtest_mode:
+                    for symbol in list(self.cache._1m_cache.keys()):
+                        try:
+                            await self.scan_and_fill_holes(symbol)
+                        except Exception as e:
+                            logger.error(f"{symbol}: 空洞补齐失败: {e}")
                 try:
                     self._flush_all_cache_to_csv()
                 except Exception as e:
                     logger.error(f"定时持久化失败: {e}")
+                # 先落盘再裁剪，避免淘汰未持久化的数据
+                for symbol in list(self.cache._1m_cache.keys()):
+                    try:
+                        self.manage_memory_cache(symbol)
+                    except Exception as e:
+                        logger.error(f"{symbol}: 内存缓存裁剪失败: {e}")
 
         task = asyncio.create_task(_persistence_loop())
         self._background_tasks.append(task)

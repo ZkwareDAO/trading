@@ -4,9 +4,9 @@
 
 ---
 
-## 1. 新架构开发规范
+## 1. 开发规范
 
-> 使用 `BaseStrategy` / `BaseStrategyCore` / `BaseState` 基类开发新策略。
+> 所有策略基于 `BaseStrategy` / `BaseStrategyCore` / `BaseState` 基类开发。
 
 ### 1.1 必需实现的抽象方法
 
@@ -15,11 +15,11 @@
 | **Strategy** | `_create_core()` | 创建 Core 实例 |
 | **Strategy** | `_get_indicator_timeframes()` | 返回指标周期集合 |
 | **Core** | `_get_state(symbol)` | 获取 per-symbol 状态 |
-| **Core** | `analyze()` | 入场逻辑（接收 `realtime_price` 参数） |
+| **Core** | `analyze()` | 入场逻辑（接收 `realtime_price`、`current_cash` 参数） |
 | **Core** | `check_realtime_exit()` | 出场逻辑 |
 | **Core** | `get_status()` | 状态查询 |
 
-> **v3.7.0 新增**：`analyze()` 方法新增 `realtime_price` 参数，用于入场判断时使用 1m K 线实时价格，避免未来函数问题。
+> `analyze()` 的 `realtime_price` 参数为入场判断价格（来自 1m K 线实时价），避免使用未闭合 K 线造成未来函数。
 
 ### 1.2 BaseState 已包含字段（无需重复定义）
 
@@ -38,7 +38,7 @@ max_pnl_pct: float = 0.0               # 最大盈利百分比（>0）
 min_pnl_pct: float = 0.0               # 最大亏损百分比（<0）
 ```
 
-> **v3.7.1 新增**：入场时必须生成 `position_id`，确保平仓时持久化文件能被正确清理。
+> 入场时必须生成 `position_id`，确保平仓时持久化文件能被正确清理。
 
 ```python
 from strategy_core.position_persistence import PositionPersistence
@@ -66,42 +66,68 @@ def update_pnl_extremes(self, current_price: float): ... # 更新盈亏极值
 # 工具方法
 parse_interval_to_minutes(interval: str) -> int: ...     # 解析周期为分钟数
 get_expected_last_closed_timestamp(...) -> datetime: ... # 计算期望闭合时间
-get_closed_data(klines_data, timeframe, ...) -> DataFrame: ... # 获取已闭合 K 线
+get_closed_data(klines_data, timeframe, min_rows, current_time) -> DataFrame: ...
+# ↑ min_rows 只拦"原始数据不足"，过滤未闭合 bar 后可能仍不够，
+#   拿到结果后必须再判一次 if df.empty or len(df) < N
+
+_get_exit_detection_prices(current_price, bar_high, bar_low) -> tuple: ...
+# ↑ 返回 (check_high, check_low)。出场判断用它，别直接拿 current_price 比
+
+check_risk_control(symbol, current_price) -> Optional[ExitSignal]: ...
+# ↑ 统一风控，基类在策略出场返回 hold 后自动调用，策略侧一般不用管
 
 # 仓位回调（自动判断 backtest_mode）
-_notify_position_enter(symbol, state): ...
+_notify_position_enter(symbol, state): ...   # ★ 入场时必须调用，否则仓位不落盘
 _notify_position_exit(symbol, state, exit_price, exit_reason, is_stop_loss, exit_time): ...
 _notify_position_update(symbol, state): ...
 
-# 平仓通用方法（v3.6.0 新增）
-_notify_exit_and_clear(symbol, state, exit_price, exit_reason, is_stop_loss, exit_time) -> str: ...
+# 平仓通用方法（一次做完：触发钩子 → 写历史仓位 → 清持久化 → 清状态 → 记止损日）
+_notify_exit_and_clear(...) -> str: ...      # 返回 "sell_close"（平多）/ "buy_close"（平空）
 
-# 平仓前钩子（v3.7.0 新增）
+# 平仓前钩子
 _on_before_exit_clear(symbol, state, is_stop_loss) -> None: ...
 ```
+
+> **主周期是 `timeframes[0]`**，不是最后一个。基类的 `self.main_timeframe`
+> 就取 `timeframes[0]`（`strategy.py:93`）。多周期策略请用显式的
+> `*_timeframes` 参数指定各指标周期，不要依赖列表顺序。
 
 ### 1.5 BaseStrategy 已实现功能（无需手动编写）
 
 | 功能 | 说明 |
 |------|------|
-| on_start() | 注册时间框架、设置回调、恢复状态 |
+| on_start() | 注册时间框架、设置回调、恢复状态、自动补历史数据 |
 | on_stop() | 停止运行 |
 | on_kline() | 完整 K 线处理流程 |
-| K 线冷却 | 同一根入场周期 K 线不重复触发，回测和实盘行为一致 |
+| 平仓信号去重 | 同一根 1m K 线内不重复发平仓信号（`_last_exit_signal_time`） |
+| 统一风控兜底 | 策略 `check_realtime_exit()` 返回 hold 后，自动检查 `risk` 段配置的止损/回落止盈 |
 | 仓位持久化 | 实盘模式自动持久化，回测时自动禁用 |
-| 信号创建 | 自动创建 Signal 对象 |
+| 信号创建 | 自动创建 Signal 对象（`action` 不在白名单内会返回 None，信号被静默丢弃） |
+
+> ### ⚠️ 基类**没有**入场侧 K 线冷却
+>
+> 基类默认 `on_kline()`（`strategy_core/base/strategy.py:373-452`）的节奏是**每根 1m K 线走一遍**：
+> 有持仓 → `check_realtime_exit()`；无持仓 → `analyze()`。
+> **`analyze()` 是每分钟被调用的，不是每根大周期才调一次。**
+>
+> 这不是缺陷：指标用 `get_closed_data()` 取已闭合大周期 K 线（无未来函数），
+> 入场价用 `realtime_price`，所以条件一成立就能进场，不必等收线。
+>
+> 如果你的策略要求"只在大周期闭合的那一分钟才判断入场"，**必须自己重写 `on_kline()`**
+> 加闭合边界判断，参考写法见 `strategies/example_ma_cross/strategy.py` 文件末尾附录。
+> 自己实现的冷却记得在回测模式跳过（`self._backtest_mode`）。
 
 ---
 
-## 2. 平仓方法规范（v3.6.0 新增）
+## 2. 平仓方法规范
 
 > **关键规范**：所有策略的 `_close` 方法应调用基类 `_notify_exit_and_clear()` 方法。
 >
-> **v3.7.1 变更**：`_notify_exit_and_clear()` 现在**无条件**调用 `_notify_position_exit`（移除了
-> `if state.position_id` 守卫）。这意味着即使策略未设置 `position_id`，持久化文件和
-> 历史仓位记录也会被正确清理。前提是入场时正确生成了 `position_id`（见 [Section 1.2](#12-basestate-已包含字段无需重复定义)）。
+> `_notify_exit_and_clear()` **无条件**调用 `_notify_position_exit`：即使策略未设置
+> `position_id`，持久化文件和历史仓位记录也会被清理。前提是入场时正确生成了
+> `position_id`（见 [Section 1.2](#12-basestate-已包含字段无需重复定义)）。
 
-### 平仓前钩子（v3.7.0 新增）
+### 平仓前钩子
 
 `BaseStrategyCore` 提供 `_on_before_exit_clear` 钩子方法，子类可重写以在平仓时执行特有逻辑：
 
@@ -129,12 +155,12 @@ def _on_before_exit_clear(self, symbol: str, state: StateType, is_stop_loss: boo
 **示例**：
 
 ```python
-class OBVCoreV2(BaseStrategyCore[OBVStateV2]):
+class {Prefix}Core(BaseStrategyCore[{Prefix}State]):
     def _on_before_exit_clear(self, symbol, state, is_stop_loss):
-        """平仓前钩子：更新连续盈利递减状态"""
+        """平仓前钩子：执行策略特有的平仓前处理"""
         exit_direction = state.position
-        self._update_win_streak(state, is_stop_loss, exit_direction)
-        self._persist_win_streak_state(symbol, state)
+        self._update_custom_state(state, is_stop_loss, exit_direction)
+        self._persist_custom_state(symbol, state)
 ```
 
 ### 标准平仓方法模板
@@ -234,39 +260,43 @@ def check_realtime_exit(self, symbol, current_price, current_time=None, bar_high
 
 ## 3. 冷却机制规范
 
-| 冷却类型 | 实现位置 | 说明 |
+| 冷却类型 | 实现位置 | 状态 |
 |----------|----------|------|
-| **K 线冷却** | BaseStrategy | 已实现，使用 `cooldown_timeframe`（默认入场时间框架） |
-| **止损日冷却** | Core.analyze() | 使用 `state.stop_loss_date` 检查 |
+| **止损日冷却** | Core.analyze() | 需自己写：检查 `state.stop_loss_date`；止损日期由基类在 `is_stop_loss=True` 时自动记录 |
+| **平仓信号去重** | BaseStrategy | 基类已实现：同一根 1m K 线内不重复发平仓信号 |
+| **入场 K 线冷却** | — | **基类没有**，见 [§1.5 的警告](#15-basestrategy-已实现功能无需手动编写) |
 
-**K 线冷却配置**（策略配置文件）：
+> **`cooldown_timeframe` / `cooldown_bars` / `cooldown_ms` 是死配置。**
+> 前两个在代码里零引用；`cooldown_ms` 只在 `strategy.py:106` 被赋值给 `self.cooldown_ms`，
+> 之后从未被读取。overrides 里写了也不生效，不要依赖它们做冷却。
 
-```yaml
-cta_ict_v3:
-  timeframes: ["1d", "4h", "15m"]
-  cooldown_timeframe: "15m"  # 可选，默认使用最后一个时间框架（入场时间框架）
-```
-
-多时间框架策略（如 ICT: 1d/4h/15m）：
-- 入场判断在 15m 上执行
-- 冷却也应使用 15m，而非 1d
-- 通过 `cooldown_timeframe` 配置项指定
+**需要"一根大周期只入场一次"怎么办**：重写 `on_kline()`，在入场分支前加闭合边界判断
+（`strategies/example_ma_cross/strategy.py` 末尾有可直接复制的实现）。这样天然满足
+"一根 K 线最多触发一次"，且不需要额外的冷却状态。
 
 **止损日冷却实现**（Core 类）：
 
 ```python
-def analyze(self, symbol, klines_data, current_time):
+def analyze(self, symbol, klines_data, current_time, realtime_price=None, current_cash=None):
     state = self._get_state(symbol)
-    today = current_time.date() if current_time else datetime.now(timezone.utc).date()
-    if state.stop_loss_date == today:
-        return {"action": "hold", "metadata": {"reason": "今日已触发止损，禁止开仓"}}
+    if current_time is None:
+        return {"action": "hold", "price": 0, "strength": 0,
+                "metadata": {"reason": "K线时间缺失"}}
+    if state.stop_loss_date == current_time.date():
+        return {"action": "hold", "price": 0, "strength": 0,
+                "metadata": {"reason": "今日已触发止损，禁止开仓"}}
 ```
 
-**止损时自动记录日期**（通过 clear_position）：
+> 禁止用 `datetime.now()` 推算止损日——回测时必须以 K 线时间为准（见 [AI_CONSTRAINTS.md](AI_CONSTRAINTS.md) 红线 #6）。
+
+**止损时自动记录日期**（统一走 `_notify_exit_and_clear()`，内部在 `is_stop_loss=True` 时记录 `stop_loss_date`）：
 
 ```python
-def _close(self, symbol, state, price, reason, is_stop_loss=False):
-    state.clear_position(record_stop_loss=is_stop_loss)
+def _close(self, symbol, state, price, reason, is_stop_loss=False, current_time=None):
+    return self._notify_exit_and_clear(
+        symbol=symbol, state=state, exit_price=price,
+        exit_reason=reason, is_stop_loss=is_stop_loss, exit_time=current_time,
+    )
 ```
 
 ---
@@ -281,7 +311,7 @@ def _close(self, symbol, state, price, reason, is_stop_loss=False):
 | 出场判断 | 1m | 使用 `current_price` 参数 |
 | 指标计算 | 各指标配置的周期 | 必须使用已闭合 K 线 |
 
-### realtime_price 使用规范（v3.7.0 新增）
+### realtime_price 使用规范
 
 `analyze()` 方法签名：
 
@@ -292,6 +322,7 @@ def analyze(
     klines_data: Dict[str, pd.DataFrame],
     current_time: Optional[datetime] = None,
     realtime_price: Optional[float] = None,  # 新增参数
+    current_cash: Optional[float] = None,    # 当前可用资金（动态资金计算用）
 ) -> Dict[str, Any]:
 ```
 
@@ -351,63 +382,71 @@ def _check_entry(self, symbol, state, klines_data, current_price, current_time):
 def _get_indicator_timeframes(self) -> set:
     tf_set = set(self.timeframes)
     p = self.params or {}
-    tf_set.add(p.get("obv_timeframes", "1h"))
-    tf_set.add(p.get("atr_timeframes", "1h"))
+    tf_set.add(p.get("indicator_a_timeframes", "4h"))
+    tf_set.add(p.get("indicator_b_timeframes", "4h"))
     return tf_set
 ```
 
-### 多周期分析参数配置（v3.7.0）
+### 多周期分析参数配置
 
 多周期策略应使用明确的参数指定各分析的周期，而非依赖 `timeframes` 列表顺序：
 
 ```yaml
-# strategies/cta_ict_v3/overrides/BTCUSDT.yaml
-cta_ict_v3:
+# strategies/<name>/overrides/<SYMBOL>.yaml
+{strategy_name}:
   timeframes:
-    - 1d
     - 4h
-    - 15m
   params:
-    # 明确指定各分析的周期
-    direction_timeframes: 1d          # 方向确认周期
-    market_structure_timeframes: 4h   # 市场结构分析周期
-    fvg_timeframes: 15m               # FVG 检测 + 入场周期
+    # 明确指定各分析的周期（参数名由策略自定义）
+    indicator_a_timeframes: 4h       # 指标 A 周期
+    indicator_b_timeframes: 4h       # 指标 B 周期
+    tracking_timeframe: 1h           # 跟踪止损周期（可比入场周期更短）
 ```
 
 **参数说明**：
 
 | 参数 | 说明 | 默认值 |
 |------|------|--------|
-| `direction_timeframes` | 大周期方向确认 | `1d` |
-| `market_structure_timeframes` | 市场结构分析（HH/HL/LH/LL） | `4h` |
-| `fvg_timeframes` | FVG 检测和入场执行 | `15m` |
+| `{indicator}_timeframes` | 各指标的分析周期（由策略定义） | `timeframes[0]` |
+| `tracking_timeframe` | 跟踪止损周期（可比入场周期更短，参数名由策略自定义） | `timeframes[0]` |
 
-**代码实现要点**：
+**代码实现要点**（`_get_indicator_timeframes()` 属于 **Strategy 类**，不是 Core）：
 
 ```python
-class ICTCoreV3(BaseStrategyCore):
-    def __init__(self, symbols, timeframes, params):
-        p = params or {}
-        self.fvg_timeframes = p.get("fvg_timeframes", "15m")
-        self.market_structure_timeframes = p.get("market_structure_timeframes", "4h")
-        self.direction_timeframes = p.get("direction_timeframes", "1d")
+class Strategy(BaseStrategy):
+    STRATEGY_TYPE = "{strategy_name}"
 
-    def _refresh_analysis(self, symbol, klines_data, current_time):
-        # 只在指定周期分析市场结构
-        ms_timeframes = {self.direction_timeframes, self.market_structure_timeframes}
+    def _create_core(self):
+        return {Prefix}Core(
+            symbols=self.symbols,
+            timeframes=self.timeframes,
+            params=self.params,
+            global_config=self._get_global_config(),
+        )
 
-        # 在指定周期检测 FVG
-        fvg_tf = self.fvg_timeframes
+    def _get_indicator_timeframes(self) -> set:
+        # 指标周期集合 = timeframes ∪ 各 *_timeframes 参数
+        tf_set = set(self.timeframes)
+        p = self.params or {}
+        tf_set.add(p.get("indicator_a_timeframes", "4h"))
+        tf_set.add(p.get("indicator_b_timeframes", "4h"))
+        tf_set.add(p.get("tracking_timeframe", "4h"))
+        return tf_set
 ```
 
-**修改 4h FVG 配置示例**：
+> Core 类只在 `__init__` 中从 `params` 读取各参数值（如
+> `self.tracking_timeframe = p.get("tracking_timeframe", timeframes[0])`），
+> 不负责声明订阅周期。
+
+**修改指标周期配置示例**：
 
 ```yaml
-# 改用 4h 周期检测 FVG（减少交易频率）
+# strategies/<name>/overrides/<SYMBOL>.yaml
+# 跟踪止损改用 1h（比入场周期更频繁地更新止损）
+timeframes:
+  - 4h
 params:
-  direction_timeframes: 1d
-  market_structure_timeframes: 4h
-  fvg_timeframes: 4h  # 改为 4h
+  tracking_timeframe: 1h
 ```
 
 ---
@@ -423,11 +462,11 @@ params:
 ```python
 # 正确
 entry_ts = int(current_time.timestamp())  # 秒级
-timestamp=self._current_kline_timestamp or datetime.now(timezone.utc)
+timestamp=self._current_kline_timestamp   # 用 K 线时间；为 None 时应跳过信号，而非回退 now()
 
 # 错误
 entry_ts = int(current_time.timestamp() * 1000)  # 毫秒级
-timestamp=datetime.now()  # 缺少时区
+timestamp=datetime.now(timezone.utc)             # 禁止：信号时间戳必须可重现
 ```
 
 ---

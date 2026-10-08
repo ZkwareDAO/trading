@@ -213,7 +213,7 @@ class TestExitDetectionMode:
 
     def test_mode_from_global_config_enabled(self):
         """从全局配置读取启用模式"""
-        global_config = {"strategy_engine": {"use_bar_high_low_for_exit": True}}
+        global_config = {"use_bar_high_low_for_exit": True}
         core = MockStrategyCore(
             symbols=["BTCUSDT"],
             timeframes=["1h"],
@@ -223,7 +223,7 @@ class TestExitDetectionMode:
 
     def test_mode_from_global_config_disabled(self):
         """从全局配置读取禁用模式"""
-        global_config = {"strategy_engine": {"use_bar_high_low_for_exit": False}}
+        global_config = {"use_bar_high_low_for_exit": False}
         core = MockStrategyCore(
             symbols=["BTCUSDT"],
             timeframes=["1h"],
@@ -233,7 +233,7 @@ class TestExitDetectionMode:
 
     def test_get_exit_detection_prices_with_bar_high_low(self):
         """使用 bar_high/bar_low 时返回正确价格"""
-        global_config = {"strategy_engine": {"use_bar_high_low_for_exit": True}}
+        global_config = {"use_bar_high_low_for_exit": True}
         core = MockStrategyCore(
             symbols=["BTCUSDT"],
             timeframes=["1h"],
@@ -249,7 +249,7 @@ class TestExitDetectionMode:
 
     def test_get_exit_detection_prices_without_bar_high_low(self):
         """禁用 bar_high/bar_low 时使用 current_price"""
-        global_config = {"strategy_engine": {"use_bar_high_low_for_exit": False}}
+        global_config = {"use_bar_high_low_for_exit": False}
         core = MockStrategyCore(
             symbols=["BTCUSDT"],
             timeframes=["1h"],
@@ -265,7 +265,7 @@ class TestExitDetectionMode:
 
     def test_get_exit_detection_prices_fallback_when_bar_data_missing(self):
         """bar_high/bar_low 缺失时回退到 current_price"""
-        global_config = {"strategy_engine": {"use_bar_high_low_for_exit": True}}
+        global_config = {"use_bar_high_low_for_exit": True}
         core = MockStrategyCore(
             symbols=["BTCUSDT"],
             timeframes=["1h"],

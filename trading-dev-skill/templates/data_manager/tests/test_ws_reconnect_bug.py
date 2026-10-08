@@ -204,9 +204,12 @@ class TestWebSocketReconnect:
             mock.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_reconnect_subscribe_on_success(self):
-        """
-        测试重连成功后重新订阅 symbols
+    async def test_reconnect_no_resubscribe_needed(self):
+        """重连成功后无需重新订阅
+
+        单体模式：Binance combined-stream 的 streams 固定在连接 URL 里，
+        重连（复用同一 URL）后订阅自动恢复 —— 旧 klines_service 协议的
+        「重连后发送 subscribe 消息」已随通道移除。
         """
         client = KlinesWebSocketClient(
             max_reconnect=3,
@@ -221,11 +224,12 @@ class TestWebSocketReconnect:
             return True
 
         with patch.object(client, 'connect', mock_connect_success):
-            with patch.object(client, 'subscribe', AsyncMock(return_value=True)) as mock_subscribe:
-                await client._reconnect()
+            url_before = client.ws_url
+            await client._reconnect()
 
-                # 重连成功后应重新订阅
-                mock_subscribe.assert_called_once_with(["BTCUSDT", "ETHUSDT"])
+            # 连接恢复即订阅恢复（同一 URL），URL 不应被改动
+            assert client._connected is True
+            assert client.ws_url == url_before
 
     @pytest.mark.asyncio
     async def test_reconnect_calls_callback_on_success(self):
@@ -248,10 +252,9 @@ class TestWebSocketReconnect:
             return True
 
         with patch.object(client, 'connect', mock_connect_success):
-            with patch.object(client, 'subscribe', AsyncMock(return_value=True)):
-                await client._reconnect()
+            await client._reconnect()
 
-                reconnect_callback.assert_called_once()
+            reconnect_callback.assert_called_once()
 
 
 class TestWebSocketReconnectPrevention:

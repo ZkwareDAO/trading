@@ -3,10 +3,13 @@
 Strategy Process Runner — 策略独立进程入口
 
 每个策略运行在独立进程中，拥有：
-- 独立的 DataManager（专属 CSV 路径）
-- 独立的 SignalLogger + KafkaProducer
-- 独立的 WS 连接
-- 独立注册到 factory-service
+- 独立的 DataManager（专属 CSV 路径，直连 Binance）
+- 独立的 SignalLogger（存储信号 + 交易所直连下单）
+- 独立的实时行情连接
+
+单体模式：本进程直接加载 strategies/<name>/strategy.py 的 Strategy 类
+（不经注册表/引擎），WS 收到 K 线 → on_kline → 信号统一写 CSV，
+CSV 成功后由 SignalLogger 直连交易所下单。
 
 使用方式:
     python run_strategy.py --name sar_snt3_v3 --symbol BTCUSDT --interval 4h --version v3 --trading-mode live
@@ -16,9 +19,9 @@ Strategy Process Runner — 策略独立进程入口
 
 import argparse
 import asyncio
+import importlib
 import logging
 import os
-import re
 import signal
 import sys
 import yaml
@@ -26,36 +29,23 @@ from pathlib import Path
 from typing import Optional, Dict, Any
 
 from data_manager import DataManager, DataManagerConfig
-from strategy_core.strategy_engine.engine import StrategyEngine
-from strategy_core.signal_logging import SignalLogger, SignalStorage, KafkaSignalProducer
-from strategy_core.signal_logging.csv_adapter import SignalCsvWriter
+from strategy_core.constants import (
+    DEFAULT_STOP_LOSS_PCT,
+    DEFAULT_TRAILING_PROFIT_ACTIVATION,
+    DEFAULT_TRAILING_PROFIT_DRAWDOWN,
+)
+from strategy_core.signal_logging import (
+    SignalLogger,
+    SignalStorage,
+    SignalCsvWriter,
+    CtaSignalCSV,
+    build_signal_params,
+)
 from strategy_core.utils.strategy_naming import build_strategy_id_from_overrides
 from strategy_core.utils.log_handlers import DailyDirectoryFileHandler
-
-# ${VAR} 占位符正则
-_ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
-
-
-def _resolve_env_placeholders(obj: Any) -> Any:
-    """递归解析配置中的 ${VAR} 占位符为环境变量值
-
-    环境变量未设置时替换为 None（而非保留字面量 ${VAR}），
-    让下游判断 None 走回退逻辑。
-    """
-    if isinstance(obj, dict):
-        return {k: _resolve_env_placeholders(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_resolve_env_placeholders(v) for v in obj]
-    if isinstance(obj, str):
-        m = _ENV_PATTERN.fullmatch(obj.strip())
-        if m:
-            # 整串就是 ${VAR}：返回环境变量原值（可能为 None）
-            return os.environ.get(m.group(1))
-        # 字符串中嵌入 ${VAR}：做替换，未设置的替换为空串
-        return _ENV_PATTERN.sub(
-            lambda mm: (os.environ.get(mm.group(1)) or ""), obj
-        )
-    return obj
+from strategy_core.utils.env_placeholders import (
+    resolve_env_placeholders as _resolve_env_placeholders,
+)
 
 
 def build_strategy_config(
@@ -96,6 +86,28 @@ def resolve_log_level(
     return "INFO"
 
 
+def resolve_effective_log_level(
+    cli_log_level: Optional[str],
+    env_log_level: Optional[str],
+) -> str:
+    """
+    解析策略配置之前的日志级别，优先级：CLI 参数 > LOG_LEVEL 环境变量 > 默认 INFO
+
+    manager（run_strategies_manager.py）通过 LOG_LEVEL 环境变量而非命令行
+    透传日志级别（build_strategy_command 拼出的命令不带 --log-level）：
+    直接运行 run_strategy.py 时读 --log-level，由 manager 拉起时读环境变量。
+
+    Args:
+        cli_log_level: --log-level 传入的值（未指定为 None）
+        env_log_level: LOG_LEVEL 环境变量值（未设置为 None）
+
+    Returns:
+        日志级别字符串（DEBUG/INFO/WARNING/ERROR），非法值回退 INFO
+    """
+    name = (cli_log_level or env_log_level or "INFO").upper()
+    return name if hasattr(logging, name) else "INFO"
+
+
 def _read_interval_from_overrides(overrides_section: Dict[str, Any]) -> Optional[str]:
     """从 overrides 段读取主周期（timeframes[0]）
 
@@ -115,17 +127,13 @@ def _read_interval_from_overrides(overrides_section: Dict[str, Any]) -> Optional
 
 class StrategyProcessRunner:
     """
-    策略进程运行器
+    策略进程运行器（单体模式）
 
     封装单个策略进程的全部生命周期：
     - DataManager（策略专属 CSV 路径）
-    - StrategyEngine（只加载当前策略）
-    - SignalLogger（独立 Kafka 连接）
+    - 策略实例（直接加载 strategies/<dir>/strategy.py，不经注册表/引擎）
+    - SignalLogger（信号存储 + 交易所直连下单）
     - CSV Writer（独立写入路径）
-
-    支持两种初始化方式：
-    1. 新格式：strategy_name（标准化名称）+ trading_mode
-    2. 旧格式：strategy_name（目录名）+ strategy_config
     """
 
     def __init__(
@@ -141,11 +149,11 @@ class StrategyProcessRunner:
         初始化策略进程
 
         Args:
-            strategy_name: 策略名称（标准化名称或目录名）
+            strategy_name: 策略名称（标准化名称）
             strategy_config: 策略配置字典
             global_config_path: 全局配置路径
             trading_mode: 运行模式 (live / paper_trading / smoking)
-            strategy_dir: 策略目录名（新格式必须）
+            strategy_dir: 策略目录名
             position_file_name: 仓位文件名（不含扩展名）
         """
         self.strategy_name = strategy_name
@@ -162,21 +170,12 @@ class StrategyProcessRunner:
         strategy_data_dir.mkdir(parents=True, exist_ok=True)
 
         # 初始化 DataManager（独立实例）
-        # 地址来自 settings.yaml 的 ${ENV_VAR} 占位；缺失时回退到 Binance 公共源
+        # 单体模式：直连 Binance（公共 WS 实时 + fapi 历史），无需外部行情服务
         dm_global_config = self.global_config.get("data_manager", {})
-        ws_url = dm_global_config.get("klines_service_ws_url")
-        http_url = dm_global_config.get("klines_service_http_url")
-        if not ws_url:
-            logging.info("未配置 data_manager.klines_service_ws_url，实时数据将回退到 Binance 公共 WS")
-        if not http_url:
-            logging.info("未配置 data_manager.klines_service_http_url，历史下载将回退到 Binance fapi")
         dm_config = DataManagerConfig(
             csv_dir=str(strategy_data_dir),
             cache_max_size=dm_global_config.get("cache_max_size", 10000),
-            # WebSocket 配置
-            klines_service_enabled=dm_global_config.get("klines_service_enabled", True),
-            klines_service_ws_url=ws_url,
-            klines_service_http_url=http_url,
+            realtime_enabled=dm_global_config.get("realtime_enabled", True),
         )
         self.data_manager = DataManager(dm_config)
 
@@ -185,53 +184,18 @@ class StrategyProcessRunner:
         storage_path = signal_config.get("storage", {}).get("path", "data/signals")
         storage = SignalStorage(base_dir=storage_path)
 
-        kafka_config = signal_config.get("kafka", {})
-        kafka_producer = None
-        kafka_topic = kafka_config.get("topic", "strategy_signals")
-        # 模拟盘不发送 Kafka
-        if kafka_config.get("enabled", False) and not self._paper_trading_mode:
-            kafka_producer = KafkaSignalProducer(kafka_config)
-
-        # 读取 signal_hub 配置
-        signal_hub_config = self.global_config.get("signal_hub", {})
-        http_endpoint = None
-        http_api_path = None
-        # 模拟盘不发送 HTTP
-        if signal_hub_config.get("enabled", False) and not self._paper_trading_mode:
-            http_endpoint = signal_hub_config.get("endpoint")
-            # 优先级：策略配置 > 全局配置 > 默认值
-            strategy_api_path = self.strategy_config.get("signal", {}).get("api_path")
-            global_api_path = signal_hub_config.get("api_path")
-            http_api_path = strategy_api_path or global_api_path
+        # 信号出口：存储（CSV）后由本进程直连交易所下单
+        direct_trader = self._build_direct_trader()
 
         self.signal_logger = SignalLogger(
             storage,
-            kafka_producer=kafka_producer,
-            http_endpoint=http_endpoint,
-            http_api_path=http_api_path,
-            kafka_topic=kafka_topic,
+            direct_trader=direct_trader,
         )
         self.csv_writer = SignalCsvWriter()
 
-        # 初始化 StrategyEngine（只加载当前策略）
-        # 地址来自 settings.yaml 的 ${ENV_VAR} 占位；缺失时策略仍可运行，仅对应功能不可用
-        engine_config = self.global_config.get("strategy_engine", {})
-        factory_endpoint = engine_config.get("factory_endpoint")
-        position_proxy_url = engine_config.get("position_proxy_url")
-        strategies_dir = engine_config.get("strategies_dir", "./strategies")
-        if not factory_endpoint:
-            logging.warning("未配置 strategy_engine.factory_endpoint，跳过 factory-service 注册/心跳")
-        if not position_proxy_url:
-            logging.warning("未配置 strategy_engine.position_proxy_url，远程仓位查询不可用")
-
-        self.engine = StrategyEngine(
-            factory_endpoint=factory_endpoint,
-            position_proxy_url=position_proxy_url,
-            strategies_dir=strategies_dir,
-            data_manager=self.data_manager,
-            signal_logger=self.signal_logger,
-            csv_writer=self.csv_writer,
-        )
+        # 策略实例（start() 时加载）
+        self.strategy = None
+        self._strategy_started = False
 
         # 仓位文件路径
         self._position_file_name = position_file_name or strategy_name
@@ -249,61 +213,136 @@ class StrategyProcessRunner:
             raw = yaml.safe_load(f) or {}
         return _resolve_env_placeholders(raw)
 
+    def _build_direct_trader(self):
+        """按 direct_trading 配置构建直连下单执行器，未启用时返回 None
+
+        凭证只从环境变量（.env）读，配置文件里不出现 key。
+        缺凭证时 BinanceTrader 会抛 BinanceCredentialsError，此处不捕获——
+        开着直连却下不了单必须让进程起不来，否则策略会在"以为已成交"的状态下继续跑。
+        """
+        direct_config = self.global_config.get("direct_trading", {}) or {}
+        if not direct_config.get("enabled", False):
+            return None
+
+        # 只有 paper_trading 不下真单。live 与 smoking 都会真实成交 ——
+        # smoking（冒烟）的设计意图就是用真单验证全链路，故不在此拦截。
+        if self._paper_trading_mode:
+            logging.warning(
+                f"[{self.strategy_name}] direct_trading 已启用但当前为 paper_trading 模式，"
+                f"不会向交易所下单"
+            )
+            return None
+
+        exchange = str(direct_config.get("exchange", "binance")).lower()
+        if exchange != "binance":
+            raise ValueError(
+                f"direct_trading.exchange 仅支持 binance，当前配置：{exchange}"
+            )
+
+        from strategy_core.signal_logging.binance_trader import (
+            BinanceTrader,
+            BinanceTraderConfig,
+        )
+
+        trader_config = BinanceTraderConfig(
+            testnet=bool(direct_config.get("testnet", False)),
+            recv_window=int(direct_config.get("recv_window", 5000)),
+            timeout=float(direct_config.get("timeout", 10.0)),
+            max_retries=int(direct_config.get("max_retries", 2)),
+        )
+        trader = BinanceTrader(trader_config)
+        logging.info(
+            f"[{self.strategy_name}] 直连下单已启用 (exchange=binance, "
+            f"testnet={trader_config.testnet})，信号不再经 HTTP 推送"
+        )
+        return trader
+
     def load_strategy(self) -> bool:
         """
-        加载指定策略（不扫描其他策略目录）
+        加载指定策略（直接实例化，不扫描其他策略目录）
 
         Returns:
             是否加载成功
         """
-        # 使用标准化名称作为 strategy_id
-        strategy_id = self.strategy_name
         module_path = f"strategies.{self._strategy_dir}.strategy"
-
-        # 直接注册策略，不扫描其他策略
-        self.engine.registry.register(
-            strategy_id=strategy_id,
-            strategy_name=self._strategy_dir,
-            module_path=module_path,
-            config=self.strategy_config,
-        )
-
-        # 实例化策略
-        strategy_entry = self.engine.registry.get(strategy_id)
-        if strategy_entry is None:
-            logging.error(f"获取策略条目失败：{strategy_id}")
+        try:
+            module = importlib.import_module(module_path)
+        except Exception as e:
+            logging.error(f"[{self.strategy_name}] 导入策略模块失败 {module_path}: {e}")
             return False
 
-        success = self.engine.lifecycle.instantiate_strategy(
-            strategy_entry,
-            self.data_manager,
-            strategy_name=self.strategy_name,
-            trading_mode=self.trading_mode,
+        strategy_class = getattr(module, "Strategy", None)
+        if strategy_class is None:
+            logging.error(
+                f"[{self.strategy_name}] 策略类 'Strategy' 未在模块 {module_path} 中找到"
+            )
+            return False
+
+        try:
+            self.strategy = strategy_class(
+                data_manager=self.data_manager,
+                config=self.strategy_config,
+                strategy_name=self.strategy_name,
+                trading_mode=self.trading_mode,
+            )
+        except Exception as e:
+            logging.error(f"[{self.strategy_name}] 策略加载失败: {e}", exc_info=True)
+            return False
+
+        logging.info(
+            f"[{self.strategy_name}] 策略 {self.strategy_name} 加载成功 (mode={self.trading_mode})"
         )
-
-        if success:
-            logging.info(f"[{self.strategy_name}] 策略 {strategy_id} 加载成功 (mode={self.trading_mode})")
-        else:
-            entry = self.engine.registry.get(strategy_id)
-            error_msg = entry.error_message if entry and entry.error_message else "未知错误"
-            logging.error(f"[{self.strategy_name}] 策略加载失败: {error_msg}")
-
-        return success
+        return True
 
     async def connect_data_manager(self) -> bool:
         """连接 DataManager（加载 CSV 数据到缓存）"""
         return self.data_manager.connect()
 
-    async def _collect_subscribed_symbols(self) -> set:
-        """收集策略订阅的所有 symbols"""
-        symbols = set()
-        for entry in self.engine.registry.list_strategies().values():
-            if entry.instance:
-                if hasattr(entry.instance, "subscribed_symbols"):
-                    symbols.update(entry.instance.subscribed_symbols)
-                elif hasattr(entry.instance, "symbol"):
-                    symbols.add(entry.instance.symbol)
-        return symbols
+    def _collect_subscribed_symbols(self) -> set:
+        """收集当前策略订阅的所有 symbols"""
+        inst = self.strategy
+        if inst is None:
+            return set()
+        subs = getattr(inst, "subscribed_symbols", None)
+        if subs:
+            return set(subs)
+        sym = getattr(inst, "symbol", None)
+        if sym:
+            return {sym}
+        return set(getattr(inst, "symbols", []) or [])
+
+    def _resolve_history_days(self, configured_days: int) -> int:
+        """取 settings.yaml 配置值与策略自述所需天数的较大值。
+
+        sync_history_days 是个与周期无关的固定值（默认 365），但所需天数
+        随周期线性增长。实测：30 天对 8h 只有 90 根、对 1d 只有 30 根，
+        均低于 ADX 的 100 根阈值。而指标层遇到数据不足只 `warnings.warn`
+        不阻断，冷启动后策略会拿着不准确的 ADX 直接发信号 —— 无异常、
+        无中断，只有一行 UserWarning，很难在实盘中被发现。
+
+        取较大值而非直接覆盖：配置值仍可用于**上调**（例如策略只要 21 天
+        但运维想多备一些），只是不再允许它把数据压到指标算不准的程度。
+        """
+        required = 0
+        inst = self.strategy
+        if inst is not None:
+            calc = getattr(inst, "_calc_required_history_days", None)
+            if callable(calc):
+                try:
+                    required = max(required, int(calc()))
+                except Exception as e:
+                    logging.warning(
+                        f"[{self.strategy_name}] 计算所需历史天数失败，"
+                        f"沿用配置值 {configured_days}: {e}"
+                    )
+
+        if required > configured_days:
+            logging.info(
+                f"[{self.strategy_name}] 历史数据天数 {configured_days} → "
+                f"{required}（策略指标预热需要，避免 ADX 等指标算不准）"
+            )
+            return required
+        return configured_days
 
     async def _load_historical_data(self, days: int) -> None:
         """
@@ -318,7 +357,7 @@ class StrategyProcessRunner:
         3. sync_to_latest — 补齐缺失的历史数据
         4. _preload_big_intervals_to_cache — 聚合大周期到内存
         """
-        symbols = await self._collect_subscribed_symbols()
+        symbols = self._collect_subscribed_symbols()
         for symbol in symbols:
             symbol_upper = symbol.upper()
             try:
@@ -346,6 +385,107 @@ class StrategyProcessRunner:
                     exc_info=True,
                 )
 
+    def _handle_signal(self, signal: Any) -> None:
+        """
+        统一信号处理：写 CSV，再由 SignalLogger 直连下单
+
+        策略只返回 Signal 对象，进程负责统一存储：
+        1. 统一生成 CtaSignalCSV 对象（确保数据一致）
+        2. SignalCsvWriter 写入 CSV
+        3. CSV 成功后 SignalLogger 直连下单
+
+        Args:
+            signal: Signal 对象
+        """
+        cfg = self.strategy_config or {}
+        params = build_signal_params(cfg)
+
+        # 使用 signal.strategy_id 作为策略名称（完整策略实例名，如 ICT_1D_3_BNBUSDT_LIVE）
+        # 用于 CSV 文件路径，与 history_positions 目录结构一致
+        strategy_full_name = signal.strategy_id or ""
+
+        # 从策略实例获取 trading_mode
+        trading_mode = getattr(self.strategy, "_trading_mode", "live")
+
+        # 获取调整后的资金（优先使用 metadata，否则使用配置）
+        adjusted_cash = signal.metadata.get("adjusted_cash", params.get("strategy_cash", 100))
+
+        cta_params = {
+            "strategy_name": strategy_full_name,
+            "strategy_version": params.get("strategy_version", cfg.get("version", "v1")),
+            "interval": params.get("strategy_internal", ""),
+            "strategy_params": dict(cfg.get("params", {}) or {}),
+            "strategy_cash": adjusted_cash,
+            "strategy_parts": params.get("strategy_parts", 1),
+            "strategy_valid_before": params.get(
+                "strategy_valid_before", cfg.get("valid_before", "2030-12-31 08:00:00")
+            ),
+            "strategy_type": params.get("strategy_type", "CTAFutureFactory"),
+            "strategy_type_name": params.get("strategy_type_name", ""),
+            "risk_strategy_type": params.get("risk_strategy_type", "cta_intraday"),
+            "user_id": params.get("user_id", 1),
+            "signal_exchange": params.get("signal_exchange", "binance"),
+            "signal_order_type": params.get("signal_order_type", 1),
+            "signal_slippage": params.get("signal_slippage", 0),
+            "pos_type": params.get("pos_type", 2),
+            "leverage": params.get("leverage", 5),
+            "risk_stop_loss_pct": params.get("StopLossThreshold", DEFAULT_STOP_LOSS_PCT),
+            "risk_trailing_profit_activation": params.get(
+                "TakeProfitBackThreshold", DEFAULT_TRAILING_PROFIT_ACTIVATION
+            ),
+            "risk_trailing_profit_drawdown": params.get(
+                "TakeProfitBackDynamicFallPercent", DEFAULT_TRAILING_PROFIT_DRAWDOWN
+            ),
+            "trading_mode": trading_mode,
+        }
+
+        # 1. 统一生成 CtaSignalCSV 对象
+        try:
+            cta_signal = CtaSignalCSV.from_signal(signal, **cta_params)
+        except Exception as e:
+            logging.error(f"[{self.strategy_name}] 信号数据生成失败: {e}")
+            return
+
+        # 2. 写入 CSV
+        csv_ok = True
+        if self.csv_writer:
+            try:
+                csv_ok = self.csv_writer.write_cta_signal(cta_signal)
+            except Exception as e:
+                logging.error(f"[{self.strategy_name}] CSV 写入失败: {e}")
+                csv_ok = False
+
+        # 3. 直连下单（CSV 失败时跳过，避免数据不一致）
+        if csv_ok:
+            try:
+                self.signal_logger.log_cta_signal(cta_signal)
+            except Exception as e:
+                logging.error(f"[{self.strategy_name}] 直连下单失败: {e}")
+
+    def _on_kline(self, kline: Any) -> None:
+        """
+        WS K 线回调：分发给策略实例，产生的信号统一落盘/下单
+
+        Args:
+            kline: Kline 对象
+        """
+        if not self._running or self.strategy is None or not self._strategy_started:
+            return
+
+        # 按 symbol 过滤：只处理本策略订阅的 symbol
+        kline_symbol = kline.symbol.upper() if hasattr(kline, "symbol") else None
+        subs = self._collect_subscribed_symbols()
+        if kline_symbol and subs and kline_symbol not in subs:
+            return
+
+        try:
+            signal = self.strategy.on_kline(kline)
+            # 如果生成信号，统一存储 CSV + 下单
+            if signal:
+                self._handle_signal(signal)
+        except Exception as e:
+            logging.error(f"[{self.strategy_name}] 处理 K 线更新失败：{e}")
+
     async def start(self) -> bool:
         """
         启动策略进程
@@ -366,25 +506,26 @@ class StrategyProcessRunner:
             logging.error(f"[{self.strategy_name}] 策略加载失败")
             return False
 
-        # 加载历史数据 —— 必须在 engine.start_all() 之前，
+        # 加载历史数据 —— 必须在 on_start() 之前，
         # 因为策略 on_start() 需要从缓存中读取 K 线数据初始化
-        # 天数来自 settings.yaml data_manager.sync_history_days（默认 30）
+        # 天数取 settings.yaml 的 sync_history_days 与策略
+        # _calc_required_history_days() 的较大值（见 _resolve_history_days）
         dm_global_config = self.global_config.get("data_manager", {})
-        history_days = dm_global_config.get("sync_history_days", 30)
+        configured_days = dm_global_config.get("sync_history_days", 365)
+        history_days = self._resolve_history_days(configured_days)
         await self._load_historical_data(days=history_days)
 
-        # 启动策略
-        results = self.engine.start_all()
-        for sid, success in results.items():
-            if success:
-                logging.info(f"[{self.strategy_name}] 策略 {sid} 已启动")
-            else:
-                logging.error(f"[{self.strategy_name}] 策略 {sid} 启动失败")
+        # 启动策略（on_start 失败不中止进程：实例保留但不再分发 K 线，
+        # 与原引擎的 ERROR 状态语义一致）
+        try:
+            self.strategy.on_start()
+            self._strategy_started = True
+            logging.info(f"[{self.strategy_name}] 策略已启动")
+        except Exception as e:
+            logging.error(f"[{self.strategy_name}] 策略启动失败: {e}", exc_info=True)
 
         # 注册 WS K 线分发回调
-        self.data_manager.set_kline_dispatch_callback(
-            lambda kline: self.engine.on_kline_update(kline)
-        )
+        self.data_manager.set_kline_dispatch_callback(self._on_kline)
 
         self._running = True
         return True
@@ -394,8 +535,11 @@ class StrategyProcessRunner:
         logging.info(f"[{self.strategy_name}] 策略进程停止")
         self._running = False
 
-        if self.engine:
-            self.engine.stop_all()
+        if self.strategy:
+            try:
+                self.strategy.on_stop()
+            except Exception as e:
+                logging.error(f"[{self.strategy_name}] 策略停止失败: {e}", exc_info=True)
 
         if self.data_manager:
             await self.data_manager.close()
@@ -404,32 +548,31 @@ class StrategyProcessRunner:
         """
         运行 WS 驱动的策略进程
 
-        WS 回调中直接调用 strategy.on_kline(kline)，
+        WS 回调中直接调用 self._on_kline(kline)，
         替代 CSV 轮询机制。
         """
         if not self._running:
             await self.start()
 
         # 收集策略订阅的 symbols
-        symbols = set()
-        for entry in self.engine.registry.list_strategies().values():
-            if entry.instance:
-                if hasattr(entry.instance, "subscribed_symbols"):
-                    symbols.update(entry.instance.subscribed_symbols)
-                elif hasattr(entry.instance, "symbol"):
-                    symbols.add(entry.instance.symbol)
+        symbols = self._collect_subscribed_symbols()
 
         if symbols:
-            logging.info(f"[{self.strategy_name}] 订阅 WS symbols: {symbols}")
+            logging.info(f"[{self.strategy_name}] 订阅实时行情 symbols: {symbols}")
 
-            # 启动实时数据服务（WebSocket）—— 先传 symbols，Binance 回退模式拼 URL 需要
-            ws_ok = await self.data_manager.start_klines_service_async(list(symbols))
-            if ws_ok:
-                # 订阅 symbols（自建模式发 subscribe 消息；Binance 模式已在 URL 订阅）
-                sub_ok = await self.data_manager.subscribe_klines_async(list(symbols))
-                # 日志已由 DataManager 根据实际数据源打印
-            else:
-                logging.warning(f"[{self.strategy_name}] 实时数据服务不可用，降级到 CSV 模式")
+        # 启动实时数据（Binance 公共 WS，REST 轮询回退）
+        if symbols:
+            ws_ok = await self.data_manager.start_realtime_async(list(symbols))
+            if not ws_ok:
+                logging.warning(f"[{self.strategy_name}] 实时行情不可用，降级到 CSV 模式")
+
+        # 启动定时维护（1m 缓存落盘 + 按配置裁剪，防止内存无界增长）
+        try:
+            self.data_manager.start_periodic_persistence()
+        except Exception as e:
+            logging.warning(
+                f"[{self.strategy_name}] 定时维护启动失败: {e}", exc_info=True,
+            )
 
         # 保持运行直到收到停止信号
         stop_event = asyncio.Event()
@@ -486,16 +629,19 @@ async def main():
     )
     parser.add_argument(
         "--log-level",
-        default="INFO",
+        default=None,
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="日志级别",
+        help="日志级别（未指定时读 LOG_LEVEL 环境变量，再默认 INFO）",
     )
 
     args = parser.parse_args()
 
+    # manager 用 LOG_LEVEL 环境变量透传 --log-level（run_strategies_manager.py 的
+    # build_strategy_command 不在子进程命令行带 --log-level）；直接运行本脚本时走 CLI
+    env_log_level = os.environ.get("LOG_LEVEL")
+    early_log_level_name = resolve_effective_log_level(args.log_level, env_log_level)
     # 尽早配置日志，确保后续所有日志输出都能正确写入
-    # 使用环境变量或命令行参数确定日志级别
-    early_log_level = getattr(logging, args.log_level, logging.INFO)
+    early_log_level = getattr(logging, early_log_level_name, logging.INFO)
     logging.basicConfig(
         level=early_log_level,
         format="%(asctime)s - [early] - %(name)s - %(levelname)s - %(message)s",
@@ -546,8 +692,8 @@ async def main():
     # 覆盖 symbol
     strategy_config["symbols"] = [args.symbol]
 
-    # 确定日志级别：策略配置优先，命令行参数其次，默认 INFO
-    log_level_str = resolve_log_level(args.log_level, strategy_config)
+    # 确定日志级别：策略配置优先，CLI/LOG_LEVEL 环境变量其次，默认 INFO
+    log_level_str = resolve_log_level(args.log_level or env_log_level, strategy_config)
     log_level = getattr(logging, log_level_str, logging.INFO)
 
     # 更新日志级别（如果需要）
@@ -578,6 +724,8 @@ async def main():
         logging.info(f"日志级别: {log_level_str}（来自策略配置）")
     elif args.log_level:
         logging.info(f"日志级别: {log_level_str}（来自命令行）")
+    elif env_log_level:
+        logging.info(f"日志级别: {log_level_str}（来自环境变量 LOG_LEVEL）")
     else:
         logging.info(f"日志级别: {log_level_str}（默认）")
 
@@ -596,7 +744,7 @@ async def main():
         strategy_dir=strategy_dir,
     )
 
-    # 注册 SIGTERM 信号处理器，确保 factory stop 时触发 on_stop()
+    # 注册 SIGTERM 信号处理器，确保停止时触发 on_stop()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 

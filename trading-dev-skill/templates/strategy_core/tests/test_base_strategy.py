@@ -12,6 +12,7 @@ import pandas as pd
 from strategy_core.base.strategy import BaseStrategy
 from strategy_core.base.core import BaseStrategyCore
 from strategy_core.base.state import BaseState
+from strategy_core.constants import INDICATOR_WARMUP_BARS, TF_MINUTES
 from strategy_core.signal_logging import Signal, SignalType
 
 
@@ -219,10 +220,10 @@ class TestCalcRequiredHistoryDays:
         }
         strategy = MockStrategy(data_manager=mock_data_manager, config=config)
 
-        # 4h 周期 15 根 K 线 = 15 * 4h = 60h = 2.5 天
-        # 加 5 天缓冲 = 7.5 天，取整 8 天，但最少 7 天
+        # 预热根数 INDICATOR_WARMUP_BARS 对应的天数 + 5 天缓冲，下限 7 天
         days = strategy._calc_required_history_days()
         assert days >= 7
+        assert days * 1440 / TF_MINUTES["4h"] >= INDICATOR_WARMUP_BARS
 
     def test_1d_timeframe_requires_more_days(self, mock_data_manager):
         """测试 1d 周期需要更多天数"""
@@ -233,13 +234,21 @@ class TestCalcRequiredHistoryDays:
         }
         strategy = MockStrategy(data_manager=mock_data_manager, config=config)
 
-        # 1d 周期 15 根 K 线 = 15 天
-        # 加 5 天缓冲 = 20 天
+        # 1d 是最大周期，预热 INDICATOR_WARMUP_BARS 根需要的天数远超下限
         days = strategy._calc_required_history_days()
         assert days >= 15
+        assert days * 1440 / TF_MINUTES["1d"] >= INDICATOR_WARMUP_BARS
 
-    def test_empty_timeframes_returns_minimum(self, mock_data_manager):
-        """测试空时间框架返回最小值"""
+    def test_empty_timeframes_falls_back_to_default(self, mock_data_manager):
+        """空 timeframes 时仍按 MockStrategy 注入的默认周期计算。
+
+        注意：这里**不会**走 `_calc_required_history_days` 的
+        `if not timeframes: return 7` 分支 —— MockStrategy 的
+        `_get_indicator_timeframes` 无条件 `tf_set.add(...默认 "1h")`，
+        所以集合永不为空。原断言 `== 7` 只是恰好等于 1h 在
+        bars_needed=15 下的结果，改成 100 根预热后变 9 天。
+        断言按 1h 的预期值算，并校验根数够 ADX。
+        """
         config = {
             "version": "1",
             "symbols": ["BTCUSDT"],
@@ -248,10 +257,19 @@ class TestCalcRequiredHistoryDays:
         strategy = MockStrategy(data_manager=mock_data_manager, config=config)
 
         days = strategy._calc_required_history_days()
-        assert days == 7  # 最小默认值
+        expected = max(
+            int((INDICATOR_WARMUP_BARS * TF_MINUTES["1h"]) / 1440 + 5), 7
+        )
+        assert days == expected
+        assert days * 1440 / TF_MINUTES["1h"] >= INDICATOR_WARMUP_BARS
 
-    def test_15m_timeframe_returns_minimum(self, mock_data_manager):
-        """测试 15m 周期返回最小值"""
+    def test_15m_timeframe_uses_max_of_15m_and_default(self, mock_data_manager):
+        """15m 与注入的默认 1h 取最大 → 按 1h 算。
+
+        原名"returns_minimum"和注释里的"15m 周期 15 根"都是误导：
+        MockStrategy 会把 "1h" 也加进集合，而 `_calc_required_history_days`
+        取最大周期，所以实际按 1h 算。
+        """
         config = {
             "version": "1",
             "symbols": ["BTCUSDT"],
@@ -259,10 +277,15 @@ class TestCalcRequiredHistoryDays:
         }
         strategy = MockStrategy(data_manager=mock_data_manager, config=config)
 
-        # 15m 周期 15 根 K 线 = 15 * 15m = 225m = 3.75 小时 < 1 天
-        # 最少 7 天
         days = strategy._calc_required_history_days()
-        assert days == 7
+        expected = max(
+            int((INDICATOR_WARMUP_BARS * TF_MINUTES["1h"]) / 1440 + 5), 7
+        )
+        assert days == expected
+        # 两个周期都必须够预热
+        for tf in ("15m", "1h"):
+            assert days * 1440 / TF_MINUTES[tf] >= INDICATOR_WARMUP_BARS
+
 
     def test_strategy_can_override_calculation(self, mock_data_manager):
         """测试策略可重写计算方法"""

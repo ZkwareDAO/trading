@@ -2,7 +2,7 @@
 """
 测试: DataManager.manage_memory_cache 方法
 
-保留近 2 天数据在内存，淘汰更老数据
+按 cache_1m_max_age_days / cache_1m_max_rows 裁剪 1m 内存缓存
 """
 
 import pytest
@@ -16,10 +16,15 @@ from data_manager.manager import DataManager, DataManagerConfig
 
 class TestManageMemoryCache:
 
-    def _make_manager(self, tmp_path: Path) -> DataManager:
+    def _make_manager(self, tmp_path: Path,
+                      max_age_days: int | None = None) -> DataManager:
+        kwargs = {}
+        if max_age_days is not None:
+            kwargs["cache_1m_max_age_days"] = max_age_days
         config = DataManagerConfig(
             csv_dir=str(tmp_path / "klines"),
-            klines_service_enabled=True,
+            realtime_enabled=True,
+            **kwargs,
         )
         dm = DataManager(config)
         dm.enable_kline_repository()
@@ -48,8 +53,8 @@ class TestManageMemoryCache:
         return pd.DataFrame(rows)
 
     def test_manage_memory_cache_removes_old_data(self, tmp_path):
-        """测试淘汰超过 2 天的旧数据"""
-        dm = self._make_manager(tmp_path)
+        """测试淘汰超过 cache_1m_max_age_days 的旧数据"""
+        dm = self._make_manager(tmp_path, max_age_days=2)
         df = self._make_mixed_age_df()
         dm.cache.put("BTCUSDT", "1m", df, force_1m=True)
 
@@ -68,6 +73,24 @@ class TestManageMemoryCache:
         for ts in cached['timestamp']:
             ts_dt = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
             assert ts_dt >= cutoff
+
+    def test_age_limit_follows_config(self, tmp_path):
+        """max_age_days 必须来自配置，不得硬编码。
+
+        同一份数据（含 3 天前的旧数据）在 max_age_days=2 时被裁剪，
+        在 max_age_days=90 时应完整保留。
+        """
+        dm_strict = self._make_manager(tmp_path, max_age_days=2)
+        dm_strict.cache.put("BTCUSDT", "1m", self._make_mixed_age_df(),
+                            force_1m=True)
+        dm_strict.manage_memory_cache("BTCUSDT")
+        assert len(dm_strict.cache.get_1m_data("BTCUSDT")) == 20
+
+        dm_loose = self._make_manager(tmp_path, max_age_days=90)
+        dm_loose.cache.put("BTCUSDT", "1m", self._make_mixed_age_df(),
+                           force_1m=True)
+        dm_loose.manage_memory_cache("BTCUSDT")
+        assert len(dm_loose.cache.get_1m_data("BTCUSDT")) == 30
 
     def test_manage_memory_cache_no_data(self, tmp_path):
         """测试无数据时不报错"""

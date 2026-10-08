@@ -121,7 +121,7 @@ backtest/batch_runner.py
 
 | 字段 | 回测侧（backtest/config/） | 实盘侧（overrides/） | 是否冲突 |
 |------|--------------------------|---------------------|---------|
-| `timeframes` / `cooldown_timeframe` | 4h | 8h | ❌ 冲突 |
+| `timeframes` | 4h | 8h | ❌ 冲突 |
 | `signal.exchange` | binance | hyperliquid | ❌ 冲突 |
 | `capital.max_cash` | 1000 | 200 | ❌ 冲突 |
 | `capital.leverage` | 5 | 1 | ❌ 冲突 |
@@ -198,10 +198,10 @@ backtest/batch_runner.py
 | `config.dev.yaml / config.test.yaml / config.prod.yaml` 多环境 (381行) | 代码无此加载逻辑 | 幻觉特性 |
 
 **同类问题**：`docs/SCRIPTS.md`（8 处引用 `backtest/config/main.yaml`）、`backtest/README.md`
-（5 处引用 legacy）、`docs/archive/straetegy-dev-guide.md`、若干测试文件。
+（5 处引用 legacy）、若干测试文件。
 
-`docs/OPEN_SOURCE_CONFIG_CI.md` 已有一份"配置收敛规划"，但它是 P1 规划文档且部分未落地——
-本文档是它的 P0 落地版，落地后应与该文合并或以本文为准。
+本文档是配置收敛的 P0 落地版；P2 候选事项（如 `scripts/validate_config.py`
+配置校验脚本）见下方问题清单，立项时再细化。
 
 ### 3.5 许可证与第三方合规（P2）
 
@@ -223,7 +223,7 @@ backtest/batch_runner.py
 | P1 | 文档 legacy 引用（SCRIPTS.md/backtest README 等） | §3.4 | 收敛后同步更新 |
 | P1 | 投资免责声明 | §3.5 | README 补充 |
 | P2 | NOTICE 文件 | §3.5 | 新增 |
-| P2 | 配置校验脚本 | OPEN_SOURCE_CONFIG_CI.md §2.1 | 落地 |
+| P2 | 配置校验脚本 | 新增 `scripts/validate_config.py`（尚未立项） | 落地 |
 
 ---
 
@@ -514,7 +514,6 @@ CLAUDE.md「禁止未来函数」那条红线的底层逻辑，在这里是"禁�
 | 内网 IP 泄漏 | `ARCHITECTURE.md:318,329,330,338,459,460,470` |
 | user_id 残留 | `strategies/sar_snt3_v3/overrides/*.yaml`（14）、`backtest/config/obv_atr_v2/*.yaml`（10） |
 | 文档过时 | `ARCHITECTURE.md` 第 5 章（314-381行）整章描述旧格式 |
-| 已有规划文档 | `docs/OPEN_SOURCE_CONFIG_CI.md`（P1 规划，本文是 P0 落地） |
 
 ---
 

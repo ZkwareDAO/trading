@@ -12,7 +12,6 @@
 import pytest
 import yaml
 from pathlib import Path
-from typing import Dict, Any
 
 from strategy_core.utils.strategies_loader import (
     StrategiesLoader,

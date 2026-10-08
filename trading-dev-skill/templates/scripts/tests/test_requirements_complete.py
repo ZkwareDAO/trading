@@ -26,7 +26,6 @@ IMPORT_TO_PACKAGE = {
     "yaml": "pyyaml",
     "dotenv": "python-dotenv",
     "talib": "ta-lib",
-    "kafka": "kafka-python-ng",
     "pandas_ta": "pandas-ta",
     "bt": "backtrader",
 }

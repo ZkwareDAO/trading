@@ -3,7 +3,7 @@
 # =============================================================================
 # 复制此文件到 config/settings.yaml 并根据实际环境填写
 #
-# 本文件说明系统级配置（数据管理、信号日志、策略引擎等）。
+# 本文件说明系统级配置（数据管理、信号日志、止损检测模式等）。
 # 策略运行配置在 strategies/<name>/overrides/<symbol>.yaml 中（per-symbol）。
 #
 # 使用方式：
@@ -12,64 +12,30 @@
 #   回测:   python -m backtest.run_backtest
 #
 # 模块说明：
-#   - strategy_engine: 策略引擎（factory 连接、止损检测模式）
-#   - data_manager:    数据管理器（K线 CSV + WebSocket 实时推送）
-#   - signal_logging:  信号日志（CSV 持久化 + Kafka 推送）
-#   - signal_hub:      Signal Hub（HTTP 推送信号到 Kafka 入口）
+#   - data_manager:    数据管理器（K线 CSV + Binance 实时行情）
+#   - signal_logging:  信号日志（CSV 持久化）
+#   - direct_trading:  交易所直连下单（存储信号后直接下单）
 #
-# 环境变量：用 ${VAR_NAME} 引用，未设置时该值为 None，对应功能自动降级：
-#   - KLINES_WS_URL / KLINES_HTTP_URL 未设 → 回退 Binance 公共 WS + fapi
-#   - FACTORY_ENDPOINT / POSITION_PROXY_URL 未设 → 跳过 factory 注册/心跳/回调、远程仓位不可用
-#   - KAFKA_BOOTSTRAP_SERVERS 未设 → kafka.enabled 保持 false
-#   - SIGNAL_HUB_ENDPOINT 未设 → signal_hub.enabled 应置 false（否则 HTTP 推送失败）
+# 交易所凭证不走 ${VAR} 占位：BINANCE_API_KEY / BINANCE_API_SECRET 只放 .env，
+# 由代码直接读环境变量，本文件不出现（避免有人误填明文后提交）。
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# 策略引擎配置
+# 止损止盈检测模式
 # -----------------------------------------------------------------------------
-# 管理策略生命周期。factory_endpoint / position_proxy_url 未配置时，
-# 策略以本地持久化仓位（data/positions/{strategy_id}.json）为准，独立运行。
-#
-# 关键字段：
-#   - factory_endpoint:    factory-service RPC 地址（策略注册/心跳）。None → 跳过
-#   - position_proxy_url:  Position 代理地址（远程仓位查询）。None → 不可用
-#   - strategies_dir:      策略子模块目录
-#   - callback_port/host:  回调服务（仅 factory_endpoint 配置时生效）
-#   - use_bar_high_low_for_exit: 止损止盈检测价格源
-# -----------------------------------------------------------------------------
-strategy_engine:
-  # factory-service 地址（策略通过此端口注册和发送心跳）
-  # 未配置时：跳过 factory-service 注册/心跳/回调，策略独立本地运行
-  factory_endpoint: "${FACTORY_ENDPOINT}"
-
-  # Position 代理地址（用于查询实时仓位）
-  # 未配置时：远程仓位查询不可用，策略以本地持久化仓位为准
-  position_proxy_url: "${POSITION_PROXY_URL}"
-
-  # 策略模块目录（存放各策略实现代码）
-  strategies_dir: "./strategies"
-
-  # 回调服务配置（仅 factory_endpoint 配置时生效）
-  # factory-service 通过此端口反向通知策略启停/暂停/参数变更
-  callback_port: 8892
-  callback_host: "0.0.0.0"  # 局域网访问 0.0.0.0，仅本机 127.0.0.1
-
-  # 止损止盈检测模式
-  # true:  使用 bar_high/bar_low（闭合 K 线最高/最低价，更准确检测 K 线内价格波动）
-  # false: 使用 current_price（K 线收盘价，简单但可能遗漏 K 线内的止损触发）
-  use_bar_high_low_for_exit: false
+# true:  使用 bar_high/bar_low（闭合 K 线最高/最低价，更准确检测 K 线内价格波动）
+# false: 使用 current_price（K 线收盘价，简单但可能遗漏 K 线内的止损触发）
+use_bar_high_low_for_exit: false
 
 # -----------------------------------------------------------------------------
 # 数据管理器配置
 # -----------------------------------------------------------------------------
-# K线数据源：CSV 本地文件 + WebSocket 实时推送。
-# klines_service_ws_url / klines_service_http_url 未配置时回退 Binance 公共源。
+# K线数据源：CSV 本地文件 + Binance 公共源实时推送（WebSocket 直连 fstream，
+# 历史下载直连 fapi），无中间服务。
 #
 # 关键字段：
 #   - csv_dir:                K线 CSV 文件目录
 #   - csv_filename_pattern:   CSV 文件命名格式（变量: {symbol}, {timeframe}）
-#   - klines_service_ws_url:  实时 K线 WebSocket 地址（None → 回退 Binance fstream）
-#   - klines_service_http_url: 历史 K线 HTTP 地址（None → 回退 Binance fapi）
 #   - cache_max_size:         内存缓存最大条数
 #   - sync_history_days:      启动时补齐历史数据天数上限（run_strategy.py 读取）
 # -----------------------------------------------------------------------------
@@ -86,26 +52,19 @@ data_manager:
   # 启动时是否自动加载数据（建议开启）
   auto_load: true
 
-  # klines_service 配置（实时 K线推送服务）
-  # 未配置时回退 Binance 公共 WS（fstream）+ fapi 历史下载
-  klines_service_enabled: true
-  klines_service_ws_url: "${KLINES_WS_URL}"      # WebSocket 地址
-  klines_service_http_url: "${KLINES_HTTP_URL}"  # HTTP 地址（历史下载备用）
-
-  # 启动时补齐历史数据的天数上限（run_strategy.py 读取，默认 30）
-  sync_history_days: 30
+  # 启动时补齐历史数据的天数上限（run_strategy.py 读取，默认 365）
+  sync_history_days: 365
 
 # -----------------------------------------------------------------------------
 # 信号日志配置
 # -----------------------------------------------------------------------------
-# 信号存储：CSV 持久化 + Kafka 实时推送（可选）。
-# paper_trading 模式下不发 Kafka / HTTP，仅写 CSV。
+# 信号存储：CSV 持久化；下单走 direct_trading 交易所直连（见下方配置）。
+# paper_trading 模式下不下单，仅写 CSV。
 #
 # 关键字段：
 #   - storage.type: 存储类型（目前仅支持 csv）
 #   - storage.path: 信号 CSV 存储目录（按 strategy_id 分子目录）
 #   - retention_days: 信号保留天数（自动清理）
-#   - kafka.enabled: 是否启用 Kafka 推送
 # -----------------------------------------------------------------------------
 signal_logging:
   # 存储配置
@@ -116,51 +75,37 @@ signal_logging:
   # 信号保留天数（超过此天数的信号会被自动清理）
   retention_days: 90
 
-  # 是否启用实时推送（Kafka/HTTP）
-  enable_realtime_push: true
-
-  # Kafka 配置（可选，用于推送信号到下游系统）
-  kafka:
-    enabled: false                                    # 是否启用 Kafka 推送
-    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"   # Kafka 集群地址
-    topic: "strategy_signals"                         # 推送主题
-
-    # SASL 认证（如 Kafka 需要认证，取消注释并填写）
-    # sasl_mechanism: "PLAIN"
-    # sasl_username: ""
-    # sasl_password: ""
-
-    # SSL 配置（如 Kafka 需要 SSL，取消注释并填写）
-    # ssl_cafile: ""
-
-    # 生产者配置
-    max_retries: 3              # 最大重试次数
-    retry_backoff_ms: 1000      # 重试间隔（毫秒）
-    acks: "all"                 # 确认级别（all = 所有副本确认）
-    compression: "gzip"         # 压缩算法（gzip/snappy/lz4/zstd）
-
-    # 去重配置（避免重复推送相同信号）
-    dedup_file: "./data/signals/.kafka_sent_ids"    # 已推送信号 ID 文件
-    dedup_max_size: 10000                           # 去重文件最大条数
-
 # -----------------------------------------------------------------------------
-# Signal Hub 配置（HTTP 推送信号到 Kafka 入口）
+# 交易所直连下单配置
 # -----------------------------------------------------------------------------
-# Signal Hub: 接收策略信号并转发到 Kafka 下游（下单/风控系统）。
-# 未配置 endpoint 时应置 enabled: false，否则 HTTP 推送会失败重试。
+# 启用后策略产生的信号在落盘后直接调用交易所 REST 下单。
+#
+# 前置条件（缺一不可，否则拒单）：
+#   1. .env 中配置 BINANCE_API_KEY / BINANCE_API_SECRET（只勾合约权限，禁提现，绑 IP）
+#   2. 币安账户为单向持仓模式（One-way Mode），双向持仓（Hedge Mode）会被拒单
+#   3. overrides/<symbol>.yaml 中 signal.exchange 必须为 binance，其他值一律拒单
+#
+# trading_mode 与下单的关系（容易误判，务必看清）：
+#   live    → 会下真单
+#   smoking → 会下真单（冒烟模式就是用真单验证全链路）
+#   paper_trading → 不下单（唯一有防线的模式）
+# 不想下真单时必须用 paper_trading，smoking 兜不住。
 #
 # 关键字段：
-#   - enabled:  是否启用 Signal Hub 推送
-#   - endpoint: Signal Hub 服务地址
-#   - api_path: API 路径（v1 包装结构 / v2 直接序列化，由 http_sender 按版本号决定 payload）
+#   - enabled:     是否启用直连下单
+#   - exchange:    交易所标识，目前仅支持 binance U 本位合约
+#   - testnet:     是否走测试网（首次接入务必先 true 验证）
+#   - recv_window: 签名请求有效窗口（毫秒），过小易因时钟偏移被拒
+#   - timeout:     单次 REST 请求超时（秒）
+#   - max_retries: 重试次数，仅对网络异常与 5xx 生效；4xx 是交易所明确拒绝，一律不重试
 # -----------------------------------------------------------------------------
-signal_hub:
-  enabled: true                              # 是否启用 Signal Hub 推送
-  endpoint: "${SIGNAL_HUB_ENDPOINT}"         # Signal Hub 服务地址
-
-  # API 路径（v1 包装结构 / v2 直接序列化，由 http_sender 按版本号决定 payload）
-  api_path: "/api/v1/kafka/message"  # v1 版本
-  # api_path: "/api/v2/signals"      # v2 版本（切换时注释上面，启用这行）
+direct_trading:
+  enabled: false        # 是否启用直连下单
+  exchange: "binance"   # 目前仅支持 binance U 本位合约
+  testnet: false        # true → testnet.binancefuture.com
+  recv_window: 5000     # 签名请求有效窗口（毫秒）
+  timeout: 10.0         # 单次请求超时（秒）
+  max_retries: 2        # 仅对网络异常与 5xx 重试；4xx 一律不重试
 
 # =============================================================================
 # 配置加载与优先级说明

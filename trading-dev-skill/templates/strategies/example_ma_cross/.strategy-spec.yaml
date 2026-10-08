@@ -1,0 +1,43 @@
+strategy_name: example_ma_cross
+prefix: EXAMPLEMACROSS
+direction: neutral
+timeframes: [4h]
+symbols: [BTCUSDT]
+
+entry:
+  description: "双均线交叉：MA10 上穿/下穿 MA30，价差越大信号越强"
+  conditions:
+    - "MA10 由 <= MA30 变为 > MA30（金叉）做多；反之死叉做空"
+    - "入场价优先使用 realtime_price（1m 实时价），退回 4h 已闭合收盘价"
+    - "strength：快慢线价差 >= strong_spread_pct 为 0.8，否则 0.6"
+
+exit:
+  stop_loss: "入场价 ± stop_loss_pct%（多头在下方）"
+  trailing_stop: ""
+  signal_reversal: ""
+  note: "回落止盈/固定止盈由 overrides 的 risk 段统一风控兜底，策略内不实现"
+
+state_fields:
+  - name: ma_fast_at_entry
+    type: float
+    default: 0.0
+    persist: true
+  - name: ma_slow_at_entry
+    type: float
+    default: 0.0
+    persist: true
+  - name: latest_ma_fast
+    type: float
+    default: 0.0
+    persist: false
+  - name: latest_ma_slow
+    type: float
+    default: 0.0
+    persist: false
+
+default_params:
+  ma_timeframes: 4h
+  ma_fast_period: 10
+  ma_slow_period: 30
+  stop_loss_pct: 2.0
+  strong_spread_pct: 0.3

@@ -3,7 +3,7 @@
 
 验证：
 1. SignalCsvWriter 使用完整策略名（如 ICT_1D_3_BNBUSDT_LIVE）作为目录
-2. engine._log_signal_unified 传入完整策略名而非基础名
+2. runner._handle_signal 传入完整策略名而非基础名
 """
 
 import csv
@@ -151,20 +151,19 @@ class TestSignalDirectoryUsesFullStrategyName:
             assert full_dir.exists(), f"应创建完整名目录 {full_dir}"
 
 
-class TestEnginePassesFullStrategyName:
-    """测试 engine 传入完整策略名"""
+class TestRunnerPassesFullStrategyName:
+    """测试 runner 传入完整策略名"""
 
-    def test_engine_uses_signal_strategy_id_as_directory(self, tmp_path):
+    def test_runner_uses_signal_strategy_id_as_directory(self, tmp_path):
         """
-        engine._log_signal_unified 应使用 signal.strategy_id 作为目录名
+        runner._handle_signal 应使用 signal.strategy_id 作为目录名
 
-        当前 engine.py:329 将 strategy_full_name 截断为基础名：
-            strategy_base_name = strategy_full_name.split('_')[0]
-
-        应改为直接使用 strategy_full_name
+        原实现（engine._log_signal_unified）曾将 strategy_full_name 截断为
+        基础名，导致不同策略实例的信号混入同一目录。已改为直接使用
+        strategy_full_name。
         """
         from unittest.mock import MagicMock, patch
-        from strategy_core.strategy_engine.engine import StrategyEngine
+        from run_strategy import StrategyProcessRunner
 
         # 创建真实的 csv_writer 以验证目录结构
         from strategy_core.signal_logging.csv_adapter import SignalCsvWriter
@@ -172,11 +171,14 @@ class TestEnginePassesFullStrategyName:
 
         signal_logger = MagicMock()
 
-        engine = StrategyEngine(
-            strategies_dir=str(tmp_path),
-            csv_writer=csv_writer,
-            signal_logger=signal_logger,
-        )
+        # 构建最小 Runner（绕过 __init__）
+        runner = StrategyProcessRunner.__new__(StrategyProcessRunner)
+        runner.strategy_name = "ICT_1D_3_NEARUSDT_LIVE"
+        runner.strategy_config = {"version": "v3"}
+        runner.strategy = None
+        runner.csv_writer = csv_writer
+        runner.signal_logger = signal_logger
+        # _handle_signal 会从 strategy 实例读 _trading_mode，此处无实例则取默认 live
 
         # 创建 signal，strategy_id 是完整策略名
         signal = MagicMock()
@@ -191,18 +193,8 @@ class TestEnginePassesFullStrategyName:
         signal.direction = "long"
         signal.metadata = {"reason": "test"}
 
-        # 创建 entry
-        entry = MagicMock()
-        entry.config = {"version": "v3"}
-        entry.strategy_id = "test_001"
-        entry.strategy_name = "ICT_1D_3_NEARUSDT_LIVE"
-        entry.instance = MagicMock()
-        entry.instance._trading_mode = "live"
-
-        params = {"user_id": 1, "strategy_type": "CTAFutureFactory"}
-
-        # 调用 _log_signal_unified
-        engine._log_signal_unified(signal, params, entry)
+        # 调用 _handle_signal
+        runner._handle_signal(signal)
 
         # 验证 CSV 写入到完整策略名目录
         expected_dir = tmp_path / "ICT_1D_3_NEARUSDT_LIVE"
@@ -215,5 +207,5 @@ class TestEnginePassesFullStrategyName:
         base_dir = tmp_path / "ICT"
         assert not base_dir.exists(), (
             f"不应创建基础名目录 'ICT'，"
-            f"当前 engine.py:336 截断了策略名"
+            f"策略名被截断了"
         )

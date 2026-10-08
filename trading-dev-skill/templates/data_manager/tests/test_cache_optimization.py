@@ -98,7 +98,7 @@ class TestDataFrameCached:
 
     def setup_method(self):
         self.tmpdir = tempfile.mkdtemp()
-        config = DataManagerConfig(csv_dir=self.tmpdir, klines_service_enabled=False)
+        config = DataManagerConfig(csv_dir=self.tmpdir, realtime_enabled=False)
         self.dm = DataManager(config)
         self.dm.connect()
         self.dm.enable_kline_repository()

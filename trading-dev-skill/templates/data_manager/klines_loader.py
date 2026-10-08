@@ -13,7 +13,7 @@ import concurrent.futures
 import sys
 from pathlib import Path
 from datetime import date, datetime, timedelta
-from typing import List, Optional, Union
+from typing import Optional, Union
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -273,17 +273,28 @@ def load_klines_data(
 
 
 def resample_ohlcv(
-    df: pd.DataFrame, target_frequency: str, datetime_column: str = "datetime"
+    df: pd.DataFrame,
+    target_frequency: str,
+    datetime_column: str = "datetime",
+    drop_partial_head: bool = False,
 ) -> pd.DataFrame:
     """
     将 K 线数据重采样到目标周期
 
     支持的目标周期：1m, 5m, 15m, 30m, 1h, 2h, 4h, 1d, 1w
 
+    时间戳语义：所有周期的 timestamp 均为该桶的 open_time（左闭区间起点），
+    与 Binance K 线一致。周线锚定周一 00:00 UTC（pandas 默认锚周日，已显式
+    改为 W-MON + label/closed="left"）。
+
     参数:
         df: 输入 DataFrame，需包含 datetime 列和 OHLCV 列
         target_frequency: 目标周期（如 "1h", "4h", "1d"）
         datetime_column: 时间列名
+        drop_partial_head: 源数据起点未落在目标周期边界上时，丢弃首个
+            残缺桶。该桶只含所属周期的后半段，open/high/low/volume
+            均失真，且调用方通常会用它覆盖已有的正确值。末尾未闭合
+            桶不受影响（由 get_closed_data 负责剔除）。
 
     返回:
         重采样后的 DataFrame，timestamp 列带 UTC 时区
@@ -312,7 +323,15 @@ def resample_ohlcv(
 
     df.set_index(datetime_column, inplace=True)
 
-    # 重采样规则
+    # 记录源数据起点，用于判断首桶是否残缺
+    source_start = df.index.min() if len(df) else None
+
+    # 重采样规则。
+    # count / trade_num 是同一份"成交笔数"在两套 schema 下的名字：
+    # Binance 历史 CSV 用 count，实时链路（Kline.trade_num）用 trade_num。
+    # 与 taker_buy_*/active_buy_* 那对别名同理，两个都要列出——漏掉
+    # trade_num 会让聚合产物比 1m 源少一列，进而在 _append_to_csv
+    # 触发列错位（见 test_schema_consistency.py）。
     agg_dict = {
         "open": "first",
         "high": "max",
@@ -321,6 +340,7 @@ def resample_ohlcv(
         "volume": "sum",
         "quote_volume": "sum",
         "count": "sum",
+        "trade_num": "sum",
         "taker_buy_volume": "sum",
         "taker_buy_quote_volume": "sum",
         "active_buy_volume": "sum",
@@ -332,18 +352,44 @@ def resample_ohlcv(
 
     # pandas 频率格式处理
     freq = target_frequency
+    resample_kwargs = {}
     if freq.endswith("m") and not freq.endswith("min"):
         freq = freq[:-1] + "min"
     elif freq.endswith("d"):
         freq = freq[:-1] + "D"
+    elif freq.endswith("w"):
+        # 周线必须显式锚定，pandas 默认与交易所约定有两处不符：
+        # 1. 默认 "W" == "W-SUN"，桶边界落在周日；Binance 周线 open_time
+        #    是周一 00:00 UTC（已通过 fapi/v1/klines?interval=1w 核对）。
+        # 2. W 系列的 label/closed 默认在区间【右】端，与 tick 类频率
+        #    （h/min，左端=open_time）相反。若不改，写进 CSV 的 timestamp
+        #    不是 open_time，且 drop_partial_head 的
+        #    `source_start > first_bucket` 判据失效——首桶标签比源起点还晚，
+        #    残缺周永远检测不出来。
+        # 注意 1d/3d 无此问题：D 系列 label 本就在左端。
+        weeks = freq[:-1]
+        freq = f"{weeks}W-MON"
+        resample_kwargs = {"label": "left", "closed": "left"}
 
-    # 对于 4h 周期，使用 origin='epoch' 确保时间戳对齐到 UTC 00:00/04:00/08:00/12:00/16:00/20:00
-    if target_frequency in ("4h", "2h", "6h", "8h", "12h"):
-        resampled = df.resample(freq, origin="epoch").agg(existing_cols)
-    else:
-        resampled = df.resample(freq).agg(existing_cols)
+    # 2h/4h/6h/8h/12h 能整除 24h，从首日午夜（默认 origin="start_day"）与从
+    # epoch 推出的网格必然重合，故不需要 origin="epoch"——它对这些周期是
+    # no-op，且对非 tick 频率（D/W）还会触发 pandas RuntimeWarning。
+    resampled = df.resample(freq, **resample_kwargs).agg(existing_cols)
 
     resampled = resampled.dropna().reset_index()
+
+    # 丢弃残缺首桶：源数据起点晚于首桶的周期边界，说明该桶前半段缺失
+    if drop_partial_head and source_start is not None and not resampled.empty:
+        first_bucket = resampled[datetime_column].iloc[0]
+        if source_start > first_bucket:
+            resampled = resampled.iloc[1:].reset_index(drop=True)
+            logger.debug(
+                f"重采样到 {target_frequency}: 丢弃残缺首桶 {first_bucket} "
+                f"(源数据起点 {source_start})"
+            )
+
+    if resampled.empty:
+        return resampled
 
     # 确保时间戳带 UTC 时区（与 1m 数据一致）
     if resampled[datetime_column].dt.tz is None:

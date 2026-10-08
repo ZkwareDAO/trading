@@ -1,7 +1,7 @@
 """
 Signal CSV Adapter - 信号 CSV 格式转换器
 
-将策略信号转换为 CSV 格式，支持后续转换为 JSON 格式发送到 Kafka。
+将策略信号转换为 CSV 格式，支持后续转换为 JSON 格式外发（Signal Hub / 直连下单）。
 
 JSON 结构 (对齐设计文档):
 {
@@ -52,7 +52,7 @@ class CtaSignalCSV:
     字段对应 JSON 结构的 strategy 和 signal 两部分
     """
 
-    # ========== SignalID (不传到 Kafka，用于内部追踪) ==========
+    # ========== SignalID (不进外发 payload，用于内部追踪) ==========
     signal_id: str = field(default_factory=lambda: f"sig_{uuid.uuid4().hex[:12]}")
 
     # ========== 基础字段 ==========
@@ -62,7 +62,7 @@ class CtaSignalCSV:
 
     # ========== strategy 配置字段 (从 config.yaml 读取) ==========
     strategy_type: str = "CTAFutureFactory"   # 策略类型
-    strategy_type_name: str = ""          # 策略类型名称（Kafka strategy.name）
+    strategy_type_name: str = ""          # 策略类型名称（JSON strategy.name）
     risk_strategy_type: str = "cta_intraday"  # 风控策略类型
     user_id: int = 1                     # 用户 ID
     strategy_name: str = ""         # 策略名称 (如 RBreakerv1_1m_IF2406)
@@ -152,7 +152,7 @@ class CtaSignalCSV:
 
     def to_json(self, user_id: Optional[int] = None) -> dict:
         """
-        转换为 JSON 格式 (发送到 Kafka)
+        转换为 JSON 格式 (外发 payload)
 
         Args:
             user_id: 用户 ID (默认使用 self.user_id)
@@ -219,7 +219,7 @@ class CtaSignalCSV:
         strategy_cash: float = 100,
         strategy_parts: int = 1,
         strategy_type: str = "CTAFutureFactory",
-        strategy_type_name: str = "",  # 策略类型名称（Kafka strategy.name）
+        strategy_type_name: str = "",  # 策略类型名称（JSON strategy.name）
         risk_strategy_type: str = "cta_intraday",
         user_id: int = 1,
         signal_exchange: str = "binance",

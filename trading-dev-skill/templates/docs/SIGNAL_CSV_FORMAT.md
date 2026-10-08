@@ -1,7 +1,7 @@
 # 策略信号格式规范
 
 **版本**: 2.3
-**更新日期**: 2026-06-26
+**更新日期**: 2026-09-03
 
 本文档定义了量化交易策略系统输出的交易信号格式标准，用于 Python 策略层与 Go 交易执行层之间的数据交换。
 
@@ -16,10 +16,10 @@ CtaSignalCSV.from_signal() 统一生成数据对象
         ↓
    ┌────┴────┐
    ↓         ↓
-CSV 存储   HTTP/Kafka 推送
+CSV 存储   直连下单（单体模式唯一信号出口）
 ```
 
-**关键原则**：CSV、HTTP、Kafka 三种输出使用同一个 `CtaSignalCSV` 对象，确保数据完全一致。
+**关键原则**：CSV、直连下单两种输出使用同一个 `CtaSignalCSV` 对象，确保数据完全一致。
 
 ---
 
@@ -31,7 +31,7 @@ CSV 存储   HTTP/Kafka 推送
 
 ```python
 def generate_signal_id(
-    strategy_type: str,      # 如 "cta_rbreaker"
+    strategy_type: str,      # 如 "sar_snt3_v3"
     symbol: str,             # 如 "BTCUSDT"
     kline_timestamp: datetime,  # 1m K线时间戳
     signal_type: str,        # "buy"/"sell"/"buy_close"/"sell_close"
@@ -55,7 +55,7 @@ sig_{16位SHA256哈希}
 | 场景 | signal_id |
 |------|-----------|
 | 实盘 CSV | `sig_4e6830a085ddbd33` |
-| 实盘 Kafka | `sig_4e6830a085ddbd33` |
+| 实盘 HTTP | `sig_4e6830a085ddbd33` |
 | 实盘 HTTP | `sig_4e6830a085ddbd33` |
 | 回测 CSV | `sig_4e6830a085ddbd33` |
 
@@ -89,7 +89,7 @@ data/signals/{strategy_id}/{date}.csv
 - `strategy_id`: 完整策略实例名，格式 `{PREFIX}_{INTERVAL}_{VERSION}_{SYMBOL}_{MODE}`
 - 与 `data/history_positions/` 目录结构一致，便于信号与仓位对应分析
 
-示例：`data/signals/ICT_1D_3_BNBUSDT_LIVE/20260624.csv`
+示例：`data/signals/SARSNT3_8H_3_BTCUSDT_LIVE/20260624.csv`
 
 ### CSV 字段定义
 
@@ -102,7 +102,7 @@ data/signals/{strategy_id}/{date}.csv
 | `strategy_type` | string | 策略类型 | `CTAFutureFactory` |
 | `risk_strategy_type` | string | 风控策略类型 | `cta_intraday` |
 | `user_id` | int | 用户 ID | `1` |
-| `strategy_name` | string | 策略名称 | `RBreaker_v2` |
+| `strategy_name` | string | 策略名称 | `SARSNT3_V3` |
 | `strategy_version` | string | 策略版本 | `v2` |
 | `strategy_internal` | string | K 线周期 | `1m` |
 | `strategy_params` | string | 策略参数 (JSON) | `{"threshold":0.005,"StopLossThreshold":-0.02}` |
@@ -123,16 +123,14 @@ data/signals/{strategy_id}/{date}.csv
 
 ---
 
-## JSON 格式 (HTTP/Kafka)
+## JSON 格式（本地备份 / 下单 payload）
 
-### 发送结构
+单体模式下 JSON 有两个用途：
+- **JSON 本地备份**：配置 `json_backup_dir` 时，信号以 `cta.to_json()` 结构写入备份目录
+- **直连下单 payload**：`BinanceTrader.execute()` 消费的即是同一份 `CtaSignalCSV.to_json()` 数据
 
-```json
-{
-  "topic": "strategy_signals",
-  "message": "{...JSON...}"
-}
-```
+（历史上外层还有 `{"topic": "...", "message": "..."}` 的包装结构，属 signal_hub HTTP
+推送通道专用，已随单体化删除。）
 
 ### JSON 字段结构
 
@@ -145,12 +143,12 @@ data/signals/{strategy_id}/{date}.csv
   "strategy_type": "CTAFutureFactory",
   "risk_strategy_type": "cta_intraday",
   "strategy": {
-    "name": "RBreaker",
-    "version": "v2",
+    "name": "SARSNT3",
+    "version": "3",
     "internal": "1m",
-    "description": "RBreaker_v2 strategy",
+    "description": "SARSNT3_V3 strategy",
     "params": {
-      "threshold": 0.005,
+      "sar_step": 0.015,
       "StopLossThreshold": -0.02,
       "TakeProfitBackThreshold": 0.05,
       "TakeProfitBackDynamicFallPercent": 0.05
@@ -180,7 +178,7 @@ data/signals/{strategy_id}/{date}.csv
 
 ### 字段说明
 
-| 字段名 | 类型 | 说明 | 配置示例 | Kafka 输出 |
+| 字段名 | 类型 | 说明 | 配置示例 | JSON 输出 |
 |--------|------|------|----------|------------|
 | `StopLossThreshold` | float | 止损阈值（负数） | `2.0` (表示 2%) | `-0.02` |
 | `TakeProfitBackThreshold` | float | 止盈回撤激活阈值 | `5.0` (表示 5%) | `0.05` |
@@ -190,7 +188,7 @@ data/signals/{strategy_id}/{date}.csv
 
 - **配置文件**：使用百分比整数形式，如 `2.0` 表示 2%
 - **内部计算**：`RiskController` 使用百分比形式，便于直观理解
-- **Kafka 输出**：转换为小数形式，如 `0.02` 表示 2%
+- **JSON 输出**：转换为小数形式，如 `0.02` 表示 2%
 
 ### 重要说明
 
@@ -216,7 +214,7 @@ cta_signal = CtaSignalCSV.from_signal(signal, **strategy_params)
 # CSV 写入
 csv_writer.write_cta_signal(cta_signal)
 
-# HTTP/Kafka 发送
+# 直连下单（单体模式唯一信号出口）
 signal_logger.log_cta_signal(cta_signal)
 ```
 
@@ -228,9 +226,10 @@ engine.py:_log_signal_unified()
 CtaSignalCSV.from_signal() → 同一对象
     ├── csv_writer.write_cta_signal()
     └── signal_logger.log_cta_signal()
-            ├── http_sender.send_cta_signal()
-            └── kafka_producer.send_cta_signal()
+            └── binance_trader.execute()        # direct_trading 通道（单体模式唯一信号出口）
 ```
+
+注：历史上的 `http_sender.send_cta_signal()`（signal_hub 通道）已随单体化删除。
 
 ---
 
@@ -239,20 +238,21 @@ CtaSignalCSV.from_signal() → 同一对象
 ### 策略配置 (config.yaml)
 
 ```yaml
-cta_rbreaker:
-  version: "v2"
+sar_snt3_v3:
+  version: '3'
   symbols: ["BTCUSDT"]
-  timeframes: ["1m"]
+  timeframes: ["8h"]
   direction: neutral
   params:
-    threshold: 0.005
+    sar_step: 0.015
+    adx_threshold: 25
   risk:
-    stop_loss_pct: 0.02
+    fixed_stop_loss_pct: 2.0
     trailing_profit_activation: 0.05
     trailing_profit_drawdown: 0.05
   signal:
     min_strength: 0.5
-    cooldown_ms: 60000
+    cooldown_ms: 0
 ```
 
 ### 系统配置 (settings.yaml)
@@ -262,15 +262,14 @@ signal_logging:
   storage:
     type: "csv"
     path: "./data/signals"
-  kafka:
-    enabled: true
-    bootstrap_servers: "${KAFKA_BOOTSTRAP_SERVERS}"
-    topic: "strategy_signals"
 
-signal_hub:
-  enabled: true
-  endpoint: "${SIGNAL_HUB_ENDPOINT}"
+direct_trading:          # 单体模式唯一信号出口：存储后直连交易所下单
+  enabled: false
+  testnet: false
 ```
+
+注：历史上的 `signal_hub` 段（HTTP 推送配置）已随单体化删除，凭证统一放 .env
+（`BINANCE_API_KEY` / `BINANCE_API_SECRET`），详见 docs/claude/operations.md。
 
 ---
 
@@ -280,7 +279,7 @@ signal_hub:
 |------|------|----------|
 | 1.0 | 2025-03 | 初始版本 |
 | 1.1 | 2025-03 | 新增 CTA/ICT 策略适配指南 |
-| 2.0 | 2026-05-09 | 统一 CSV/HTTP/Kafka 数据格式，风控字段一致性，StopLossThreshold 负数处理 |
+| 2.0 | 2026-05-09 | 统一 CSV/HTTP 数据格式，风控字段一致性，StopLossThreshold 负数处理 |
 | 2.1 | 2026-05-18 | 新增确定性 signal_id 生成机制，实盘/回测 ID 一致性保证 |
-| 2.2 | 2026-06-05 | 风控参数 Kafka 输出从百分比整数改为小数形式（20→0.2） |
+| 2.2 | 2026-06-05 | 风控参数 JSON 输出从百分比整数改为小数形式（20→0.2） |
 | 2.3 | 2026-06-26 | 信号目录结构改为完整策略实例名，与 history_positions 一致 |

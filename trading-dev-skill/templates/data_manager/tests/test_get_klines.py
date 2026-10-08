@@ -48,7 +48,7 @@ class TestGetKlines:
         config = DataManagerConfig(
             csv_dir=self.tmpdir,
             preload_1m_enabled=False,
-            klines_service_enabled=False,
+            realtime_enabled=False,
         )
         self.dm = DataManager(config)
         self.dm.connect()

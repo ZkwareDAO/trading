@@ -1,6 +1,11 @@
 #!/usr/bin/env python3
 """
 Klines WebSocket 客户端测试
+
+单体模式：客户端直连 Binance 公共 fstream combined-stream，
+streams 固定在连接 URL 中（无 subscribe/unsubscribe 消息协议），
+旧 klines_service 协议（subscribe 消息 / _parse_kline_data）的用例
+已随通道移除，改测 _parse_binance_kline / _message_handler。
 """
 
 import asyncio
@@ -11,14 +16,42 @@ from datetime import datetime, timezone
 from data_manager.klines_ws_client import KlinesWebSocketClient, Kline
 
 
+def _binance_kline_msg(symbol="BTCUSDT", ts_ms=1712548800000):
+    """构造 Binance combined-stream kline 消息"""
+    return {
+        "stream": f"{symbol.lower()}@kline_1m",
+        "data": {
+            "e": "kline",
+            "E": ts_ms + 1000,
+            "s": symbol,
+            "k": {
+                "t": ts_ms,          # open_time
+                "T": ts_ms + 59999,  # close_time
+                "s": symbol,
+                "i": "1m",
+                "o": "50000.00",
+                "h": "50100.00",
+                "l": "49900.00",
+                "c": "50050.00",
+                "v": "100.50",
+                "q": "5025000.00",
+                "n": 1234,
+                "V": "50.25",
+                "Q": "2512500.00",
+                "x": True,
+            },
+        },
+    }
+
+
 class TestKlinesWebSocketClient:
     """WebSocket 客户端测试"""
 
     def test_init_default_values(self):
-        """测试默认初始化"""
+        """测试默认初始化（单体模式：直连 Binance 公共 combined-stream）"""
         client = KlinesWebSocketClient()
 
-        assert client.ws_url == "ws://127.0.0.1:17081/ws/klines"
+        assert client.ws_url == "wss://fstream.binance.com/stream"
         assert client.symbols == []
         assert client.reconnect_delay == 5.0
         assert client.max_reconnect == 5
@@ -87,95 +120,13 @@ class TestKlinesWebSocketClient:
         assert client._connected is False
         mock_ws.close.assert_called_once()
 
-    @pytest.mark.asyncio
-    async def test_subscribe_sends_message(self):
-        """测试订阅发送消息"""
-        client = KlinesWebSocketClient()
-        client._connected = True
-        client._ws = AsyncMock()
-
-        await client.subscribe(["BTCUSDT", "ETHUSDT"])
-
-        expected_message = '{"action": "subscribe", "symbols": ["BTCUSDT", "ETHUSDT"]}'
-        client._ws.send.assert_called_once_with(expected_message)
-
-    @pytest.mark.asyncio
-    async def test_subscribe_when_not_connected(self):
-        """测试未连接时订阅"""
-        client = KlinesWebSocketClient()
-        client._connected = False
-
-        with pytest.raises(RuntimeError, match="Not connected"):
-            await client.subscribe(["BTCUSDT"])
-
-    @pytest.mark.asyncio
-    async def test_subscribe_deduplicates_symbols(self):
-        """测试订阅时去重 symbols - 防止重连时累积重复"""
-        client = KlinesWebSocketClient()
-        client._connected = True
-        client._ws = AsyncMock()
-        client.symbols = ["BTCUSDT", "ETHUSDT"]  # 已有订阅
-
-        # 再次订阅相同 symbols
-        await client.subscribe(["BTCUSDT", "ETHUSDT", "SOLUSDT"])
-
-        # symbols 列表应该去重，不应有重复
-        assert client.symbols == ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-        assert len(client.symbols) == 3  # 只有 3 个，不是 5 个
-
-    @pytest.mark.asyncio
-    async def test_subscribe_multiple_times_no_duplication(self):
-        """测试多次订阅同一 symbols 不累积重复"""
-        client = KlinesWebSocketClient()
-        client._connected = True
-        client._ws = AsyncMock()
-
-        # 模拟重连场景：多次订阅同一列表
-        for _ in range(10):
-            await client.subscribe(["BTCUSDT", "ETHUSDT"])
-
-        # 重复订阅 10 次，symbols 列表应该只有 2 个元素
-        assert client.symbols == ["BTCUSDT", "ETHUSDT"]
-        assert len(client.symbols) == 2
-
-    @pytest.mark.asyncio
-    async def test_unsubscribe_sends_message(self):
-        """测试取消订阅发送消息"""
-        client = KlinesWebSocketClient()
-        client._connected = True
-        client._ws = AsyncMock()
-
-        await client.unsubscribe(["BTCUSDT"])
-
-        expected_message = '{"action": "unsubscribe", "symbols": ["BTCUSDT"]}'
-        client._ws.send.assert_called_once_with(expected_message)
-
-    def test_parse_kline_data(self):
-        """测试解析 K 线数据"""
+    def test_parse_binance_kline(self):
+        """测试解析 Binance combined-stream kline 消息"""
         client = KlinesWebSocketClient()
 
-        ws_message = {
-            "type": "kline",
-            "symbol": "BTCUSDT",
-            "data": {
-                "symbol": "BTCUSDT",
-                "interval": "1m",
-                "open": "50000.00",
-                "high": "50100.00",
-                "low": "49900.00",
-                "close": "50050.00",
-                "volume": "100.50",
-                "is_final": True,
-                "start_time": 1712548800000,
-                "end_time": 1712548859999,
-                "quote_volume": "5025000.00",
-                "trade_num": 1234,
-                "active_buy_volume": "50.25",
-                "active_buy_quote_volume": "2512500.00"
-            }
-        }
+        msg = _binance_kline_msg()
 
-        kline = client._parse_kline_data(ws_message)
+        kline = client._parse_binance_kline(msg)
 
         assert isinstance(kline, Kline)
         assert kline.symbol == "BTCUSDT"
@@ -186,29 +137,15 @@ class TestKlinesWebSocketClient:
         assert kline.close == 50050.00
         assert kline.volume == 100.50
         assert kline.timestamp == datetime.fromtimestamp(1712548800, tz=timezone.utc)
+        assert kline.is_final is True
 
-    def test_parse_kline_data_missing_fields(self):
-        """测试解析缺失字段的 K 线数据"""
+    def test_parse_binance_kline_non_kline_event(self):
+        """非 kline 事件（如 aggTrade）返回 None"""
         client = KlinesWebSocketClient()
 
-        ws_message = {
-            "type": "kline",
-            "symbol": "BTCUSDT",
-            "data": {
-                "open": "50000.00",
-                "close": "50050.00",
-                "start_time": 1712548800000
-            }
-        }
+        msg = {"stream": "btcusdt@aggTrade", "data": {"e": "aggTrade"}}
 
-        kline = client._parse_kline_data(ws_message)
-
-        assert kline.symbol == "BTCUSDT"  # 从外层获取
-        assert kline.open == 50000.00
-        assert kline.close == 50050.00
-        assert kline.high == 0.0  # 默认值
-        assert kline.low == 0.0  # 默认值
-        assert kline.volume == 0.0  # 默认值
+        assert client._parse_binance_kline(msg) is None
 
     @pytest.mark.asyncio
     async def test_message_handler_calls_callback(self):
@@ -217,17 +154,7 @@ class TestKlinesWebSocketClient:
         callback = AsyncMock()
         client.set_on_kline_callback(callback)
 
-        ws_message = {
-            "type": "kline",
-            "symbol": "BTCUSDT",
-            "data": {
-                "open": "50000.00",
-                "close": "50050.00",
-                "start_time": 1712548800000
-            }
-        }
-
-        await client._message_handler(ws_message)
+        await client._message_handler(_binance_kline_msg())
 
         callback.assert_called_once()
         arg = callback.call_args[0][0]
@@ -242,8 +169,8 @@ class TestKlinesWebSocketClient:
         client.set_on_kline_callback(callback)
 
         ws_message = {
-            "type": "ping",
-            "data": {}
+            "stream": "btcusdt@aggTrade",
+            "data": {"e": "aggTrade"},
         }
 
         await client._message_handler(ws_message)
@@ -256,18 +183,8 @@ class TestKlinesWebSocketClient:
         client = KlinesWebSocketClient()
         # 未设置回调
 
-        ws_message = {
-            "type": "kline",
-            "symbol": "BTCUSDT",
-            "data": {
-                "open": "50000.00",
-                "close": "50050.00",
-                "start_time": 1712548800000
-            }
-        }
-
         # 不应抛出异常
-        await client._message_handler(ws_message)
+        await client._message_handler(_binance_kline_msg())
 
 
 class TestKline:

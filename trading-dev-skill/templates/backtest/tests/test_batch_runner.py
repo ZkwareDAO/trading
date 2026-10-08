@@ -286,17 +286,33 @@ class TestExplicitRunList:
         assert [t["symbol"] for t in tasks] == ["BTCUSDT", "ETHUSDT"]
         assert all(t["strategy"] == "sar_snt3_v3" for t in tasks)
 
-    def test_run_list_is_subset_of_registry(self):
-        """--run 能跑登记表的真子集：登记表 13 个 symbol，指定 1 个就只跑 1 个"""
-        full = BatchBacktestRunner(STRATEGIES_CONFIG, profile=PROFILE)._build_tasks()
+    def test_run_list_is_subset_of_registry(self, tmp_path):
+        """--run 能跑登记表的真子集：登记表 2 个 symbol，指定 1 个就只跑 1 个。
+
+        用临时登记表而非真实 config/strategies.yaml：模板仓库只登记 1 个策略
+        ×1 个 symbol（历史上曾登记 13 个），`len(full) > len(one)` 在 1 任务
+        登记表下恒假 —— 该断言依赖的是"登记表规模 > 清单规模"这一前提，
+        与 --run 过滤逻辑本身无关，故由 fixture 保证前提成立。
+        overrides 需真实存在（_build_tasks 对缺失文件 warning 跳过）。
+        """
+        registry = tmp_path / "strategies.yaml"
+        registry.write_text(
+            "strategies:\n"
+            "  sar_snt3_v3:\n"
+            "    trading_mode: \"paper_trading\"\n"
+            "    symbols: [BTCUSDT, ETHUSDT]\n",
+            encoding="utf-8",
+        )
+
+        full = BatchBacktestRunner(str(registry), profile=PROFILE)._build_tasks()
         one = BatchBacktestRunner(
-            STRATEGIES_CONFIG, profile=PROFILE,
+            str(registry), profile=PROFILE,
             explicit_strategies="sar_snt3_v3:BTCUSDT",
         )._build_tasks()
 
-        assert len(full) > len(one) == 1, (
-            "若相等则说明 --run 未生效，登记表仍被全量展开"
-        )
+        assert len(full) == 2
+        assert len(one) == 1, "若相等则说明 --run 未生效，登记表仍被全量展开"
+        assert one[0]["symbol"] == "BTCUSDT"
 
     def test_run_list_config_path_same_as_registry(self):
         """同一个 name:symbol，无论走清单还是登记表，都必须解析到同一份 overrides。

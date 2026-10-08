@@ -6,7 +6,6 @@ Test run_strategy.py — 策略进程入口
 2. 独立 DataManager 创建（策略专属路径）
 3. 策略加载与初始化
 4. 独立 SignalLogger + CSV 写入器
-5. WS 回调绑定
 """
 
 import pytest
@@ -66,19 +65,12 @@ class TestStrategyProcessRunner:
     def _make_global_config(self, tmpdir):
         """创建全局 settings.yaml"""
         config = {
-            "strategy_engine": {
-                "factory_endpoint": "http://127.0.0.1:8888",
-                "strategies_dir": str(PROJECT_ROOT / "strategies"),
-            },
             "data_manager": {
                 "source_data_path": str(tmpdir / "source_data"),
             },
             "signal_logging": {
                 "storage": {
                     "path": str(tmpdir / "signals"),
-                },
-                "kafka": {
-                    "enabled": False,
                 },
             },
         }
@@ -94,13 +86,11 @@ class TestStrategyProcessRunner:
         settings_path = self._make_global_config(tmp_path)
         strategy_config = self._make_runner_config(tmp_path)
 
-        # Mock factory connection to avoid network calls
-        with patch("strategy_core.strategy_engine.engine.xmlrpc.client.ServerProxy", autospec=True):
-            runner = StrategyProcessRunner(
-                strategy_name="cta_rbreaker_v3",
-                strategy_config=strategy_config,
-                global_config_path=settings_path,
-            )
+        runner = StrategyProcessRunner(
+            strategy_name="cta_rbreaker_v3",
+            strategy_config=strategy_config,
+            global_config_path=settings_path,
+        )
 
         # 验证数据路径包含策略名
         assert runner.strategy_name == "cta_rbreaker_v3"
@@ -112,18 +102,14 @@ class TestStrategyProcessRunner:
         settings_path = self._make_global_config(tmp_path)
         strategy_config = self._make_runner_config(tmp_path)
 
-        with patch("strategy_core.strategy_engine.engine.xmlrpc.client.ServerProxy", autospec=True):
-            runner = StrategyProcessRunner(
-                strategy_name="cta_rbreaker_v3",
-                strategy_config=strategy_config,
-                global_config_path=settings_path,
-            )
+        runner = StrategyProcessRunner(
+            strategy_name="cta_rbreaker_v3",
+            strategy_config=strategy_config,
+            global_config_path=settings_path,
+        )
 
         # 检查 DataManager 配置
         assert "cta_rbreaker" in runner.data_manager.config.csv_dir
-
-
-
 
 
 class TestSignalWriter(TestStrategyProcessRunner):
@@ -137,12 +123,11 @@ class TestSignalWriter(TestStrategyProcessRunner):
         settings_path = self._make_global_config(tmp_path)
         strategy_config = self._make_runner_config(tmp_path)
 
-        with patch("strategy_core.strategy_engine.engine.xmlrpc.client.ServerProxy", autospec=True):
-            runner = StrategyProcessRunner(
-                strategy_name="cta_rbreaker_v3",
-                strategy_config=strategy_config,
-                global_config_path=settings_path,
-            )
+        runner = StrategyProcessRunner(
+            strategy_name="cta_rbreaker_v3",
+            strategy_config=strategy_config,
+            global_config_path=settings_path,
+        )
 
         # 验证 CSV writer 存在
         assert runner.csv_writer is not None

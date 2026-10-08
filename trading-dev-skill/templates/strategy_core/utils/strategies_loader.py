@@ -222,27 +222,6 @@ class StrategiesLoader:
                 f"策略 '{name}' 缺少推荐字段: {missing}，将使用默认值"
             )
 
-    def _load_interval_version_from_zktrading(
-        self,
-        config_path: str,
-        strategy_name: str,
-        symbol: str
-    ) -> tuple:
-        """从 per-symbol 覆盖配置读取 interval 和 version
-
-        Args:
-            config_path: per-symbol 配置文件路径（strategies/<name>/overrides/<symbol>.yaml）
-            strategy_name: 策略名称
-            symbol: 交易对
-
-        Returns:
-            (interval, version) 元组
-        """
-        interval, version, _ = self._load_overrides_fields(
-            config_path, strategy_name, symbol
-        )
-        return interval, version
-
     def _load_overrides_fields(
         self,
         config_path: str,
@@ -343,7 +322,7 @@ class StrategiesLoader:
                 config_path = str(Path(config_dir) / strategy_name / "overrides" / f"{symbol}.yaml")
 
                 # interval/version 从 per-symbol 覆盖配置读取
-                interval, version = self._load_interval_version_from_zktrading(
+                interval, version, _ = self._load_overrides_fields(
                     config_path, strategy_name, symbol
                 )
 

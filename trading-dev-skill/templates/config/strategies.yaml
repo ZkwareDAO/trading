@@ -29,20 +29,19 @@
 # =============================================================================
 
 strategies:
-  sar_snt3_v3:
-    trading_mode: "smoking"
-    # config_dir 默认 strategies，per-symbol 覆盖在 strategies/sar_snt3_v3/overrides/<SYMBOL>.yaml
-    symbols:
-      - BTCUSDT
-      - ETHUSDT
-      - SOLUSDT
-      - BNBUSDT
-      - XRPUSDT
-      - XLMUSDT
-      - PAXGUSDT
-      - DOGEUSDT
-      - NEARUSDT
-      - FILUSDT
-      - ZECUSDT
-      - WLDUSDT
-      - HYPEUSDT
+  # ---------------------------------------------------------------------------
+  # 参考实现 example_ma_cross —— 默认不启用。
+  # 想跑通一遍完整链路（拉数据 → 出信号 → 写 CSV），把下面四行取消注释。
+  # 建议先用 smoking 空跑，参数在 strategies/example_ma_cross/overrides/BTCUSDT.yaml
+  # ---------------------------------------------------------------------------
+  # example_ma_cross:        # 单周期参考实现
+  #   trading_mode: "smoking"
+  #   symbols:
+  #     - BTCUSDT
+
+  # example_mtf_trend:       # 多周期参考实现（1d+4h+1h）
+  #   trading_mode: "smoking"
+  #   symbols:
+  #     - BTCUSDT
+
+  # 新策略由 trading-dev skill 在 Phase 2 登记到这里（trading_mode 默认 paper_trading）。

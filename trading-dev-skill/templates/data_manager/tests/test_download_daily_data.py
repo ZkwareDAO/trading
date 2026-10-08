@@ -2,20 +2,21 @@
 """
 测试: DataManager.download_daily_data 方法
 
-POST /api/v1/klines/daily 下载单日数据 → 存本地 CSV
+单体模式：直接调 Binance fapi GET /fapi/v1/klines（startTime~endTime 当天范围）→ 存本地 CSV。
+旧 klines_service 的 POST /api/v1/klines/daily 协议已随单体化移除，
+mock 打在 _binance_public_request（统一代理/超时/错误处理的出口）上。
 """
 
 import pytest
 import pandas as pd
 from pathlib import Path
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch, PropertyMock
+from unittest.mock import AsyncMock, patch
 
 from data_manager.manager import DataManager, DataManagerConfig
 
 
 def make_api_response():
-    """模拟 POST /api/v1/klines/daily 的响应格式 (Binance 风格)"""
+    """模拟 GET /fapi/v1/klines 的响应格式 (Binance 12 元素数组)"""
     return [
         [
             1712548800000,  # 0: open_time (ms)
@@ -41,8 +42,7 @@ class TestDownloadDailyData:
         """创建测试用 DataManager"""
         config = DataManagerConfig(
             csv_dir=str(tmp_path / "klines"),
-            klines_service_enabled=True,
-            klines_service_http_url="http://127.0.0.1:17081",
+            realtime_enabled=True,
         )
         dm = DataManager(config)
         dm.enable_kline_repository()
@@ -53,70 +53,45 @@ class TestDownloadDailyData:
         """测试成功下载单日数据并保存 CSV"""
         dm = self._make_manager(tmp_path)
 
-        mock_response_data = make_api_response()
-
-        with patch("aiohttp.ClientSession") as MockSession:
-            mock_post_ctx = self._make_mock_response(mock_response_data, 200)
-            mock_session = AsyncMock()
-            mock_session.post = MagicMock(return_value=mock_post_ctx)
-            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_session.__aexit__ = AsyncMock(return_value=None)
-            MockSession.return_value = mock_session
+        with patch.object(dm, '_binance_public_request', new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = make_api_response()
 
             result = await dm.download_daily_data("BTCUSDT", "2024-04-08")
 
             assert result is True
 
-            # 验证调用了正确的 URL 和参数
-            call_args = mock_session.post.call_args
-            assert call_args is not None
-            url = call_args[0][0] if call_args[0] else call_args[1].get("url", "")
-            assert "/api/v1/klines/daily" in url
+            # 验证调用了 Binance fapi GET klines 且带当天时间范围
+            mock_req.assert_called_once()
+            call_args = mock_req.call_args
+            url = call_args[0][1]
+            assert "/fapi/v1/klines" in url
+            params = call_args[0][2]
+            assert params["symbol"] == "BTCUSDT"
+            assert params["interval"] == "1m"
+            assert params["startTime"] == 1712534400000  # 2024-04-08 00:00 本地(+08:00) → 前一天 16:00 UTC
+
+    @pytest.mark.asyncio
+    async def test_download_daily_data_request_failure_returns_false(self, tmp_path):
+        """请求失败/返回空（_binance_public_request 返回 None）时如实返回 False
+
+        网络异常与 5xx 在生产代码内已被 _binance_public_request 吞为 None，
+        本用例覆盖"取不到数据 → False"这一对外契约。
+        """
+        dm = self._make_manager(tmp_path)
+
+        with patch.object(dm, '_binance_public_request', new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = None
+            result = await dm.download_daily_data("BTCUSDT", "2024-04-08")
+            assert result is False
 
     @pytest.mark.asyncio
     async def test_download_daily_data_empty_response(self, tmp_path):
-        """测试 API 返回空数据"""
+        """测试 API 返回空列表"""
         dm = self._make_manager(tmp_path)
 
-        with patch("aiohttp.ClientSession") as MockSession:
-            mock_post_ctx = self._make_mock_response([], 200)
-            mock_session = AsyncMock()
-            mock_session.post = MagicMock(return_value=mock_post_ctx)
-            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_session.__aexit__ = AsyncMock(return_value=None)
-            MockSession.return_value = mock_session
-
+        with patch.object(dm, '_binance_public_request', new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = []
             result = await dm.download_daily_data("BTCUSDT", "2024-04-08")
-
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_download_daily_data_api_error(self, tmp_path):
-        """测试 API 返回错误"""
-        dm = self._make_manager(tmp_path)
-
-        with patch("aiohttp.ClientSession") as MockSession:
-            mock_post_ctx = self._make_mock_response({"error": "internal"}, 500)
-            mock_session = AsyncMock()
-            mock_session.post = MagicMock(return_value=mock_post_ctx)
-            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_session.__aexit__ = AsyncMock(return_value=None)
-            MockSession.return_value = mock_session
-
-            result = await dm.download_daily_data("BTCUSDT", "2024-04-08")
-
-            assert result is False
-
-    @pytest.mark.asyncio
-    async def test_download_daily_data_network_error(self, tmp_path):
-        """测试网络异常"""
-        dm = self._make_manager(tmp_path)
-
-        with patch("aiohttp.ClientSession") as MockSession:
-            MockSession.side_effect = ConnectionError("Connection refused")
-
-            result = await dm.download_daily_data("BTCUSDT", "2024-04-08")
-
             assert result is False
 
     @pytest.mark.asyncio
@@ -124,19 +99,11 @@ class TestDownloadDailyData:
         """测试数据保存到 CSV"""
         dm = self._make_manager(tmp_path)
 
-        mock_response_data = make_api_response()
-
-        with patch("aiohttp.ClientSession") as MockSession:
-            mock_post_ctx = self._make_mock_response(mock_response_data, 200)
-            mock_session = AsyncMock()
-            mock_session.post = MagicMock(return_value=mock_post_ctx)
-            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_session.__aexit__ = AsyncMock(return_value=None)
-            MockSession.return_value = mock_session
-
+        with patch.object(dm, '_binance_public_request', new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = make_api_response()
             await dm.download_daily_data("BTCUSDT", "2024-04-08")
 
-            # 验证 CSV 文件已创建
+            # 验证 CSV 文件已创建（kline_repo 的 1m 子目录约定）
             csv_path = tmp_path / "klines" / "1m" / "BTCUSDT_1m.csv"
             assert csv_path.exists()
 
@@ -165,34 +132,16 @@ class TestDownloadDailyData:
         csv_dir.mkdir(parents=True, exist_ok=True)
         existing.to_csv(csv_dir / "BTCUSDT_1m.csv", index=False)
 
-        # API 返回新数据（时间戳不同）
+        # API 返回新数据（时间戳不同：2024-04-08 00:01 UTC）
         new_data = [
             [1712548860000, "50000.0", "50100.0", "49900.0", "50050.0", "100.5",
              1712548920000, "5025000.0", 1234, "50.25", "2512500.0", "0"]
         ]
 
-        with patch("aiohttp.ClientSession") as MockSession:
-            mock_post_ctx = self._make_mock_response(new_data, 200)
-            mock_session = AsyncMock()
-            mock_session.post = MagicMock(return_value=mock_post_ctx)
-            mock_session.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_session.__aexit__ = AsyncMock(return_value=None)
-            MockSession.return_value = mock_session
-
+        with patch.object(dm, '_binance_public_request', new_callable=AsyncMock) as mock_req:
+            mock_req.return_value = new_data
             await dm.download_daily_data("BTCUSDT", "2024-04-08")
 
             # 验证合并后有 2 条数据
             df = pd.read_csv(csv_dir / "BTCUSDT_1m.csv")
             assert len(df) == 2
-
-    def _make_mock_response(self, json_data, status=200):
-        """创建 mock POST/GET 响应的异步上下文管理器"""
-        mock_response = AsyncMock()
-        mock_response.status = status
-        mock_response.json = AsyncMock(return_value=json_data)
-        mock_response.text = AsyncMock(return_value=str(json_data))
-
-        mock_ctx = AsyncMock()
-        mock_ctx.__aenter__ = AsyncMock(return_value=mock_response)
-        mock_ctx.__aexit__ = AsyncMock(return_value=None)
-        return mock_ctx

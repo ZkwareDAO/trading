@@ -44,14 +44,14 @@ origin: trading
 | 输入形态 | 示例 | 解析策略 |
 |----------|------|----------|
 | 文件路径 | `--from /path/to/strategy_doc.md` | Read 文件，解析内容 |
-| 策略目录 | `--from /path/to/cta_ict_v4/` | 读已有策略代码，逆向提取 spec |
+| 策略目录 | `--from /path/to/example_ma_cross/` | 读已有策略代码，逆向提取 spec |
 | URL | `--from https://...` | WebFetch 抓取 |
 | 自然语言 | `/trading-dev new 开发一个 EMA 交叉策略，4h，BTCUSDT` | 从描述提取 |
 | 省略 | `/trading-dev new` | 进入多轮对话收集策略信息 |
 
 ---
 
-## Phase -1: 交互式引导（无参数时） ← NEW
+## Phase -1: 交互式引导（无参数时）
 
 ### 触发条件
 
@@ -107,7 +107,7 @@ Step 3: 汇总确认 -> 用户确认后进 Phase 0
 请描述新策略（任选一种方式）：
   1. 直接描述   ← 一句话策略逻辑，如"EMA20/EMA60 交叉，4h，BTCUSDT"
   2. 文件路径   ← 如 --from /path/to/strategy_doc.md
-  3. 已有策略   ← 如 --from /path/to/cta_ict_v4/（逆向提取 spec）
+  3. 已有策略   ← 如 --from /path/to/example_ma_cross/（逆向提取 spec）
   4. URL        ← 如 --from https://...
 
 请输入（默认进入多轮对话逐步收集）：
@@ -136,14 +136,6 @@ Step 3: 汇总确认 -> 用户确认后进 Phase 0
 ### 引导收尾
 
 用户确认后：把引导参数组装成等效命令行 -> **进入 Phase 0 环境预检 + 策略信息获取**。
-
-### 引导 vs 原流程对照
-
-| 场景 | 旧行为 | 新行为 |
-|------|--------|--------|
-| `/trading-dev` 无参数 | 不明确 | 进引导，问子命令->策略来源 |
-| `/trading-dev new` | 交互式多轮收集 | 跳过引导（子命令明确，走 Phase 0 交互） |
-| `/trading-dev new --from X` | 全自动直接跑 | 跳过引导直接跑（参数齐全） |
 
 ---
 
@@ -184,10 +176,10 @@ TALIB_FOUND=$(ldconfig -p 2>/dev/null | grep -c libta_lib || echo "0")
 # 3. pip 可用
 PIP_AVAILABLE=$(command -v pip &>/dev/null && echo "1" || echo "0")
 
-# 4. K 线数据
-KLINE_SRC="${KLINE_DATA_DIR:-${DATA_PATH:-./data}/strategies/1m}"
+# 4. K 线数据（路径约定：{csv_dir}/{interval}/{SYMBOL}_{interval}.csv）
+KLINE_SRC="${KLINE_DATA_DIR:-${DATA_PATH:-./data}/klines}"
 KLINE_READY="0"
-if [ -d "$KLINE_SRC" ] && [ -f "$KLINE_SRC/BTCUSDT_1m.csv" ]; then
+if [ -d "$KLINE_SRC/1m" ] && [ -f "$KLINE_SRC/1m/BTCUSDT_1m.csv" ]; then
     KLINE_READY="1"
 fi
 
@@ -205,7 +197,7 @@ DISK_OK="0"
 | Python 3.10+ | `PYTHON_CMD` 非空 | Ubuntu: `sudo apt install python3.12 python3.12-venv` / macOS: `brew install python@3.12` |
 | ta-lib C 库 | `TALIB_FOUND ≥ 1` | `wget ...ta-lib... && ./configure && make && sudo make install && ldconfig` |
 | pip 可用 | `PIP_AVAILABLE = 1` | `python3 -m ensurepip` |
-| K 线数据 | `KLINE_READY = 1` | 设置 `KLINE_DATA_DIR` 指向已有数据目录，或运行 `python scripts/download_data.py --symbol BTCUSDT,ETHUSDT,SOLUSDT --interval 1m --days 600` |
+| K 线数据 | `KLINE_READY = 1` | 运行 `python scripts/download_data.py --symbol BTCUSDT,ETHUSDT,SOLUSDT --interval 1m --days 600`（脚手架创建后） |
 | 磁盘空间 ≥ 2G | `DISK_OK = 1` | 清理空间或更换 `DATA_PATH` |
 
 **阻塞 vs 非阻塞**：
@@ -213,9 +205,9 @@ DISK_OK="0"
 | 检测项 | 不达标时 | 原因 |
 |--------|----------|------|
 | Python 3.10+ | **阻塞** — 无法创建 venv 和运行回测 | 核心依赖 |
-| ta-lib C 库 | **非阻塞** — 降级安装，回测时部分指标不可用 | 可后续安装 |
+| ta-lib C 库 | **非阻塞** — 降级安装；模板参考实现为纯 pandas，无 talib 依赖 | 可后续安装 |
 | pip 可用 | **阻塞** — 无法安装依赖 | 核心依赖 |
-| K 线数据 | **非阻塞** — Phase 1 自动 symlink/下载，仍无数据则自动运行 `scripts/download_data.py` | 可自动修复 |
+| K 线数据 | **非阻塞** — Phase 1 自动 symlink/下载 | 可自动修复 |
 | 磁盘空间 | **非阻塞** — 警告，可能回测输出空间不足 | 可后续清理 |
 
 **阻塞项处理**：Python/pip 不可用 → 报错退出，提示安装命令。这是唯一需要用户干预的情况。
@@ -236,9 +228,10 @@ DISK_OK="0"
 # 读取策略目录中的关键文件
 strategy_dir = source_path
 files_to_read = [
-    f"{strategy_dir}/strategy.py",        # STRATEGY_TYPE, STRATEGY_PREFIX, DEFAULT_TIMEFRAME
-    f"{strategy_dir}/*_core.py",          # State fields, analyze() logic, check_realtime_exit()
-    f"{strategy_dir}/overrides/*.yaml",   # per-symbol 参数（v3.7 单一事实来源）
+    f"{strategy_dir}/strategy.py",          # STRATEGY_TYPE, STRATEGY_PREFIX, DEFAULT_TIMEFRAME
+    f"{strategy_dir}/*_core.py",            # State fields, analyze() logic, check_realtime_exit()
+    f"{strategy_dir}/.strategy-spec.yaml",  # 已有规格文件则直接读
+    f"{strategy_dir}/overrides/*.yaml",     # per-symbol 参数（v3.7 单一事实来源）
 ]
 
 # 提取映射
@@ -268,47 +261,56 @@ overrides/<SYMBOL>.yaml → symbols(取文件名全集), params, direction
 
 > **项目路径规则**：默认 `{cwd}/{strategy_name}`。如果目录已存在，追加 `_v2`、`_v3` 等后缀避免覆盖。
 
-### Step 2: 统一提取为策略规格
+### Step 2: 统一提取为策略规格（.strategy-spec.yaml）
 
-所有输入形态收敛到同一个结构：
+所有输入形态收敛到同一个结构。**字段 schema 见模板 `docs/strategy/STRATEGY_SPEC.md`**（生成前必须先读它）：
 
 ```yaml
 strategy_name: ema_rsi_pullback
 prefix: EMA_RSI
 direction: neutral
-timeframes: [4h, 1h]
+timeframes: [4h, 1h]          # [0] 必须是触发主周期
+extra_timeframes: [1d]        # 可选：除主周期外订阅的其他周期
 symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
 
 entry:
   description: "EMA 交叉 + RSI 回踩确认"
-  conditions:
+  conditions:                  # 条件逐条列，生成代码时一条对应一个判断
     - "快线上穿慢线"
     - "RSI 回踩至 40-60 区间后反弹"
 
 exit:
-  stop_loss: "2 倍 ATR"
-  take_profit: "移动止盈，1.5 倍 ATR 回落平仓"
+  stop_loss: "2 倍 ATR"        # 硬止损规则；不做空字符串
+  trailing_stop: ""            # 没有就留空字符串
+  signal_reversal: ""
+  note: "回落止盈/固定止盈由 overrides 的 risk 段统一风控兜底，策略内不实现"
 
-state_fields:
+state_fields:                  # 策略特有状态字段（BaseState 已有字段不要列）
   - name: atr_at_entry
-    type: float
+    type: float                # float / int / bool / str / date
     default: 0.0
-    persist: true
+    persist: true              # true=进 to_persist_dict；false=每根 K 线重算的缓存
   - name: trail_activated
     type: bool
     default: false
     persist: true
 
-default_params: {}
+default_params:                # Core.__init__ 从 params 读取的参数及默认值
+  ema_fast_period: 20
+  ema_slow_period: 60
 ```
+
+> **参考范例**：模板自带两个参考实现的 spec——
+> `strategies/example_ma_cross/.strategy-spec.yaml`（单周期）、
+> `strategies/example_mtf_trend/.strategy-spec.yaml`（多周期）。
 
 ### Step 3: 执行确认（按模式）
 
 **全自动模式**：自动保存 `.strategy-spec.yaml`，直接进入 Phase 1。
 
 ```
-📋 策略: cta_ict_v4 | CTA_ICT | neutral | [4h,1h] | [BTCUSDT,ETHUSDT,SOLUSDT]
-🔧 环境: Python 3.12 ✅ | ta-lib ✅ | K线数据 ✅ | 磁盘 15G ✅
+📋 策略: ema_rsi_pullback | EMA_RSI | neutral | [4h,1h] | [BTCUSDT,ETHUSDT,SOLUSDT]
+🔧 环境: Python 3.12 ✅ | ta-lib ⚠(不阻塞) | K线数据 ✅ | 磁盘 15G ✅
 🚀 自动执行 loop-engineering 模式...
 ```
 
@@ -317,29 +319,19 @@ default_params: {}
 ```
 📋 环境预检:
   Python 3.12: ✅
-  ta-lib C 库: ❌ (回测指标计算需要，见下方安装命令)
+  ta-lib C 库: ⚠ 未装（参考实现为纯 pandas，不阻塞；需要 talib 指标时再装）
   pip: ✅
-  K 线数据: ✅ (symlink → /path/to/1m/)
+  K 线数据: ✅ (symlink → /path/to/data/klines/)
   磁盘空间: ✅ (15G 可用)
 
 📋 策略解析结果:
-  名称: cta_ict_v4
-  前缀: CTA_ICT
+  名称: ema_rsi_pullback
+  前缀: EMA_RSI
   方向: neutral
   时间框架: [4h, 1h]
   标的: [BTCUSDT, ETHUSDT, SOLUSDT]
-  入场: FVG + Order Block + Breaker 确认
-  出场: 止损 2x ATR, 移动止盈 1.5x ATR
-
-🔧 环境变量（可修改）:
-  KLINE_DATA_DIR = ./data/klines
-  BENCHMARK_OUTPUT_PATH = ./benchmark_output
-  DATA_PATH = ./data
-
-⚠ ta-lib 未安装，回测中 ATR/RSI 等指标会失败。安装：
-  wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz
-  tar -xzf ta-lib-0.4.0-src.tar.gz
-  cd ta-lib && ./configure && make && sudo make install && ldconfig
+  入场: EMA 交叉 + RSI 回踩确认
+  出场: 止损 2x ATR, 统一风控兜底
 
 确认执行？(y/n)
 ```
@@ -372,7 +364,7 @@ default_params: {}
 
 ### Step 1: 复制模板代码
 
-从 skill 模板目录复制骨架代码到新项目：
+从 skill 模板目录复制骨架代码到新项目。
 
 **模板根目录**：自动检测，优先级：
 
@@ -392,77 +384,48 @@ else
 fi
 ```
 
-**复制列表（全量）**：
+**复制列表（全量镜像）**：模板即完整可运行项目，整体复制：
 
 | 源路径 | 说明 |
 |--------|------|
-| `templates/strategy_core/` | 基类框架（BaseStrategy/BaseState/BaseStrategyCore） |
-| `templates/backtest/` | 回测引擎 |
-| `templates/data_manager/` | K线数据管理 |
-| `templates/scripts/` | 辅助脚本（含 `download_data.py` K线下载、`run_backtest_batch.sh`、`run_live_batch.sh`） |
-| `templates/config/settings.example.yaml` | 系统配置模板 |
-| `templates/docs/strategy/` | 开发规范文档（QUICKSTART/DEVELOPMENT_GUIDE/AI_CONSTRAINTS/REVIEW_CHECKLIST/EXAMPLES） |
-| `templates/requirements.txt` | 依赖清单 |
-| `templates/.gitignore` | 排除规则 |
-| `templates/.env.example` | 环境变量模板 |
-| `templates/run_strategies_manager.py` | 策略管理器入口 |
-| `templates/run_strategy.py` | 单策略运行入口 |
-| `templates/start.sh` | 启动脚本 |
-| `templates/stop.sh` | 停止脚本 |
+| `templates/strategy_core/` | 基类框架（BaseStrategy/BaseState/BaseStrategyCore + 统一风控） |
+| `templates/backtest/` | 回测引擎（run_backtest / batch_runner） |
+| `templates/data_manager/` | K线数据管理（CSV + WS + 多时间框架聚合） |
+| `templates/scripts/` | `download_data.py` / `run_backtest_batch.sh` / `run_live_batch.sh` / `resample_1m_to_multi_tf.py` |
+| `templates/config/` | 三层配置（settings.yaml / strategies.yaml / backtest.yaml run-profile），全部入库 |
+| `templates/strategies/` | 参考实现（example_ma_cross 单周期、example_mtf_trend 多周期）+ README |
+| `templates/tests/` | 根级测试 |
+| `templates/docs/` | 全部文档（strategy/ 五件套 + STRATEGY_SPEC.md 等） |
+| `templates/requirements*.txt` | 依赖清单 |
+| `templates/.gitignore` / `.env.example` | 排除规则 / 环境变量模板 |
+| `templates/run_strategies_manager.py` / `run_strategy.py` | 入口 |
+| `templates/start.sh` / `stop.sh` | 启停脚本 |
+| `templates/CLAUDE.md` / `README.md` / `ARCHITECTURE.md` | 项目文档 |
 
-**不复制**：
+**不复制**（模板中已排除，此处列出原因）：
 
 | 排除项 | 原因 |
 |--------|------|
-| `strategies/` 中真实策略 | 业务逻辑不进模板 |
-| `backtest_output*/` | 运行产物 |
-| `arbitrage/` | 套利模块，非 CTA 必需 |
-| `signal_comparison/` | 高级功能，可后置 |
-| `.env` | 含真实服务地址与私有值，用 .env.example 替代 |
-
-> `config/settings.yaml` 与 `config/strategies.yaml` **入库**：前者的外部地址
-> 全部是 `${ENV_VAR}` 占位（未设置时功能自动降级），后者是编排登记表。
-> v3.7 已删除 `backtest/config/` 整个配置族（配置分叉源头），
-> 配置收敛为 `config/` 三层模型 + `config/backtest.yaml`（run-profile），全部入库。
+| `.env` | 含真实凭证，只保留 `.env.example` |
+| `strategies/sar_snt3_v3/` 类真实策略 | 业务逻辑与真实资金参数不进模板 |
+| `data/ logs/ backtest_output*/` | 运行时生成 |
 
 **复制命令**：
 
 ```bash
-# 模板目录由上方自动检测逻辑确定
-TEMPLATE_DIR="$TEMPLATE_DIR"  # 已在 Step 1 中设置
+TEMPLATE_DIR="{已检测的模板目录}"
 PROJECT_DIR="{project_path}"
 
-# 复制核心模块
-cp -r $TEMPLATE_DIR/strategy_core/ $PROJECT_DIR/strategy_core/
-cp -r $TEMPLATE_DIR/backtest/ $PROJECT_DIR/backtest/
-cp -r $TEMPLATE_DIR/data_manager/ $PROJECT_DIR/data_manager/
-cp -r $TEMPLATE_DIR/scripts/ $PROJECT_DIR/scripts/
+# 整体镜像复制（模板已是干净的开源子集，无需再挑拣）
+cp -r $TEMPLATE_DIR/. $PROJECT_DIR/
 
-# 复制配置和文档
-cp -r $TEMPLATE_DIR/config/ $PROJECT_DIR/config/
-cp -r $TEMPLATE_DIR/docs/ $PROJECT_DIR/docs/
-
-# 复制入口文件
-cp $TEMPLATE_DIR/requirements.txt $PROJECT_DIR/
-cp $TEMPLATE_DIR/.gitignore $PROJECT_DIR/
-cp $TEMPLATE_DIR/.env.example $PROJECT_DIR/
-cp $TEMPLATE_DIR/run_strategies_manager.py $PROJECT_DIR/
-cp $TEMPLATE_DIR/run_strategy.py $PROJECT_DIR/
-cp $TEMPLATE_DIR/start.sh $PROJECT_DIR/
-cp $TEMPLATE_DIR/stop.sh $PROJECT_DIR/
-
-# config/ 已随上面整体复制（含 settings.yaml / strategies.yaml /
-# backtest.yaml run-profile），无需再从 .example 生成。
-# 私有值走 .env：
-cp $TEMPLATE_DIR/.env.example $PROJECT_DIR/.env    # 再按需填写
-
-# 创建策略空壳目录
-mkdir -p $PROJECT_DIR/strategies
+# 创建本地 .env（从模板）
+cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env
 ```
 
-> **模板规则**：`backtest/config/` 中的 `main.yaml` 和 `strategies.yaml` 是运行时文件，**不进模板**。
-> 模板只保留 `.example.yaml` 变体。脚手架创建时从 `.example` 复制生成运行时文件。
-> 这样用户修改运行时配置不会污染模板，新项目始终从干净的 `.example` 开始。
+> **与旧版差异**：v3.7 模板即完整可运行项目（单体模式，直连 Binance 公共行情），
+> 无需再从 `.example` 生成运行时配置——`config/` 三层全部入库，
+> 新策略登记进 `config/strategies.yaml` 即可。
 
 ### Step 2: 初始化 Python 环境
 
@@ -477,23 +440,30 @@ source .venv/bin/activate
 pip install --upgrade pip
 
 # 2. 安装依赖
-if pip install -r requirements.txt; then
+if pip install -r requirements.txt -r requirements-dev.txt; then
     echo "✅ 依赖安装成功"
 else
     echo "⚠ 部分依赖安装失败，降级安装核心依赖..."
     pip install pandas numpy pyyaml
     if [ "$TALIB_FOUND" = "0" ]; then
         echo "⚠ ta-lib C 库未安装，跳过 ta-lib Python 包"
-        echo "  ATR/RSI 等指标回测不可用，安装 C 库后重跑: pip install ta-lib"
+        echo "  参考实现为纯 pandas 不受影响；需要 talib 指标时安装 C 库后重跑: pip install ta-lib"
     fi
 fi
 ```
 
-> **ta-lib 处理逻辑**：Phase 0 预检已检测 C 库状态。C 库未安装时，pip install ta-lib 会失败，此处自动跳过并降级。用户可在安装 C 库后手动 `pip install ta-lib`。
+> **ta-lib 处理逻辑**：Phase 0 预检已检测 C 库状态。C 库未安装时，pip install ta-lib 会失败，此处自动跳过并降级。模板参考实现（example_ma_cross / example_mtf_trend）是纯 pandas，不影响跑通链路。
 
 ### Step 3: 准备回测 K 线数据
 
-回测引擎从 `data_dir/1m/{SYMBOL}_1m.csv` 读取 1m K 线数据。数据约 1.3G，**不复制**，用 symlink 指向共享数据源。
+**数据路径约定**（回测/实盘/下载脚本三方一致，见 `backtest/run_backtest.py` 的 `_kline_csv_path`）：
+
+```
+{csv_dir}/{interval}/{SYMBOL}_{interval}.csv
+例: ./data/klines/1m/BTCUSDT_1m.csv
+```
+
+回测按 1m 驱动，大周期由框架自动聚合（也可用 `scripts/resample_1m_to_multi_tf.py` 预生成）。数据约 1.3G/代币/600天，**不复制**，用 symlink 指向共享数据源。
 
 **数据格式**（CSV，带 header）：
 
@@ -503,39 +473,41 @@ timestamp,open,high,low,close,volume
 2022-12-30 00:01:00+00:00,16629.3,16629.3,16625.5,16625.5,77.129
 ```
 
-**文件命名**：`{SYMBOL}_1m.csv`，如 `BTCUSDT_1m.csv`、`ETHUSDT_1m.csv`
-
 **自动准备**（按优先级尝试，不询问用户）：
 
 ```bash
 cd {project_path}
-DATA_DIR="${DATA_PATH:-./data}"
-KLINE_SRC="${KLINE_DATA_DIR:-${DATA_PATH:-./data}/strategies/1m}"
+DATA_DIR="${DATA_PATH:-./data/klines}"
+KLINE_SRC="${KLINE_DATA_DIR:-$DATA_DIR}"
 
 # 方式 1: symlink 到已有数据源（推荐，零拷贝）
-if [ -d "$KLINE_SRC" ] && [ -f "$KLINE_SRC/BTCUSDT_1m.csv" ]; then
-    mkdir -p "$DATA_DIR/strategies/1m"
-    ln -sf "$KLINE_SRC"/*.csv "$DATA_DIR/strategies/1m/"
-    echo "✅ 已 symlink 1m kline 数据: $KLINE_SRC → $DATA_DIR/strategies/1m/"
+if [ -d "$KLINE_SRC" ] && [ -f "$KLINE_SRC/1m/BTCUSDT_1m.csv" ]; then
+    mkdir -p "$DATA_DIR"
+    # 按周期子目录逐个链接（路径约定 {csv_dir}/{interval}/）
+    for tf_dir in "$KLINE_SRC"/*/; do
+        tf=$(basename "$tf_dir")
+        mkdir -p "$DATA_DIR/$tf"
+        ln -sf "$tf_dir"*.csv "$DATA_DIR/$tf/" 2>/dev/null
+    done
+    echo "✅ 已 symlink kline 数据: $KLINE_SRC → $DATA_DIR"
 
-# 方式 2: 运行 scripts/download_data.py 从 Binance 下载（自动，约 30-60 分钟）
-#   注意 CLI 是 --days N（回看天数），v3.7 没有 --start / --output 参数
+# 方式 2: 运行 scripts/download_data.py 从 Binance 公共数据源下载（无需 API key）
+#   输出路径 {data_dir}/{interval}/{SYMBOL}_{interval}.csv，与回测/实盘一致
+#   CSV 已存在时自动增量 merge，不销毁历史
 elif [ -f "scripts/download_data.py" ]; then
-    echo "📥 K 线数据未就绪，从 Binance Futures 下载..."
+    echo "📥 K 线数据未就绪，从 Binance 下载..."
     echo "  回看天数: 600 天"
     echo "  交易对: BTCUSDT,ETHUSDT,SOLUSDT（默认）"
     $PYTHON_CMD scripts/download_data.py \
         --symbol BTCUSDT,ETHUSDT,SOLUSDT \
         --interval 1m \
         --days 600 \
-        --data-dir "$DATA_DIR/klines"
+        --data-dir "$DATA_DIR"
 
 # 方式 3: 数据未就绪，记录警告（不阻塞流程，回测时会报错）
 else
-    echo "⚠ 1m kline 数据未就绪"
-    echo "  需要路径: $DATA_DIR/strategies/1m/"
-    echo "  文件格式: {SYMBOL}_1m.csv (timestamp,open,high,low,close,volume)"
-    echo "  设置 KLINE_DATA_DIR 环境变量指向已有数据目录"
+    echo "⚠ kline 数据未就绪"
+    echo "  需要路径: $DATA_DIR/1m/，文件格式 {SYMBOL}_1m.csv (timestamp,open,high,low,close,volume)"
     echo "  或运行: python scripts/download_data.py --symbol BTCUSDT,ETHUSDT,SOLUSDT --interval 1m --days 600"
 fi
 ```
@@ -543,8 +515,8 @@ fi
 **验证数据就绪**：
 
 ```bash
-if [ -f "$DATA_DIR/strategies/1m/BTCUSDT_1m.csv" ]; then
-    lines=$(wc -l < "$DATA_DIR/strategies/1m/BTCUSDT_1m.csv")
+if [ -f "$DATA_DIR/1m/BTCUSDT_1m.csv" ]; then
+    lines=$(wc -l < "$DATA_DIR/1m/BTCUSDT_1m.csv")
     echo "✅ 1m kline 数据就绪: BTCUSDT ${lines} 行"
 else
     echo "⚠ 1m kline 数据未就绪，回测将失败"
@@ -556,11 +528,12 @@ fi
 ```bash
 cd {project_path}
 git init
-cp .env.example .env          # 创建本地 .env（从模板）
 echo "data/" >> .gitignore    # K线数据不入库
 git add .
 git commit -m "init: scaffold from trading-dev-skill template"
 ```
+
+> `.env` 已在模板 `.gitignore` 中排除，不会误提交。
 
 ### Step 5: 输出就绪报告
 
@@ -570,25 +543,24 @@ git commit -m "init: scaffold from trading-dev-skill template"
 项目路径: {project_path}
 Python 环境: .venv (Python 3.x)
 依赖安装: ✅ / ⚠️ (ta-lib 需手动安装)
-1m K线数据: ✅ (symlink) / ✅ (下载) / ⚠️ (需手动准备)
+kline 数据: ✅ (symlink) / ✅ (下载) / ⚠️ (需手动准备)
 
 项目结构:
   {strategy_name}/
   ├── strategy_core/              # 基类框架（BaseStrategy/BaseState/BaseStrategyCore）
-  │   └── utils/                  # 工具（config_loader, log_handlers, strategy_loader...）
+  │   ├── base/                   # 基类 + 统一风控
+  │   ├── signal_logging/         # CSV 持久化 + 交易所直连下单（binance_trader）
+  │   └── utils/                  # strategies_loader / log_handlers / env_placeholders
   ├── backtest/                   # 回测引擎
-  │   ├── run_backtest.py         # 回测入口
-  │   ├── analyzer.py             # 数据分析
-  │   ├── html_generator/         # HTML 报告生成
-  │   └── config/
-  │       ├── main.example.yaml   # 回测配置模板
-  │       ├── main.yaml           # 运行时配置（从 .example 生成）
-  │       ├── strategies.example.yaml
-  │       └── strategies.yaml     # 运行时配置（从 .example 生成）
-  ├── data_manager/               # K线数据管理（DataManager, klines_loader）
-  ├── scripts/                    # 辅助脚本（download_data.py / run_backtest_batch.sh / run_live_batch.sh）
-  ├── strategies/                 # 策略目录
-  │   ├── __init__.py             # 策略注册（空壳，Phase 2 更新）
+  │   ├── run_backtest.py         # 回测入口（CLI 已收敛为 7 参数）
+  │   ├── batch_runner.py         # 批量回测执行器
+  │   └── analyzer.py             # 指标解析
+  ├── data_manager/               # K线数据管理（DataManager, kline_repository, klines_loader）
+  ├── scripts/                    # download_data.py / run_backtest_batch.sh / run_live_batch.sh
+  ├── strategies/                 # 参考实现 + 新策略目录
+  │   ├── README.md
+  │   ├── example_ma_cross/       # ⬅ 单周期参考实现（先完整读一遍再写新策略）
+  │   ├── example_mtf_trend/      # ⬅ 多周期参考实现
   │   └── {strategy_name}/        # ⬅ Phase 2 生成
   │       ├── strategy.py
   │       ├── {prefix}_core.py
@@ -600,30 +572,23 @@ Python 环境: .venv (Python 3.x)
   │       ├── .strategy-spec.yaml
   │       └── tests/
   ├── config/                     # ⬅ 三层配置模型，全部入库
-  │   ├── settings.yaml           # 系统层（外部地址用 ${ENV_VAR} 占位）
-  │   ├── settings.example.yaml
+  │   ├── settings.yaml           # 系统层（数据/信号日志/直连下单开关）
   │   ├── strategies.yaml         # 编排层（实盘回测共用登记表）
-  │   ├── strategies.example.yaml
-  │   ├── backtest.yaml           # 回测 run-profile（默认 --profile）
+  │   ├── backtest.yaml           # 回测 run-profile（--profile 默认值）
   │   └── quick.example.yaml      # 调参用 profile 示例
-  ├── docs/strategy/              # 开发规范文档
-  │   ├── QUICKSTART.md
-  │   ├── DEVELOPMENT_GUIDE.md
-  │   ├── AI_CONSTRAINTS.md
-  │   ├── REVIEW_CHECKLIST.md
-  │   └── EXAMPLES.md
-  ├── data/klines/                # ⬅ K线数据（按周期分目录）
-  │   ├── 1m/BTCUSDT_1m.csv
-  │   ├── 4h/BTCUSDT_4h.csv
-  │   └── 8h/BTCUSDT_8h.csv       # 须与 settings.yaml 的 csv_dir 一致
-  ├── .env                        # 环境变量（从 .env.example 生成）
-  ├── .env.example                # 环境变量模板
-  ├── .gitignore
-  ├── requirements.txt
+  ├── tests/                      # 根级测试（strategies_loader / run_strategy 等）
+  ├── docs/                       # 全部规范文档
+  │   └── strategy/               # QUICKSTART / DEVELOPMENT_GUIDE / AI_CONSTRAINTS
+  │                               # / REVIEW_CHECKLIST / EXAMPLES / STRATEGY_SPEC
+  ├── data/klines/                # ⬅ K线数据（{csv_dir}/{interval}/{SYMBOL}_{interval}.csv）
+  │   └── 1m/BTCUSDT_1m.csv
+  ├── .env                        # 环境变量（从 .env.example 生成，不入库）
+  ├── .env.example
+  ├── requirements.txt / requirements-dev.txt
   ├── run_strategies_manager.py   # 策略管理器入口
   ├── run_strategy.py             # 单策略运行入口
-  ├── start.sh                    # 启动脚本
-  └── stop.sh                     # 停止脚本
+  ├── start.sh / stop.sh
+  └── CLAUDE.md / README.md / ARCHITECTURE.md
 ```
 
 ---
@@ -638,23 +603,33 @@ Python 环境: .venv (Python 3.x)
 |------|----------|-----------|-----------|
 | 加载规范文档 | 静默加载 | 静默加载 | 静默加载 |
 | 生成代码 | 展示生成的文件列表 | 静默生成 | 展示生成的文件列表 |
-| 注册策略 | 静默执行 | 静默执行 | 静默执行 |
+| 登记策略 | 静默执行 | 静默执行 | 静默执行 |
 | 验证配置 | 展示验证结果 | 静默验证，失败自动修复 | 展示验证结果 |
 | 审查检查表 | 展示审查结果 | 静默审查，不通过自动修复 | 展示审查结果 |
 
 **单步模式**：`/trading-dev develop` 只执行 Phase 2（需要已有脚手架和 `.strategy-spec.yaml`）。
 
-### Step 0: 加载规范文档（强制）
+### Step 0: 加载规范文档 + 参考实现（强制）
 
-**必须先读取以下文档到上下文，确保生成的代码符合项目规范**：
+**必须先读取以下文档与参考代码到上下文，确保生成的代码符合项目规范**：
 
 ```
-docs/strategy/QUICKSTART.md         # 目录结构、命名规范
-docs/strategy/DEVELOPMENT_GUIDE.md  # 基类功能、平仓方法、冷却机制
-docs/strategy/AI_CONSTRAINTS.md     # 编码红线（14 条禁止 + 11 条必须）
-docs/strategy/REVIEW_CHECKLIST.md   # 提交前检查项（8 类 68 项）
-docs/strategy/EXAMPLES.md           # 代码模板与 FAQ
+docs/strategy/QUICKSTART.md           # Step 0 要求先读参考实现；目录结构、命名规范、代码模板
+docs/strategy/DEVELOPMENT_GUIDE.md    # 基类功能、平仓方法、冷却机制
+docs/strategy/AI_CONSTRAINTS.md       # 编码红线（14 条禁止 + 11 条必须）
+docs/strategy/REVIEW_CHECKLIST.md     # 提交前检查项（10 类）
+docs/strategy/EXAMPLES.md             # 常见问题与踩坑
+docs/strategy/STRATEGY_SPEC.md        # spec 字段 schema
+
+strategies/example_ma_cross/          # ⬅ 单周期参考实现（必读，QUICKSTART Step 0 强制）
+  ├── strategy.py                     # Strategy 接口层（最简形态）
+  ├── example_ma_cross_core.py        # Core 逻辑层（★ 注释是框架契约重点）
+  ├── overrides/BTCUSDT.yaml          # per-symbol 配置逐字段注释
+  └── tests/                          # 测试写法
 ```
+
+**多周期策略额外必读**：`strategies/example_mtf_trend/`（1d 定方向 + 4h 触发 + 1h 确认，
+演示每个周期分别 `get_closed_data()` + 单独数据检查的标准写法）。
 
 ### Step 1: 生成策略代码
 
@@ -702,12 +677,19 @@ class Strategy(BaseStrategy):
 
 | 红线 | 说明 |
 |------|------|
-| 禁止入场用未闭合 K 线 | 用 `get_closed_data()` |
+| 禁止入场用未闭合 K 线 | 多周期必须 `get_closed_data()` |
 | 禁止 `datetime.now()` 做时间戳 | 用 K 线时间 |
 | 禁止 Strategy 类算指标 | 指标在 Core.analyze() 内 |
-| 禁止跳过数据不足检查 | `if df.empty or len(df) < min_rows` |
+| 禁止跳过数据不足检查 | `get_closed_data(min_rows=N)` 后再判一次 `len()` |
 | 禁止可变默认值 | 用 `field(default_factory=list)` |
 | 禁止缓存字段持久化 | 缓存不进 `to_persist_dict()` |
+| 入场必须调 `_notify_position_enter()` | 漏了仓位不落盘，进程重启即丢 |
+| 平仓必须走 `_notify_exit_and_clear()` | 不要自己调 `clear_position()` |
+
+**参考实现里的框架契约**（QUICKSTART 代码地图，写错不报错只会静默不发信号）：
+- `action` 合法取值：入场 `buy`/`sell`，平仓用 `_notify_exit_and_clear()` 返回值（全集 `buy`/`sell`/`buy_close`/`sell_close`）
+- 入场 state 必填字段：`position`/`position_id`/`entry_price`/`entry_time`/`entry_timestamp`/`stop_price`/`peak_price` + 特有字段
+- 下单量：`metadata["target_notional"] = (current_cash or 0) * self.leverage`；杠杆从 `params.leverage` 读（`capital.leverage` 不会传给 Core）
 
 #### 1.3 __init__.py
 
@@ -718,22 +700,22 @@ from .{prefix}_core import {Prefix}Core, {Prefix}State
 __all__ = ["Strategy", "{Prefix}Core", "{Prefix}State"]
 ```
 
-#### 1.4 策略参数配置（per-symbol）
+> **无需全局注册**：框架按 `strategies.{name}.strategy` 模块路径直接 import
+> `Strategy` 类，不存在中心注册表。只要目录名 = 配置里的策略名即可被加载。
+
+#### 1.4 策略参数配置（per-symbol overrides）
 
 v3.7 每个 (策略, 代币) 一份参数文件，**这是唯一事实来源** ——
 实盘 `run_strategy.py` 与回测 `run_backtest.py` 读的都是它。
 不再生成 `config.yaml` / `config.dev.yaml` / `config.test.yaml`：
-那套按环境分文件的做法会让回测与实盘读到两份参数（回测失真的根源），
-v3.7 已删除。
+那套按环境分文件的做法会让回测与实盘读到两份参数（回测失真的根源），v3.7 已删除。
 
 **路径**：`strategies/{strategy_name}/overrides/{SYMBOL}.yaml`
 
-**格式**（顶层必须是策略名键，`symbols` 只含自己那一个代币）：
+**格式**（顶层必须是策略名键；完整字段说明照抄参考实现 `strategies/example_ma_cross/overrides/BTCUSDT.yaml` 的逐字段注释）：
 
 ```yaml
 {strategy_name}:
-  strategy:
-    name: {PREFIX}
   enabled: true
   version: '1'
   # 运行模式：live / paper_trading / smoking
@@ -743,13 +725,13 @@ v3.7 已删除。
   symbols:
     - {SYMBOL}
   timeframes: {timeframes}
-  params: {params}
+  params: {params}          # 从 .strategy-spec.yaml 的 default_params 填充
   signal:
     min_strength: 0.5
     cooldown_ms: 0
     order_type: 1
     slippage: 0
-    exchange: binance
+    exchange: binance       # 直连下单模式下必须与执行器一致（binance）
   capital:
     max_cash: 1000
     max_parts: 1
@@ -762,8 +744,7 @@ v3.7 已删除。
       activation_pct: 2.0
       drawdown_pct: 20.0
     fixed_take_profit_pct: 0.0
-  cooldown_timeframe: {timeframes[0]}
-  # 信号归属的用户 ID（下游下单系统用；单用户部署保持 1）
+  # 注意：cooldown_timeframe / cooldown_bars / cooldown_ms 是死配置，不要写
   user_id: 1
 ```
 
@@ -772,12 +753,10 @@ v3.7 已删除。
 - `symbols` 字段只含当前文件对应的那一个代币
 - `params` 从 `.strategy-spec.yaml` 的 `default_params` 填充；
   不同代币可各自独立调参（这正是拆成 per-symbol 的目的）
-- `interval` 与 `version` 由框架从本文件的 `timeframes[0]` / `version` 自动读取，
-  无需在命令行传
-- 回测通过 `--strategies {strategy_name}:{SYMBOL}` 自动定位本文件，
-  **不需要** `--config` 参数（v3.7 已删除）
-- 回测引擎会把实际生效的配置复制到
-  `{output_dir}/{strategy}/{date}/{time}/{SYMBOL}/config.yaml` 供复现
+- 每个指标必须配置 `*_timeframes` 并在 `Strategy._get_indicator_timeframes()` 收集
+- `interval` 与 `version` 由框架从本文件的 `timeframes[0]` / `version` 自动读取
+- 回测通过 `--strategies {strategy_name}:{SYMBOL}` 自动定位本文件，不需要 `--config` 参数
+- 回测引擎会把实际生效的配置复制到 `{output_dir}/{strategy}/{date}/{time}/{SYMBOL}/config.yaml` 供复现
 
 #### 1.5 编排登记（config/strategies.yaml）
 
@@ -809,20 +788,14 @@ strategies/{strategy_name}/
 ├── __init__.py
 ├── .strategy-spec.yaml         # 策略规格（供逆向提取与再生成）
 └── tests/
-    ├── test_{prefix}_core.py
-    └── test_strategy_logging.py
+    └── test_{prefix}_core.py
 ```
 
 #### 1.6 测试文件
 
-- `tests/test_{prefix}_core.py` — 核心逻辑测试
-- `tests/test_strategy_logging.py` — 信号日志测试
+- `tests/test_{prefix}_core.py` — 核心逻辑测试（照参考实现 `strategies/example_ma_cross/tests/` 的写法）
 
-### Step 2: 注册策略
-
-更新 `strategies/__init__.py`，添加新策略的 import。
-
-### Step 3: 验证配置
+### Step 2: 验证配置
 
 ```bash
 python3 -c "
@@ -847,7 +820,14 @@ print('✅ 配置文件格式正确')
 "
 ```
 
-### Step 4: 运行审查检查表
+再跑一遍新策略的测试，确认加载无误：
+
+```bash
+source .venv/bin/activate
+python3 -m pytest strategies/{strategy_name}/tests/ -v
+```
+
+### Step 3: 运行审查检查表
 
 按 `docs/strategy/REVIEW_CHECKLIST.md` 逐项检查，输出结果。
 
@@ -925,16 +905,16 @@ python -m backtest.run_backtest \
     --start 20250101 --end 20260710 --log-level INFO
 ```
 
-CLI 已收敛为 7 个参数。`--symbol` / `--config` / `--output` / `--timeframe`
-等在 v3.7 已删除：symbol 唯一来源是 `--strategies` 的 `name:symbol`，
-参数来源是 `overrides/<SYMBOL>.yaml`，输出目录与资金费率由
-`--profile`（默认 `config/backtest.yaml`）提供。
+`run_backtest` CLI 共 7 个参数：`--strategies`（name:symbol）、`--start`、`--end`、
+`--profile`、`--config-path`、`--overrides`、`--log-level`。
+symbol 唯一来源是 `--strategies` 的 `name:symbol`，参数来源是
+`overrides/<SYMBOL>.yaml`，输出目录与资金费率由 `--profile`（默认 `config/backtest.yaml`）提供。
 
 要换一套回测参数而不改动入库文件，复制 `config/quick.example.yaml`
 成 `config/<名字>.yaml`，用 `--profile <名字>` 运行。
 
-**⚠ 不要用 `--daemon`**：该模式重建子命令时只传 `--profile` 与
-`--batch-id`，会丢掉 `--run/--start/--end/--config`，等于跑成空清单。
+**⚠ 不要用 `--daemon`**：batch_runner 的 daemon 模式重建子命令时只传
+`--profile` 与 `--batch-id`，会丢掉 `--run/--start/--end`，等于跑成空清单。
 需要后台执行请在外层 `nohup`。
 
 **产物路径**：`{output_dir}/{strategy}/{date}/{time}/{symbol}/`，
@@ -1045,10 +1025,10 @@ per_symbol_stats = {
 
 #### Step 2: 读取策略代码，提取可调参数清单
 
-解析 `{prefix}_core.py` 和 `config.yaml`，自动提取：
+解析 `{prefix}_core.py` 和 `overrides/<SYMBOL>.yaml`，自动提取：
 
 ```python
-# 从 config.yaml 的 params 段提取可调参数
+# 从 overrides/<SYMBOL>.yaml 的 params 段提取可调参数
 adjustable_params = {
     "{param_name}": {
         "current": float/int/str,   # 当前值
@@ -1082,7 +1062,7 @@ hardcoded_thresholds = [
 | `win_rate < 30%` 且 `profit_factor < 1.0` | 入场逻辑方向性错误 | 检查信号方向（long/short 是否反了）/ 入场条件逻辑是否取反 | 查看 `analyze()` 中 open_long/open_short 的触发条件 |
 | `win_rate < 30%` 且 `profit_factor > 1.5` | 少数大赢覆盖多数小亏，但胜率低 | 收紧止损减少小亏损 / 加宽止盈让大赢跑更远 | 查看 `check_realtime_exit()` 止损逻辑 |
 | `max_drawdown > 30%` 且 `win_rate > 50%` | 单笔亏损过大 | 收紧止损倍数 / 减小单笔仓位 | 查看 ATR 止损倍数和仓位计算 |
-| `max_drawdown > 30%` 且 `win_rate < 40%` | 连续亏损累积 | 增加冷却期 / 增加趋势过滤条件避免逆势 | 查看 `cooldown_bars` 和趋势判断逻辑 |
+| `max_drawdown > 30%` 且 `win_rate < 40%` | 连续亏损累积 | 增加趋势过滤条件避免逆势（基类没有入场冷却，需要冷却须重写 `on_kline()` 且回测模式跳过） | 查看趋势判断逻辑 |
 | `profit_factor < 1.0` 且 `total_trades > 30` | 频繁交易但平均亏损 | 提高入场门槛减少交易 / 加大止盈空间 | 查看 `avg_win / avg_loss` 比值，确认盈亏比 |
 | `total_return < 0` 且手续费占比 > 50% | 手续费吃掉利润 | 减少交易频率 / 提高单笔最低收益要求 | 计算 `总手续费 / |总盈亏|`，确认手续费占比 |
 | `短期好长期差` | 策略过拟合或市场结构变化 | 放宽参数减少过拟合 / 增加市场状态识别 | 对比短期/长期的 per_symbol_stats，找出哪个币种长期拖累 |
@@ -1128,9 +1108,9 @@ hardcoded_thresholds = [
 
 1. **每轮只改一个主维度**，辅维度最多一个，确保可归因
 2. **参数修改幅度**：首次调整步长为当前值的 ±20%（或参数合理范围的 1/3），后续轮次根据上轮效果缩放步长
-3. **代码修改**：优先调参（改 config.yaml），其次调阈值（改 core.py 中的硬编码值），最后调逻辑（改 core.py 中的条件判断）
-4. **禁止归因模糊**：如果连续 2 轮修改同维度无改善，换一个本质不同的维度
-5. **回撤优先**：如果 `max_drawdown > 30%`，优先处理风控（止损/仓位/冷却），再处理收益
+3. **代码修改优先级**：优先调参（改 overrides YAML）→ 调阈值（改 core.py 硬编码）→ 调逻辑（改 core.py 条件判断）
+4. **禁止归因模糊**：连续 2 轮修改同维度无改善，换一个本质不同的维度
+5. **回撤优先**：`max_drawdown > 30%` 时优先处理风控（止损/仓位/冷却），再处理收益
 
 ### Loop 流程图
 
@@ -1162,44 +1142,6 @@ Phase 1: 脚手架创建（一次性）
 └─────────────────────────────────────────────┘
 ```
 
-### 失败原因分析模板
-
-每轮回测未达标时，按动态诊断流程输出：
-
-```
-📊 第 {N} 轮回测诊断:
-
-  回测指标:
-    总收益率: {total_return:.2f}% | 最大回撤: {max_drawdown:.2f}%
-    胜率: {win_rate:.2f}% | 盈亏比: {profit_factor:.2f}
-    交易次数: {total_trades} | 平均盈利: {avg_win:.2f} | 平均亏损: {avg_loss:.2f}
-    夏普: {sharpe:.2f} | 索提诺: {sortino:.2f}
-
-  分币对:
-    {SYMBOL_1}: {trades}笔 | 胜率 {wr:.1f}% | PnL {pnl:.2f}
-    {SYMBOL_2}: {trades}笔 | 胜率 {wr:.1f}% | PnL {pnl:.2f}
-    {SYMBOL_3}: {trades}笔 | 胜率 {wr:.1f}% | PnL {pnl:.2f}
-
-  诊断结论:
-    主因: {诊断描述，如"入场条件过严导致交易次数不足"}
-    辅因: {次要问题，如"止损偏宽导致回撤较大"}
-
-  策略可调参数:
-    {param_1}: {current} → {suggested}（{reason}）
-    {param_2}: {current} → {suggested}（{reason}）
-    硬编码阈值:
-      {threshold_1}: {current} → {suggested}（{reason}）
-
-  修改方案:
-    1. 修改 strategies/{strategy_name}/overrides/{SYMBOL}.yaml: {具体参数变更}
-    2. 修改 {prefix}_core.py: {具体代码变更}
-    3. {其他修改}
-
-  归因标记: 本轮修改维度 = {维度名，如"入场阈值"/"止损倍数"/"指标周期"}
-
-→ 进入第 {N+1} 轮
-```
-
 ---
 
 ## 环境变量清单
@@ -1210,71 +1152,46 @@ Phase 1: 脚手架创建（一次性）
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `DATA_PATH` | `./data` | K线数据存储路径 |
+| `DATA_PATH` | `./data/klines` | K线数据存储路径（= settings.yaml 的 csv_dir） |
 | `CTA_ENV` | `dev` | 运行环境（dev/test/prod） |
 | `BENCHMARK_OUTPUT_PATH` | `./benchmark_output` | benchmark 报告输出路径 |
-| `KLINE_DATA_DIR` | `${DATA_PATH}/strategies/1m` | 1m K线数据源目录（symlink 目标） |
+| `KLINE_DATA_DIR` | `./data/klines` | 共享 K线数据源目录（symlink 目标） |
 
-### 服务配置（实盘模式需要）
-
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
-| `FACTORY_ENDPOINT` | `http://127.0.0.1:8888` | 策略工厂服务地址 |
-| `POSITION_PROXY_URL` | `http://127.0.0.1:8889` | 仓位代理服务地址 |
-| `CALLBACK_PORT` | `8892` | 策略回调端口 |
-| `CALLBACK_HOST` | `0.0.0.0` | 回调监听地址 |
-| `KLINES_WS_URL` | `ws://127.0.0.1:17081/ws/klines` | K线 WebSocket 地址 |
-| `KLINES_HTTP_URL` | `http://127.0.0.1:17081` | K线 HTTP 地址 |
-
-### 可选服务配置
+### 直连下单配置（live/smoking 模式必填）
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `KAFKA_BROKERS` | `127.0.0.1:9092` | Kafka 集群地址 |
-| `KAFKA_TOPIC` | `biance_klines` | Kafka 主题 |
-| `SIGNAL_HUB_ENDPOINT` | `http://127.0.0.1:18888` | 信号推送中心 |
-| `OPENVIKING_SERVER_URL` | `http://127.0.0.1:1933` | OpenViking 服务器 |
-| `OPENVIKING_ROOT_API_KEY` | （空） | OpenViking API Key |
-| `POLYMARKET_WALLET_KEY` | （空） | Polymarket 钱包私钥 |
-| `POLYMARKET_FUNDER_ADDRESS` | （空） | Polymarket 资金方地址 |
-| `DERIBIT_API_KEY` | （空） | Deribit API Key |
-| `DERIBIT_API_SECRET` | （空） | Deribit API Secret |
+| `BINANCE_API_KEY` | （空） | 币安合约 API Key（只勾合约交易权限，勿开提现） |
+| `BINANCE_API_SECRET` | （空） | 币安合约 API Secret |
+
+> **单体模式无外部服务**：行情直连 Binance 公共源（WS 实时 + fapi 历史），
+> 信号存储后由策略进程直接下单。旧版的 FACTORY_ENDPOINT / POSITION_PROXY_URL /
+> KLINES_WS_URL / KAFKA 等服务地址在 v3.7 单体模式下已不存在。
+> 凭证缺失且 `direct_trading.enabled=true` 时，策略进程启动即失败（不静默降级）。
+
+### 其他可选配置
+
+| 环境变量 | 默认值 | 说明 |
+|----------|--------|------|
+| `HTTPS_PROXY` / `HTTP_PROXY` | （空=直连） | 访问 Binance 公共源的代理（国内网络通常需要） |
+| `LOG_LEVEL` | `INFO` | 策略进程日志级别（manager 透传） |
 
 ### .env.example 模板
 
+以模板文件为准：`templates/.env.example`。关键字段：
+
 ```bash
-# ===== 必需配置 =====
-DATA_PATH=./data
+DATA_PATH=./data/klines
 CTA_ENV=dev
 BENCHMARK_OUTPUT_PATH=./benchmark_output
-KLINE_DATA_DIR=./data/klines
 
-# ===== 策略引擎（实盘模式） =====
-FACTORY_ENDPOINT=http://127.0.0.1:8888
-POSITION_PROXY_URL=http://127.0.0.1:8889
-CALLBACK_PORT=8892
-CALLBACK_HOST=0.0.0.0
+# ---- 直连交易所下单（settings.yaml 的 direct_trading.enabled=true 时必填）----
+BINANCE_API_KEY=
+BINANCE_API_SECRET=
 
-# ===== K线数据 =====
-KLINES_WS_URL=ws://127.0.0.1:17081/ws/klines
-KLINES_HTTP_URL=http://127.0.0.1:17081
-
-# ===== Kafka（可选） =====
-KAFKA_BROKERS=127.0.0.1:9092
-KAFKA_TOPIC=biance_klines
-
-# ===== 信号推送（可选） =====
-SIGNAL_HUB_ENDPOINT=http://127.0.0.1:18888
-
-# ===== OpenViking（可选） =====
-OPENVIKING_SERVER_URL=http://127.0.0.1:1933
-OPENVIKING_ROOT_API_KEY=
-
-# ===== 套利模块（可选） =====
-POLYMARKET_WALLET_KEY=
-POLYMARKET_FUNDER_ADDRESS=
-DERIBIT_API_KEY=
-DERIBIT_API_SECRET=
+# ---- 代理（可选，国内网络通常需要）----
+# HTTPS_PROXY=http://127.0.0.1:7890
+# HTTP_PROXY=http://127.0.0.1:7890
 ```
 
 ---
@@ -1314,50 +1231,33 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 | **Bash: pip install** | 安装依赖 | Phase 1 |
 | **Bash: git init/add/commit** | 初始化仓库 | Phase 1 |
 | **Bash: python -m backtest** | 运行回测 | Phase 3 |
+| **Bash: python3 -m pytest** | 跑策略测试 | Phase 2 |
 | **Bash: python3 -c** | 验证配置格式 | Phase 2 |
 | **Write** | 写入策略代码、配置、spec、benchmark | Phase 2/3 |
-| **Edit** | 修改 `strategies/__init__.py`、策略代码（loop 修改） | Phase 2 |
-| **Read** | 读取策略文档、规范文档、回测输出 | 全流程 |
-
----
-
-## 模板处理规范
-
-模板代码经过以下处理，确保开源可用：
-
-1. **替换硬编码 IP** — `192.168.x.x` → `${ENV_VAR}` 或 `127.0.0.1` 默认值
-2. **替换个人路径** — 绝对路径 → `./data` 相对路径或 `DATA_PATH` 环境变量
-3. **排除真实策略** — `strategies/` 只保留空壳 `__init__.py`
-4. **排除运行产物** — `backtest_output*/`、`logs/`、`data/` 不进模板
-5. **保留 .env.example** — 所有部署配置走环境变量
-
-### 模板 vs 原始代码的差异
-
-| 文件 | 原始代码 | 模板 |
-|------|----------|------|
-| `config/settings.yaml` | 含内网 IP | 用 `settings.example.yaml`，所有 IP 为 `127.0.0.1` |
-| `data_manager/klines_loader.py` | `DATA_PATH` 默认值为绝对路径 | 默认值改为 `./data` |
-| `strategies/__init__.py` | import 真实策略 | 只有 docstring，空壳 |
-| `config/openviking_sync.yaml` | 含内网 IP | 用 `${OPENVIKING_SERVER_URL}` 占位 |
-| `config/backtest.yaml` | 含内网 IP | 用 `${ENV_VAR}` 占位 |
+| **Edit** | 修改策略代码与 overrides（loop 修改） | Phase 2 |
+| **Read** | 读取策略文档、参考实现、回测输出 | 全流程 |
 
 ---
 
 ## Critical Constraints
 
-### 编码红线（来自 AI_CONSTRAINTS.md）
+### 编码红线（来自 AI_CONSTRAINTS.md，14 条禁止 + 11 条必须）
 
 | # | 约束 | 原因 |
 |---|------|------|
 | 1 | 禁止入场用未闭合 K 线 | 未来函数，回测失真 |
-| 2 | 禁止 `datetime.now()` 做时间戳 | 用 K 线时间，保证可重现 |
+| 2 | 禁止 `datetime.now()` 做时间戳/冷却判断 | 用 K 线时间，保证可重现 |
 | 3 | 禁止 Strategy 类算指标 | 指标在 Core.analyze() 内用已闭合 K 线 |
 | 4 | 禁止跳过数据不足检查 | 指标计算错误 |
-| 5 | 禁止回测模式启用 K 线冷却 | 回测信号缺失 |
-| 6 | 禁止可变默认值 | `[]`, `{}` 共享状态 |
-| 7 | 禁止缓存字段持久化 | 缓存不进 `to_persist_dict()` |
-| 8 | 禁止自定义止损计数字段 | 用 `BaseState.stop_loss_date` |
-| 9 | 禁止直接用原始 K 线入场 | 多周期必须 `get_closed_data()` |
+| 5 | 禁止假设基类做了入场 K 线冷却 | 基类**没有**；自己实现的冷却必须在回测模式跳过 |
+| 6 | 禁止自定义止损计数字段 | 用 `BaseState.stop_loss_date` |
+| 7 | 禁止移动止盈记录止损日期 | 非止损，次日应可开仓 |
+| 8 | 禁止外部数据注入方法/依赖外部传入指标值 | 指标从 klines_data 参数计算 |
+| 9 | 禁止直接用原始 K 线入场 | 多周期必须对每个时间框架 `get_closed_data()` |
+| 10 | 禁止缓存字段持久化 | 缓存不进 `to_persist_dict()` |
+| 必须 | 平仓走 `_notify_exit_and_clear(..., is_stop_loss=...)` | 不要自己调 `clear_position()` |
+| 必须 | 入场调 `_notify_position_enter(symbol, state)` | 漏了仓位不落盘 |
+| 必须 | overrides 的 `params` 配置 `*_timeframes` | 否则该周期无数据 |
 
 ### 配置文件格式
 
@@ -1366,6 +1266,8 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 | 必须有顶层策略名键 | `name: xxx` 在顶层 | `{strategy_name}:\n  name: xxx` |
 | 参数放在 params 下 | `obs_n: 20` 在顶层 | `params:\n  obs_n: 20` |
 | symbols 用数组格式 | `symbol: BTCUSDT` | `symbols:\n  - BTCUSDT` |
+| trading_mode 必须显式 | （缺省） | `trading_mode: "paper_trading"`（缺省按 live，会下真单） |
+| 死配置不要写 | `cooldown_timeframe: 4h` | （删除——代码不读取，写了不生效） |
 
 ### 开源约束
 
@@ -1374,7 +1276,7 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 | 1 | 禁止硬编码内网 IP（`192.168.x.x`），必须走环境变量 |
 | 2 | 禁止硬编码个人路径（`/home/xxx`），用相对路径或 `DATA_PATH` 环境变量 |
 | 3 | 禁止在代码中写入 API Key / Secret，用 `.env` + `.gitignore` |
-| 4 | `config/settings.yaml` 不进模板，用 `settings.example.yaml` 替代 |
+| 4 | 真实策略（含真实资金/风控参数）不进模板，只保留 example 参考实现 |
 | 5 | 测试中 mock IP 可保留，但需加注释说明是假数据 |
 
 ---
@@ -1388,7 +1290,7 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
   交互:   /trading-dev new
   单步:   /trading-dev scaffold | develop | backtest | benchmark
        ↓
-Phase -1: 交互式引导（仅无参数时）  ← NEW
+Phase -1: 交互式引导（仅无参数时）
   ├── Step 1: 问子命令（默认 new）
   ├── Step 2: 问策略来源（new 子命令）
   └── Step 3: 汇总确认 -> 进 Phase 0
@@ -1396,13 +1298,13 @@ Phase -1: 交互式引导（仅无参数时）  ← NEW
 Phase 0: 环境预检 + 策略信息获取
   ├── Step 0: 环境预检（Python/ta-lib/pip/K线数据/磁盘）
   ├── Step 1: 解析策略来源（文件/目录/URL/自然语言/多轮对话）
-  ├── Step 2: 统一提取为策略规格
+  ├── Step 2: 统一提取为 .strategy-spec.yaml（schema 见 docs/strategy/STRATEGY_SPEC.md）
   └── Step 3: 执行确认（全自动→直接执行 / 交互→用户确认）
        ↓
 Phase 1: 脚手架创建（一次性）
-  ├── 复制模板代码
-  ├── 创建 Python venv + 安装依赖（预检已知 Python 版本和 ta-lib 状态）
-  ├── 准备 1m K 线数据（symlink/下载）
+  ├── 镜像复制模板（含两个参考实现）
+  ├── 创建 Python venv + 安装依赖
+  ├── 准备 K 线数据（symlink / download_data.py 下载，路径 {csv_dir}/{interval}/）
   ├── git init + 首次 commit
   └── 输出就绪报告
        ↓
@@ -1410,16 +1312,16 @@ Phase 1: 脚手架创建（一次性）
 │ Loop (最多 5 轮)                             │
 │                                             │
 │   Phase 2: 生成/修改策略代码                  │
-│     ├── 加载规范文档                          │
-│     ├── 生成 strategy.py + core.py           │
-│     ├── 生成配置 + 测试                       │
-│     ├── 注册策略                              │
-│     ├── 验证配置格式                          │
+│     ├── 读规范文档 + 参考实现 example_ma_cross │
+│     ├── 生成 strategy.py + {prefix}_core.py  │
+│     ├── 生成 overrides/<SYMBOL>.yaml + 测试   │
+│     ├── 登记 config/strategies.yaml          │
+│     ├── 验证配置格式 + 跑测试                  │
 │     └── 运行审查检查表                        │
 │         ↓                                   │
 │   Phase 3: 回测验证                          │
-│     ├── 短期 → 中期 → 长期                   │
-│     └── 解析 backtest_result.json            │
+│     ├── 短期 → 中期 → 长期（run_backtest_batch.sh）│
+│     └── 解析 backtest_result.json 的 metrics │
 │         ↓                                   │
 │   达标？ ── 是 ──→ 输出 benchmark.md         │
 │     │                                       │
@@ -1439,8 +1341,6 @@ Phase 1: 脚手架创建（一次性）
 
 ## Related Skills
 
-- `zk_cta-strategy-dev`: 策略开发一站式（逻辑确认 + 代码生成）
-- `zk_cta-strategy-logic-refine`: 策略逻辑确认
-- `zk_cta-strategy-implement`: 策略代码生成
-- `zk_cta-backtest-run`: 对话式回测
-- `zk_cta-backtest-config`: 回测配置管理
+- `trading-discovery`: 指定代币/策略/时间范围的回测探索（git clone 拉策略 → 批量回测）
+- `trading-replay`: 实盘信号与回测信号对比回放
+- `trading-deploy`: 策略部署

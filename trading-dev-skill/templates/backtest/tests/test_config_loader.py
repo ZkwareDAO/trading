@@ -72,11 +72,19 @@ class TestLoadProfile:
     """测试 run-profile 加载（run_backtest 与 batch_runner 共用同一实现）"""
 
     def test_load_backtest_profile_by_name(self):
-        """按 profile 名加载，无需写全路径"""
-        config = load_profile("backtest")
+        """按 profile 名加载，无需写全路径。
 
-        assert config["start"] == "20260601"
-        assert config["data_dir"] == "./data/klines"
+        断言值不写死：配置文件里的 start 会被正常调整（如推进回测区间），
+        硬编码会让测试随配置漂移误报。加载机制的正确性 = 结果与文件内容一致。
+        """
+        import yaml
+
+        config = load_profile("backtest")
+        with open("config/backtest.yaml", encoding="utf-8") as f:
+            expected = yaml.safe_load(f) or {}
+
+        assert config["start"] == expected["start"]
+        assert config["data_dir"] == expected["data_dir"]
 
     def test_missing_profile_raises_file_not_found(self):
         """profile 不存在必须报错，不可静默回退默认值——
@@ -110,8 +118,12 @@ class TestLoadProfile:
             load_profile(bad_name)
 
     def test_legitimate_names_still_work(self):
-        """守卫不得误伤正常 profile 名。"""
-        assert load_profile("backtest")["start"] == "20260601"
+        """守卫不得误伤正常 profile 名。断言与配置文件内容一致，不写死具体值。"""
+        import yaml
+
+        with open("config/backtest.yaml", encoding="utf-8") as f:
+            expected = yaml.safe_load(f) or {}
+        assert load_profile("backtest")["start"] == expected["start"]
 
     @pytest.mark.parametrize("reserved", [
         "settings", "settings.example", "strategies", "strategies.example",

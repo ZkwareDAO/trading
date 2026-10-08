@@ -2,6 +2,12 @@
 """
 测试信号格式对齐设计文档
 
+注：原文件末尾的 TestKafkaFormatAlignment（4 个用例）随 KafkaSignalProducer
+一并删除 —— 它测的是已不存在的类。这 4 个用例断言的字段（strategy_type /
+signal.action / strategy.internal / user_id）都出自 CtaSignalCSV.to_json()，
+覆盖仍由本文件 TestDesignDocSignalFormat 承担，且 HTTP 通道发的正是同一个
+to_json() 结果，故无覆盖缺口。
+
 根据信号格式规范：docs/SIGNAL_CSV_FORMAT.md
 
 需要验证的格式差异:
@@ -205,122 +211,3 @@ class TestDesignDocSignalFormat:
         assert "trigger_price" in sig
         assert "slippage" in sig
         assert "order_type" in sig
-
-
-class TestKafkaFormatAlignment:
-    """Kafka 推送应发送与设计文档一致的格式"""
-
-    @pytest.fixture
-    def mock_producer(self):
-        from strategy_core.signal_logging.kafka_producer import KafkaSignalProducer
-
-        dedup_file = os.path.join(tempfile.gettempdir(), f"test_kafka_fmt_dedup_{os.getpid()}.txt")
-        config = {
-            "enabled": True,
-            "bootstrap_servers": "127.0.0.1:9092",
-            "topic": "strategy_signals",
-            "dedup_file": dedup_file,
-        }
-        with patch("strategy_core.signal_logging.kafka_producer.KafkaProducer") as MockKafka:
-            mock_kafka = MagicMock()
-            MockKafka.return_value = mock_kafka
-            producer = KafkaSignalProducer(config)
-            producer._kafka_producer = mock_kafka
-            yield producer
-        if os.path.exists(dedup_file):
-            os.unlink(dedup_file)
-
-    def test_kafka_message_has_strategy_type(self, mock_producer):
-        """Kafka 消息应包含 strategy_type"""
-        captured = {}
-
-        def capture_send(topic, **kwargs):
-            captured["value"] = kwargs.get("value")
-            return MagicMock()
-
-        mock_producer._kafka_producer.send.side_effect = capture_send
-
-        signal = _make_signal()
-        mock_producer.send_signal(
-            signal,
-            strategy_name="cta_rbreaker",
-            strategy_version="v2",
-            interval="1m",
-            strategy_params={"threshold": 0.005},
-            strategy_type="CTAFuture",
-            risk_strategy_type="cta_intraday",
-            user_id=1,
-        )
-
-        value = captured["value"]
-        if isinstance(value, bytes):
-            value = value.decode("utf-8")
-        parsed = json.loads(value)
-        assert parsed["strategy_type"] == "CTAFuture"
-        assert parsed["risk_strategy_type"] == "cta_intraday"
-
-    def test_kafka_message_has_signal_action(self, mock_producer):
-        """Kafka 消息的 signal 对象应包含 action"""
-        captured = {}
-
-        def capture_send(topic, **kwargs):
-            captured["value"] = kwargs.get("value")
-            return MagicMock()
-
-        mock_producer._kafka_producer.send.side_effect = capture_send
-
-        signal = Signal(
-            signal_id="sig-action-test",
-            strategy_id="test",
-            signal_type=SignalType.REVERSE_SHORT,
-            symbol="BTCUSDT",
-            price=72000.0,
-            timestamp=datetime(2026, 4, 14, 10, 0, 0, tzinfo=timezone.utc),
-        )
-        mock_producer.send_signal(signal)
-
-        value = captured["value"]
-        if isinstance(value, bytes):
-            value = value.decode("utf-8")
-        parsed = json.loads(value)
-        assert parsed["signal"]["action"] == "reverse_short"
-
-    def test_kafka_message_uses_internal_not_interval(self, mock_producer):
-        """Kafka 消息应使用 strategy.internal 而非 strategy.interval"""
-        captured = {}
-
-        def capture_send(topic, **kwargs):
-            captured["value"] = kwargs.get("value")
-            return MagicMock()
-
-        mock_producer._kafka_producer.send.side_effect = capture_send
-
-        signal = _make_signal()
-        mock_producer.send_signal(signal, interval="15m")
-
-        value = captured["value"]
-        if isinstance(value, bytes):
-            value = value.decode("utf-8")
-        parsed = json.loads(value)
-        assert "internal" in parsed["strategy"]
-        assert "interval" not in parsed["strategy"]
-        assert parsed["strategy"]["internal"] == "15m"
-
-    def test_kafka_message_user_id(self, mock_producer):
-        """Kafka 消息 user_id 应来自配置"""
-        captured = {}
-
-        def capture_send(topic, **kwargs):
-            captured["value"] = kwargs.get("value")
-            return MagicMock()
-
-        mock_producer._kafka_producer.send.side_effect = capture_send
-
-        signal = _make_signal()
-        mock_producer.send_signal(signal, user_id=99)
-
-        value = captured["value"]
-        if isinstance(value, bytes):
-            value = value.decode("utf-8")
-        parsed = json.loads(value)
-        assert parsed["user_id"] == 99

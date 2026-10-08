@@ -32,8 +32,8 @@ class TestBatchDownloadHistory:
     def _make_manager(self, tmp_path: Path) -> DataManager:
         config = DataManagerConfig(
             csv_dir=str(tmp_path / "klines"),
-            klines_service_enabled=True,
-            klines_service_http_url="http://127.0.0.1:17081",
+            realtime_enabled=True,
+            # removed http url #"http://127.0.0.1:17081",
         )
         dm = DataManager(config)
         dm.enable_kline_repository()

@@ -63,8 +63,8 @@ def make_api_klines(n: int, start_ts: datetime = None) -> list:
 def dm(tmp_path):
     config = DataManagerConfig(
         csv_dir=str(tmp_path / "klines"),
-        klines_service_enabled=True,
-        klines_service_http_url="http://test:17081",
+        realtime_enabled=True,
+        # removed http url #"http://test:17081",
         auto_sync_on_connect=False,
     )
     dm_inst = DataManager(config)
@@ -103,7 +103,7 @@ class TestOnKlineReceivedGapFill:
         # 新 K 线 3 分钟前（在 5 分钟内，但与缓存差距大）
         new_kline = make_kline(ts=make_recent_ts(3))
 
-        with patch.object(dm, '_fetch_klines_from_api', new_callable=AsyncMock) as mock_api:
+        with patch.object(dm, '_fetch_from_binance_public', new_callable=AsyncMock) as mock_api:
             # API 返回中间缺失的 4 条
             mock_api.return_value = make_api_klines(4, base_ts + timedelta(minutes=1))
 
@@ -127,7 +127,7 @@ class TestOnKlineReceivedGapFill:
         # 60 秒 gap — 正常，不触发补齐
         new_kline = make_kline(ts=base_ts + timedelta(seconds=60))
 
-        with patch.object(dm, '_fetch_klines_from_api', new_callable=AsyncMock) as mock_api:
+        with patch.object(dm, '_fetch_from_binance_public', new_callable=AsyncMock) as mock_api:
             dm._on_kline_received(new_kline)
             mock_api.assert_not_called()
 

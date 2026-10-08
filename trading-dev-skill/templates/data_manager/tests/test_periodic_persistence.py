@@ -18,8 +18,8 @@ from data_manager.manager import DataManager, DataManagerConfig
 def dm(tmp_path):
     config = DataManagerConfig(
         csv_dir=str(tmp_path / "klines"),
-        klines_service_enabled=True,
-        klines_service_http_url="http://test:17081",
+        realtime_enabled=True,
+        # removed http url #"http://test:17081",
         auto_sync_on_connect=False,
         persistence_interval_minutes=1,  # 缩短间隔用于测试
     )

@@ -39,7 +39,7 @@ pip install -r requirements.txt   # 含 backtrader、TA-Lib
 python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260610 --end 20260708
 ```
 
-回测**不依赖任何外部服务**——回测链路不初始化 factory 与 signal hub 客户端（由代码保证，非配置开关）。
+回测**不依赖任何外部服务**——回测链路不初始化任何交易所客户端（由代码保证，非配置开关）。
 
 ### CLI 参数（7 个）
 
@@ -92,7 +92,7 @@ max_workers: 4
 
 以上 9 个键**全部有代码消费**。profile 里不写没人读的"说明性配置" ——
 早期版本曾写 `mode: backtest` 与 `signal_hub.enabled: false` /
-`strategy_engine.factory_enabled: false`，但回测不初始化推送与 factory 客户端，
+但回测不初始化推送与下单客户端，
 "回测不推信号"由链路本身保证，那三个键从未生效，
 反而与 `settings.yaml`（其中 `signal_hub.enabled: true`）形成"两处不同值"的假象，
 已删除。
@@ -246,7 +246,7 @@ python3 -m backtest.batch_runner --daemon
 python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
 
 # 多策略多标的
-python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,obv_atr_v2:ETHUSDT
+python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
 ```
 
 `--run` 优先于 `--config` 登记表。symbol 小写自动转大写。

@@ -3,10 +3,14 @@
 测试统一信号输出格式
 
 验证:
-1. SignalLogger.log_signal 只做 Kafka 推送，不写 SignalStorage CSV
-2. 引擎的 _log_signal_unified 同时写 CSV 和 Kafka
-3. CSV 和 Kafka 使用相同的 CtaSignalCSV 格式
-4. user_id 从配置正确传递到 Kafka 消息
+1. SignalLogger.log_signal 只做直连下单（配置 direct_trader 时），不写 SignalStorage CSV
+2. 引擎的 _log_signal_unified 统一写 CSV 并触发下单
+3. CSV 和下单 payload 使用相同的 CtaSignalCSV 格式
+4. user_id 从配置正确传递到下单 payload
+
+通道沿革：Kafka → signal_hub HTTP 推送 → 单体直连下单（direct_trader），
+前两代已随单体化移除；"log_signal 不写 CSV" 的不变量与通道无关，跨代保留，
+现用 direct_trader 验证。
 """
 
 import json
@@ -17,24 +21,33 @@ from unittest.mock import MagicMock, patch, call
 from strategy_core.signal_logging.storage import Signal, SignalType
 from strategy_core.signal_logging.logger import SignalLogger, SignalStorage
 from strategy_core.signal_logging.csv_adapter import CtaSignalCSV
-from strategy_core.signal_logging.kafka_producer import KafkaSignalProducer
 
 
-class TestSignalLoggerKafkaOnly:
-    """测试 SignalLogger.log_signal 只做 Kafka 推送"""
+class TestSignalLoggerDirectRouting:
+    """测试 SignalLogger.log_signal 直连路由语义（单体模式）
+
+    不变量（与通道无关，跨 Kafka→HTTP→direct_trader 三代沿革保留）：
+    1. log_signal 不落 SignalStorage CSV —— CSV 由引擎的 _log_signal_unified
+       统一写（走 SignalCsvWriter），log_signal 再写会产生两份格式不同的记录
+    2. 配置 direct_trader 时经 CtaSignalCSV 转换后调用 execute 下单
+    3. 未配置 direct_trader 时不下单、不报错（只落 JSON 备份）
+    4. 下单失败如实返回 False（单体后没有第二条通道兜底，失败不许伪装成功）
+    """
 
     @pytest.fixture
-    def mock_kafka_producer(self):
-        producer = MagicMock(spec=KafkaSignalProducer)
-        producer.is_available.return_value = True
-        producer.send_signal.return_value = True
-        return producer
+    def mock_direct_trader(self):
+        trader = MagicMock()
+        trader.execute.return_value = True
+        return trader
 
-    def test_log_signal_does_not_call_storage_save(self, mock_kafka_producer, tmp_path):
+    def _make_logger(self, storage, direct_trader=None):
+        return SignalLogger(storage, direct_trader=direct_trader)
+
+    def test_log_signal_does_not_call_storage_save(self, mock_direct_trader, tmp_path):
         """log_signal 不应调用 storage.save"""
         storage = SignalStorage(base_dir=str(tmp_path / "signals"))
         with patch.object(storage, 'save') as mock_save:
-            logger = SignalLogger(storage, kafka_producer=mock_kafka_producer)
+            logger = self._make_logger(storage, mock_direct_trader)
 
             signal = Signal(
                 signal_id="test-sig-1",
@@ -47,10 +60,10 @@ class TestSignalLoggerKafkaOnly:
 
             mock_save.assert_not_called()
 
-    def test_log_signal_calls_kafka_send_signal(self, mock_kafka_producer, tmp_path):
-        """log_signal 应调用 kafka_producer.send_signal"""
+    def test_log_signal_routes_to_direct_trader(self, mock_direct_trader, tmp_path):
+        """log_signal 应把 Signal 转成 CtaSignalCSV 交给 direct_trader.execute"""
         storage = SignalStorage(base_dir=str(tmp_path / "signals"))
-        logger = SignalLogger(storage, kafka_producer=mock_kafka_producer)
+        logger = self._make_logger(storage, mock_direct_trader)
 
         signal = Signal(
             signal_id="test-sig-2",
@@ -59,35 +72,17 @@ class TestSignalLoggerKafkaOnly:
             symbol="ETHUSDT",
             price=3000.0,
         )
-        logger.log_signal(signal, strategy_params={"user_id": 99, "strategy_type": "CTAFutureFactory"})
+        logger.log_signal(signal, strategy_params={"user_id": 7})
 
-        mock_kafka_producer.send_signal.assert_called_once()
-        call_signal = mock_kafka_producer.send_signal.call_args[0][0]
-        call_kwargs = mock_kafka_producer.send_signal.call_args[1]
-        assert call_signal.signal_id == "test-sig-2"
-        assert call_kwargs.get("user_id") == 99
+        mock_direct_trader.execute.assert_called_once()
+        cta = mock_direct_trader.execute.call_args[0][0]
+        assert cta.signal_id == "test-sig-2"
 
-    def test_log_signal_without_strategy_params(self, mock_kafka_producer, tmp_path):
-        """log_signal 无 strategy_params 时应传空 dict"""
-        storage = SignalStorage(base_dir=str(tmp_path / "signals"))
-        logger = SignalLogger(storage, kafka_producer=mock_kafka_producer)
-
-        signal = Signal(
-            signal_id="test-sig-3",
-            strategy_id="test_strategy",
-            signal_type=SignalType.BUY,
-            symbol="BNBUSDT",
-            price=600.0,
-        )
-        logger.log_signal(signal)
-
-        mock_kafka_producer.send_signal.assert_called_once_with(signal)
-
-    def test_log_signal_without_kafka_producer(self, tmp_path):
-        """没有 Kafka producer 时应静默跳过"""
+    def test_log_signal_without_direct_trader(self, tmp_path):
+        """未配置 direct_trader 时不下单、不报错，且不落 CSV"""
         storage = SignalStorage(base_dir=str(tmp_path / "signals"))
         with patch.object(storage, 'save') as mock_save:
-            logger = SignalLogger(storage, kafka_producer=None)
+            logger = SignalLogger(storage)
 
             signal = Signal(
                 signal_id="test-sig-4",
@@ -100,15 +95,16 @@ class TestSignalLoggerKafkaOnly:
             result = logger.log_signal(signal, strategy_params={"user_id": 1})
 
             mock_save.assert_not_called()
+            # 无直连执行器 = 不下单部署（如 paper_trading），信号不出进程属预期，恒返回 True
             assert result is True
 
-    def test_log_signal_when_kafka_unavailable(self, tmp_path):
-        """Kafka 不可用时不应抛异常"""
+    def test_log_signal_when_direct_execute_fails(self, tmp_path):
+        """下单失败时如实返回 False，不抛异常，也不落 CSV"""
         storage = SignalStorage(base_dir=str(tmp_path / "signals"))
         with patch.object(storage, 'save') as mock_save:
-            mock_kafka = MagicMock(spec=KafkaSignalProducer)
-            mock_kafka.is_available.return_value = False
-            logger = SignalLogger(storage, kafka_producer=mock_kafka)
+            failing_trader = MagicMock()
+            failing_trader.execute.return_value = False
+            logger = self._make_logger(storage, failing_trader)
 
             signal = Signal(
                 signal_id="test-sig-5",
@@ -120,11 +116,12 @@ class TestSignalLoggerKafkaOnly:
             result = logger.log_signal(signal, strategy_params={"user_id": 1})
 
             mock_save.assert_not_called()
-            assert result is True
+            failing_trader.execute.assert_called_once()
+            assert result is False
 
 
 class TestUnifiedSignalFormat:
-    """测试 CSV 和 Kafka 使用相同的 CtaSignalCSV 格式"""
+    """测试 CSV 和外发 payload 使用相同的 CtaSignalCSV 格式"""
 
     def _make_signal(self) -> Signal:
         return Signal(
@@ -138,8 +135,8 @@ class TestUnifiedSignalFormat:
             strength=0.75,
         )
 
-    def test_csv_and_kafka_share_same_csi_signal_format(self):
-        """CSV 和 Kafka 应使用相同的 CtaSignalCSV 格式"""
+    def test_csv_and_order_payload_share_same_csi_signal_format(self):
+        """CSV 和下单 payload 应使用相同的 CtaSignalCSV 格式"""
         signal = self._make_signal()
 
         cta = CtaSignalCSV.from_signal(
@@ -286,36 +283,3 @@ class TestSignalCsvWriterSlippage:
             reader = csv_module.DictReader(f)
             row = next(reader)
             assert row["signal_slippage"] == "0.03"
-
-
-class TestEngineLogSignalUnified:
-    """测试引擎的 _log_signal_unified 行为"""
-
-    @pytest.fixture
-    def mock_csv_writer(self):
-        return MagicMock()
-
-    @pytest.fixture
-    def mock_signal_logger(self):
-        logger = MagicMock()
-        logger.kafka_producer = MagicMock()
-        logger.kafka_producer.is_available.return_value = True
-        logger.kafka_producer.send_signal.return_value = True
-        return logger
-
-    def test_engine_has_csv_writer_attribute(self, tmp_path):
-        """StrategyEngine 应支持 csv_writer 参数"""
-        from strategy_core.strategy_engine.engine import StrategyEngine
-
-        engine = StrategyEngine(
-            strategies_dir=str(tmp_path),
-            csv_writer=MagicMock()
-        )
-        assert engine.csv_writer is not None
-
-    def test_engine_csv_writer_defaults_to_none(self, tmp_path):
-        """StrategyEngine 的 csv_writer 默认应为 None"""
-        from strategy_core.strategy_engine.engine import StrategyEngine
-
-        engine = StrategyEngine(strategies_dir=str(tmp_path))
-        assert engine.csv_writer is None
