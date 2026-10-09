@@ -315,5 +315,8 @@ python3 replay.py [--date YYYYMMDD] [--config config.yaml] [--snapshot-dir ./sna
 
 ## Related Skills
 
-- `trading-dev`: CTA 策略开发全生命周期
+- `trading-dev`: CTA 策略开发全生命周期。**dev 产出的项目（v3.7 单体模板）可直接被 replay 复盘**：
+  代码/数据路径（`data/signals/`、`data/positions/`、`data/history_positions/`）、
+  `strategies/<name>/overrides/<SYM>.yaml`、`scripts/run_backtest_batch.sh` 均与
+  replay 的假设一致；deploy 到实盘机器后把项目根目录填进 `config.yaml` 的 `path` 即可。
 - `trading-discovery`: 指定代币/策略/时间范围的回测探索

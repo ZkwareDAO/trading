@@ -5,7 +5,7 @@
 # 绝不含策略参数（策略参数唯一来源是 strategies/<name>/overrides/<SYM>.yaml）。
 #
 # 使用方式：
-#   python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260601
+#   python -m backtest.run_backtest --strategies example_ma_cross:BTCUSDT --start 20260601
 #   python -m backtest.batch_runner
 #
 # 本文件即 --profile 的默认值，日常回测无需传 --profile。
@@ -15,13 +15,13 @@
 # CLI --start / --end 可覆盖本文件的 start / end。
 #
 # 本文件只写【代码真实消费】的键。早期版本曾写 mode / signal_hub /
-# strategy_engine 三段，但它们没有任何消费者，只是与 settings.yaml 同名键取值
+# 三段多余配置，它们没有任何消费者，只是与 settings.yaml 同名键取值
 # 相反、制造"两处配置都不生效"的假象，已删除。
 #
 # 与 config/settings.yaml 的关系（重要）：
 #   回测的配置来源是【两份】，不是一份 ——
 #     settings.yaml   与实盘共用。回测会读它的
-#                     strategy_engine.use_bar_high_low_for_exit，
+#                     use_bar_high_low_for_exit，
 #                     该字段决定止损止盈用 K 线 high/low 还是收盘价判定，
 #                     直接影响成交次数与 PnL，因此必须回测实盘一致。
 #     本文件           回测的运行方式（时间范围/资金/费率/输出/并发）。
