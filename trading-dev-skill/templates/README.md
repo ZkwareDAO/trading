@@ -9,7 +9,7 @@
 
 ## 快速开始（开箱即用）
 
-仓库自带 30 天 BTCUSDT 示例数据，**无需配置、无需外部服务，两条命令跑通一次回测**。
+**无需配置、无需外部服务，三条命令跑通一次回测**（示例数据需先下载）。
 
 ### 1. 安装依赖
 
@@ -28,13 +28,16 @@ pip install -r requirements-dev.txt              # 测试依赖（跑 pytest 才
 > 若 `pip install TA-Lib` 报找不到头文件，说明系统库未装成功——先确认 `ta_lib.h` 存在于
 > `/usr/include/ta-lib/` 或 `$(brew --prefix)/include/ta-lib/`。
 
-### 2. 跑一次回测（用自带示例数据）
+### 2. 下载示例数据并跑一次回测
 
 ```bash
-python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260610 --end 20260708
+# 先下载示例数据（Binance 公共源，无需 API key）
+python scripts/download_data.py --symbol BTCUSDT --interval 1m --days 40
+
+python -m backtest.run_backtest --strategies example_ma_cross:BTCUSDT --start 20260610 --end 20260708
 ```
 
-结果输出到 `backtest_output/sar_snt3_v3/<日期>/BTCUSDT/`，含权益曲线、交易明细、信号 CSV 与图表。
+结果输出到 `backtest_output/example_ma_cross/<日期>/BTCUSDT/`，含权益曲线、交易明细、信号 CSV 与图表。
 
 回测**不依赖任何外部服务**——回测链路不初始化任何交易所客户端（由代码保证，非配置开关）。
 
@@ -56,7 +59,7 @@ python scripts/download_data.py --symbol ETHUSDT --interval 1m --days 30
 python3 -m backtest.batch_runner
 
 # 只跑部分（不改登记表），格式与实盘 --run 一致
-python3 -m backtest.batch_runner --run sar_snt3_v3:BTCUSDT,sar_snt3_v3:ETHUSDT
+python3 -m backtest.batch_runner --run example_ma_cross:BTCUSDT,example_ma_cross:ETHUSDT
 ```
 
 单次 `run_backtest` 只跑一个 `name:symbol`；多个一律走 `batch_runner`。
@@ -139,8 +142,8 @@ cta-strategy-code/
 │   │   └── binance_trader.py  #   直连下单执行器（单体模式唯一信号出口）
 │   ├── position_persistence.py# 仓位持久化
 │   └── utils/                 # 工具模块
-│       ├── config_loader.py   #   多环境配置加载
-│       ├── strategy_loader.py #   策略加载器
+│       ├── strategies_loader.py #   策略配置加载（登记表 + overrides 展开）
+│       ├── env_placeholders.py  #   ${VAR} 占位符解析
 │       └── strategy_naming.py #   策略命名工具
 ├── data_manager/              # 数据管理器
 │   ├── manager.py             #   DataManager 核心（5 个核心方法）
@@ -150,12 +153,13 @@ cta-strategy-code/
 │   ├── indicators.py          #   技术指标计算（ADX, RSI, MACD, BOLL...）
 │   └── cache.py               #   分层缓存（1m 常驻 + 大周期 LRU）
 ├── strategies/                # 策略插件（每个策略一个目录）
-│   └── sar_snt3_v3/           #   SAR + 情绪指标策略（参考实现）
-│       ├── strategy.py        #     BaseStrategy 子类
-│       ├── core.py            #     BaseStrategyCore：analyze() 信号逻辑
-│       ├── state.py           #     BaseState 子类：持仓与风控状态
-│       ├── config.yaml        #     策略默认参数
-│       └── overrides/         #     per-symbol 参数（唯一事实来源）
+│   ├── example_ma_cross/      #   单周期参考实现：双均线交叉（先读这个）
+│   │   ├── strategy.py        #     BaseStrategy 子类（接口层）
+│   │   ├── example_ma_cross_core.py  # BaseStrategyCore：analyze() 信号逻辑
+│   │   ├── overrides/         #     per-symbol 参数（唯一事实来源）
+│   │   └── tests/             #     测试写法
+│   ├── example_mtf_trend/     #   多周期参考实现：1d+4h+1h 三周期共振
+│   └── <你的策略>/            #   新策略照参考实现的结构创建
 ├── backtest/                  # 回测框架（backtrader 适配层）
 ├── data/                      # 数据目录
 │   ├── klines/                #   K 线数据 (CSV)，含 BTCUSDT 示例数据
@@ -174,10 +178,12 @@ cta-strategy-code/
 
 | 策略 | 说明 | 基类架构 | 时间周期 | 多标的 |
 |------|------|----------|----------|--------|
-| **sar_snt3_v3** | SAR + 情绪指标趋势策略 | ✅ BaseStrategy | 1m→多周期 | ✅ |
+| **example_ma_cross** | 双均线交叉（单周期参考实现，纯 pandas） | ✅ BaseStrategy | 4h | ✅ |
+| **example_mtf_trend** | 多周期趋势（1d 定方向 + 4h 触发 + 1h 确认） | ✅ BaseStrategy | 1d+4h+1h | ✅ |
 
-本仓库作为**模板**发布，只保留一个完整的参考实现。新增策略请看
-[docs/strategy/QUICKSTART.md](docs/strategy/QUICKSTART.md)——照 `sar_snt3_v3` 的结构，
+本仓库作为**模板**发布，只保留参考实现。新增策略请看
+[docs/strategy/QUICKSTART.md](docs/strategy/QUICKSTART.md)——先完整读一遍
+`example_ma_cross`（多周期再读 `example_mtf_trend`），照它的结构，
 实现 `analyze()` + `check_realtime_exit()` 两个方法即可接入回测与实盘。
 
 ---
@@ -200,13 +206,8 @@ cta-strategy-code/
 ## 测试
 
 ```bash
-# 数据管理器测试
-python3 -m pytest data_manager/tests/ -v
-
-# 回测框架测试
-python3 -m backtest.tests.test_core
-
-
+# 全量测试（数据管理器 / 回测框架 / 策略核心 / 参考实现 / 根级）
+python3 -m pytest data_manager/tests/ backtest/tests/ strategy_core/ strategies/ tests/ -v
 ```
 
 ---

@@ -606,6 +606,7 @@ kline 数据: ✅ (symlink) / ✅ (下载) / ⚠️ (需手动准备)
 | 登记策略 | 静默执行 | 静默执行 | 静默执行 |
 | 验证配置 | 展示验证结果 | 静默验证，失败自动修复 | 展示验证结果 |
 | 审查检查表 | 展示审查结果 | 静默审查，不通过自动修复 | 展示审查结果 |
+| README 同步 | 展示更新内容 | 静默更新 | 展示更新内容 |
 
 **单步模式**：`/trading-dev develop` 只执行 Phase 2（需要已有脚手架和 `.strategy-spec.yaml`）。
 
@@ -830,6 +831,20 @@ python3 -m pytest strategies/{strategy_name}/tests/ -v
 ### Step 3: 运行审查检查表
 
 按 `docs/strategy/REVIEW_CHECKLIST.md` 逐项检查，输出结果。
+
+### Step 4: 同步更新 README.md（强制）
+
+策略开发完成后，必须同步更新项目根目录 `README.md` 的策略相关内容，保持文档与代码一致：
+
+| 位置 | 更新内容 |
+|------|----------|
+| `## 项目结构` 的 `strategies/` 段 | 追加新策略目录（与参考实现同级的注释格式） |
+| `## 参考策略` 表格 | 追加一行：策略名 / 一句话说明 / 基类架构 / 时间周期 / 多标的 |
+| `## 快速开始` 的示例命令 | 若新策略更适合作演示，可替换 `example_ma_cross:BTCUSDT` 示例 |
+
+**规则**：README 只描述"有什么"，不复制策略参数——参数细节留在
+`strategies/{name}/overrides/<SYMBOL>.yaml` 的注释里。新策略是参考实现级别的
+通用范例才写进"参考策略"表；一次性业务策略只在项目结构里出现目录名即可。
 
 ---
 
@@ -1317,7 +1332,8 @@ Phase 1: 脚手架创建（一次性）
 │     ├── 生成 overrides/<SYMBOL>.yaml + 测试   │
 │     ├── 登记 config/strategies.yaml          │
 │     ├── 验证配置格式 + 跑测试                  │
-│     └── 运行审查检查表                        │
+│     ├── 运行审查检查表                        │
+│     └── 同步更新 README.md                    │
 │         ↓                                   │
 │   Phase 3: 回测验证                          │
 │     ├── 短期 → 中期 → 长期（run_backtest_batch.sh）│
