@@ -606,7 +606,7 @@ kline 数据: ✅ (symlink) / ✅ (下载) / ⚠️ (需手动准备)
 | 登记策略 | 静默执行 | 静默执行 | 静默执行 |
 | 验证配置 | 展示验证结果 | 静默验证，失败自动修复 | 展示验证结果 |
 | 审查检查表 | 展示审查结果 | 静默审查，不通过自动修复 | 展示审查结果 |
-| README 同步 | 展示更新内容 | 静默更新 | 展示更新内容 |
+| README 重写/同步 | 展示更新内容 | 静默执行 | 展示更新内容 |
 
 **单步模式**：`/trading-dev develop` 只执行 Phase 2（需要已有脚手架和 `.strategy-spec.yaml`）。
 
@@ -832,19 +832,54 @@ python3 -m pytest strategies/{strategy_name}/tests/ -v
 
 按 `docs/strategy/REVIEW_CHECKLIST.md` 逐项检查，输出结果。
 
-### Step 4: 同步更新 README.md（强制）
+### Step 4: 重写/同步 README.md（强制）
 
-策略开发完成后，必须同步更新项目根目录 `README.md` 的策略相关内容，保持文档与代码一致：
+策略开发完成后，项目根目录 `README.md` 必须与开发的策略保持一致。按场景处理：
+
+#### 场景 A：新项目（Phase 1 刚创建，本次开发的是项目主策略）→ **重写**
+
+脚手架复制出来的 README 是模板视角（主角是 `example_ma_cross` 参考实现），
+新项目的主角是本次开发的策略，必须重写策略相关段落：
+
+```markdown
+# {strategy_name} — {一句话策略定位}
+
+> {direction} 策略 | 主周期 {timeframes[0]} | 标的 {symbols} | 前缀 {PREFIX}
+
+## 策略概述
+
+- 入场：{spec.entry.description}（完整条件清单见 strategies/{name}/.strategy-spec.yaml）
+- 出场：{spec.exit 摘要} + overrides 的 risk 段统一风控兜底
+- 参数：per-symbol overrides（strategies/{name}/overrides/<SYMBOL>.yaml，实盘回测共用）
+
+## 快速开始
+
+python -m backtest.run_backtest --strategies {strategy_name}:{SYMBOL} --start 20260601 --end 20260709
+（替换模板里的 example_ma_cross 示例命令）
+
+## 项目结构
+（模板结构保留，strategies/ 段把 {strategy_name} 列为主策略，
+  example_ma_cross / example_mtf_trend 标注为"框架参考实现"）
+
+## 配置体系 / 文档导航 / 免责声明
+（框架通用段落原样保留）
+```
+
+**重写规则**：
+- 主角换成开发策略；参考实现降级为"框架参考实现"一节，不占快速开始
+- 策略参数不复制进 README——参数细节留在 overrides YAML 的注释里
+- 框架通用段落（配置体系三层模型、免责声明、文档导航、测试命令）保留不动
+
+#### 场景 B：已有项目追加新策略 → **增量同步**
 
 | 位置 | 更新内容 |
 |------|----------|
 | `## 项目结构` 的 `strategies/` 段 | 追加新策略目录（与参考实现同级的注释格式） |
 | `## 参考策略` 表格 | 追加一行：策略名 / 一句话说明 / 基类架构 / 时间周期 / 多标的 |
-| `## 快速开始` 的示例命令 | 若新策略更适合作演示，可替换 `example_ma_cross:BTCUSDT` 示例 |
+| `## 快速开始` 的示例命令 | 若新策略更适合作演示，可替换现有示例 |
 
-**规则**：README 只描述"有什么"，不复制策略参数——参数细节留在
-`strategies/{name}/overrides/<SYMBOL>.yaml` 的注释里。新策略是参考实现级别的
-通用范例才写进"参考策略"表；一次性业务策略只在项目结构里出现目录名即可。
+**规则**：README 只描述"有什么"，不复制策略参数。参考实现级别的通用范例才写进
+"参考策略"表；一次性业务策略只在项目结构里出现目录名即可。
 
 ---
 
@@ -1333,7 +1368,7 @@ Phase 1: 脚手架创建（一次性）
 │     ├── 登记 config/strategies.yaml          │
 │     ├── 验证配置格式 + 跑测试                  │
 │     ├── 运行审查检查表                        │
-│     └── 同步更新 README.md                    │
+│     └── 重写/同步 README.md（场景A重写/B增量） │
 │         ↓                                   │
 │   Phase 3: 回测验证                          │
 │     ├── 短期 → 中期 → 长期（run_backtest_batch.sh）│
