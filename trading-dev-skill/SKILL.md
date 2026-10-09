@@ -692,6 +692,24 @@ class Strategy(BaseStrategy):
 - 入场 state 必填字段：`position`/`position_id`/`entry_price`/`entry_time`/`entry_timestamp`/`stop_price`/`peak_price` + 特有字段
 - 下单量：`metadata["target_notional"] = (current_cash or 0) * self.leverage`；杠杆从 `params.leverage` 读（`capital.leverage` 不会传给 Core）
 
+**两个核心方法的完整签名**（必须照抄，参数名错了基类调用即 TypeError）：
+
+```python
+def analyze(self, symbol, klines_data, current_time=None,
+            realtime_price=None, current_cash=None) -> Dict[str, Any]:
+    # klines_data: {timeframe: DataFrame}，由基类 _fetch_multi_timeframe_data()
+    #   按 _get_indicator_timeframes() 收集的周期从 data_manager 取出
+    ...
+
+def check_realtime_exit(self, symbol, current_price, current_time=None,
+                        bar_high=None, bar_low=None) -> Dict[str, Any]:
+    # 注意：出场侧不传 klines_data！指标性出场需要数据时无法在 Core 内取
+    # （Core 不持有 data_manager）。照参考实现只做价格止损；指标性出场
+    # 放 analyze() 的反向信号，通用风控（回落止盈/固定止盈）由 overrides
+    # 的 risk 段兜底。出场开头必须调 state.update_pnl_extremes(current_price)。
+    ...
+```
+
 #### 1.3 __init__.py
 
 ```python
