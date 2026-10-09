@@ -26,6 +26,7 @@ overrides/<SYMBOL>.yaml，而那份合成文件只会让人误以为改它就能
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -174,7 +175,11 @@ def format_check(r: dict) -> str:
 
 def register_strategy(project_dir: str, strategy_name: str, symbols: list,
                       trading_mode: str = "", dry_run: bool = False) -> dict:
-    """把策略写入 config/strategies.yaml（编排层，实盘回测共用）"""
+    """把策略写入 config/strategies.yaml（编排层，实盘回测共用）
+
+    用文本插入而非 yaml.safe_dump 全量重写：登记表头部的使用说明注释
+    （symbols 两种格式、trading_mode 语义等）必须保留，safe_dump 会把它们全部抹掉。
+    """
     if yaml is None:
         return {"ok": False, "error": "PyYAML not installed"}
 
@@ -183,7 +188,11 @@ def register_strategy(project_dir: str, strategy_name: str, symbols: list,
         return {"ok": False, "error": f"not found: {target}"}
 
     cfg = _parse_yaml(target)
-    strategies = cfg.get("strategies")
+    strategies = cfg.get("strategies") if isinstance(cfg, dict) else None
+    if strategies is None:
+        # 新脚手架（trading-dev v3.7 模板）的登记表全部注释，yaml 解析为 None
+        # —— 这不是错误，是"尚未登记任何策略"的初始态
+        strategies = {}
     if not isinstance(strategies, dict):
         return {"ok": False, "error": f"{target} has no 'strategies' mapping"}
 
@@ -201,8 +210,6 @@ def register_strategy(project_dir: str, strategy_name: str, symbols: list,
     added = [s for s in symbols if s not in existing_names]
     merged = list(existing) + added
     entry["symbols"] = merged
-    strategies[strategy_name] = entry
-    cfg["strategies"] = strategies
 
     result = {
         "ok": True,
@@ -217,8 +224,49 @@ def register_strategy(project_dir: str, strategy_name: str, symbols: list,
     if dry_run:
         return result
 
-    with open(target, "w", encoding="utf-8") as f:
-        yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+    # --- 文本插入：找到 strategies: 段内最后一个非注释条目之后追加 ---
+    text = target.read_text(encoding="utf-8")
+    if strategy_name in strategies:
+        # 已有条目 → 全量重写不可避免（要改它的 symbols），但这种情况罕见，
+        # 登记表头部注释已在首次创建时承担过职责
+        strategies[strategy_name] = entry
+        cfg["strategies"] = strategies
+        with open(target, "w", encoding="utf-8") as f:
+            yaml.safe_dump(cfg, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+        return result
+
+    # 新条目：定位 strategies: 段，找段内最后一个顶层子项行（缩进两格的 key）的行号
+    lines = text.split("\n")
+    seg_start = None
+    for i, ln in enumerate(lines):
+        if ln.rstrip() == "strategies:":
+            seg_start = i
+            break
+    if seg_start is None:
+        # 没有 strategies: 键（理论上 cfg.get 已含），追加到文件尾
+        text = text.rstrip("\n") + "\nstrategies:\n"
+        seg_start = len(text.split("\n")) - 1
+        lines = text.split("\n")
+
+    insert_at = seg_start
+    child_re = re.compile(r"^  [A-Za-z0-9_\-]+:")
+    for i in range(seg_start + 1, len(lines)):
+        ln = lines[i]
+        if child_re.match(ln):
+            insert_at = i
+            continue
+        if ln and not ln.startswith((" ", "#")):
+            break  # 下一个顶层键，段结束
+        if ln.strip() and not ln.startswith("#") and not ln.startswith(" "):
+            break
+    block = [f"  {strategy_name}:"]
+    if trading_mode:
+        block.append(f'    trading_mode: "{trading_mode}"')
+    block.append("    symbols:")
+    block.extend(f"      - {s}" for s in merged)
+    lines[insert_at + 1:insert_at + 1] = block
+
+    target.write_text("\n".join(lines), encoding="utf-8")
     return result
 
 
