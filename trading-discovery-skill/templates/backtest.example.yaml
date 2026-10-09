@@ -5,7 +5,7 @@
 # 绝不含策略参数（策略参数唯一来源是 strategies/<name>/overrides/<SYM>.yaml）。
 #
 # 使用方式：
-#   python -m backtest.run_backtest --strategies sar_snt3_v3:BTCUSDT --start 20260601
+#   python -m backtest.run_backtest --strategies example_ma_cross:BTCUSDT --start 20260601
 #   python -m backtest.batch_runner
 #
 # 本文件即 --profile 的默认值，日常回测无需传 --profile。

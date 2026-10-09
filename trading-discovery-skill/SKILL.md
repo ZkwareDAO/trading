@@ -81,6 +81,13 @@ Phase 4   → 回测执行与结果通知
   1. 将解析出的策略及其 git 仓库地址记录在 `config.yaml` 中（顶层 key = 策略目录名，值含 `git_url`）。
   2. 根据用户期望代币，生成该策略的清单文件 `strategies.yaml`（`strategies` 段，列出策略包名 + symbols）。
 
+> **trading-dev 产出的项目（v3.7 单体模板）无需第 2 步**：
+> 代币清单已由 dev 的 Phase 2 登记在
+> `(策略目录)/config/strategies.yaml`（登记表 = 代币清单，同一份文件），
+> discovery.py 直接读它，不要另生成 `strategies.yaml` 覆盖。
+> `config.yaml` 里 `git_url` 留空即可 —— fetch_strategies.py 对空 url 告警跳过，
+> 本地目录已存在（dev 脚手架产出）则 discovery 后续直接使用。
+
 完成后回到 Phase 1.3 复检，通过则进入 Phase 2。
 
 ---
@@ -281,5 +288,8 @@ python3 discovery.py --start 20260601 [--end 20260801] [--config config.yaml] [-
 
 ## Related Skills
 
-- `trading-dev`: CTA 策略开发全生命周期
+- `trading-dev`: CTA 策略开发全生命周期。**dev 产出的项目可直接作为 discovery 的策略目录**：
+  在 `config.yaml` 登记目录名（`git_url` 留空），discovery.py 会读项目自带的
+  `config/strategies.yaml`（dev Phase 2 登记的代币清单）并走其自带
+  `scripts/run_backtest_batch.sh` 回测，overrides 已由 dev 生成无需兜底。
 - `trading-replay`: 每日策略代码备份 + 回放回测
