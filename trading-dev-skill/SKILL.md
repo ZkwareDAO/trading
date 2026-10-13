@@ -364,23 +364,20 @@ default_params:                # Core.__init__ 从 params 读取的参数及默�
 
 ### Step 1: 复制模板代码
 
-从 skill 模板目录复制骨架代码到新项目。
+从 GitHub 仓库克隆模板代码到新项目。
 
-**模板根目录**：自动检测，优先级：
-
-1. 环境变量 `TRADING_DEV_TEMPLATE_DIR`（如有设置）
-2. `~/.claude/skills/trading-dev/templates/`（默认安装位置）
-3. 当前 SKILL.md 所在目录的 `templates/` 子目录
+**模板来源**：`https://github.com/ZkwareDAO/strategy-template.git`
 
 ```bash
-# 自动检测模板目录
-if [ -n "$TRADING_DEV_TEMPLATE_DIR" ]; then
+# 克隆模板仓库到临时目录
+TEMPLATE_REPO="https://github.com/ZkwareDAO/strategy-template.git"
+TEMPLATE_DIR=$(mktemp -d)
+git clone --depth 1 "$TEMPLATE_REPO" "$TEMPLATE_DIR"
+
+# 克隆失败时回退到本地缓存（如有）
+if [ $? -ne 0 ] && [ -n "$TRADING_DEV_TEMPLATE_DIR" ] && [ -d "$TRADING_DEV_TEMPLATE_DIR" ]; then
+    echo "⚠ GitHub 克隆失败，使用本地缓存: $TRADING_DEV_TEMPLATE_DIR"
     TEMPLATE_DIR="$TRADING_DEV_TEMPLATE_DIR"
-elif [ -d "$HOME/.claude/skills/trading-dev/templates" ]; then
-    TEMPLATE_DIR="$HOME/.claude/skills/trading-dev/templates"
-else
-    # SKILL.md 同级目录
-    TEMPLATE_DIR="$(dirname "$(find "$HOME/.claude/skills" -name SKILL.md -path "*/trading-dev/*" 2>/dev/null | head -1)")/templates"
 fi
 ```
 
@@ -388,32 +385,32 @@ fi
 
 | 源路径 | 说明 |
 |--------|------|
-| `templates/strategy_core/` | 基类框架（BaseStrategy/BaseState/BaseStrategyCore + 统一风控） |
-| `templates/backtest/` | 回测引擎（run_backtest / batch_runner） |
-| `templates/data_manager/` | K线数据管理（CSV + WS + 多时间框架聚合） |
-| `templates/scripts/` | `download_data.py` / `run_backtest_batch.sh` / `run_live_batch.sh` / `resample_1m_to_multi_tf.py` |
-| `templates/config/` | 三层配置（settings.yaml / strategies.yaml / backtest.yaml run-profile），全部入库 |
-| `templates/strategies/` | 参考实现（example_ma_cross 单周期、example_mtf_trend 多周期）+ README |
-| `templates/tests/` | 根级测试 |
-| `templates/docs/` | 全部文档（strategy/ 五件套 + STRATEGY_SPEC.md 等） |
-| `templates/requirements*.txt` | 依赖清单 |
-| `templates/.gitignore` / `.env.example` | 排除规则 / 环境变量模板 |
-| `templates/run_strategies_manager.py` / `run_strategy.py` | 入口 |
-| `templates/start.sh` / `stop.sh` | 启停脚本 |
-| `templates/CLAUDE.md` / `README.md` / `ARCHITECTURE.md` | 项目文档 |
+| `strategy_core/` | 基类框架（BaseStrategy/BaseState/BaseStrategyCore + 统一风控） |
+| `backtest/` | 回测引擎（run_backtest / batch_runner） |
+| `data_manager/` | K线数据管理（CSV + WS + 多时间框架聚合） |
+| `scripts/` | `download_data.py` / `run_backtest_batch.sh` / `run_live_batch.sh` / `resample_1m_to_multi_tf.py` |
+| `config/` | 三层配置（settings.yaml / strategies.yaml / backtest.yaml run-profile），全部入库 |
+| `strategies/` | 参考实现（example_ma_cross 单周期、example_mtf_trend 多周期）+ README |
+| `tests/` | 根级测试 |
+| `docs/` | 全部文档（strategy/ 五件套 + STRATEGY_SPEC.md 等） |
+| `requirements*.txt` | 依赖清单 |
+| `.gitignore` / `.env.example` | 排除规则 / 环境变量模板 |
+| `run_strategies_manager.py` / `run_strategy.py` | 入口 |
+| `start.sh` / `stop.sh` | 启停脚本 |
+| `CLAUDE.md` / `README.md` / `ARCHITECTURE.md` | 项目文档 |
 
 **不复制**（模板中已排除，此处列出原因）：
 
 | 排除项 | 原因 |
 |--------|------|
 | `.env` | 含真实凭证，只保留 `.env.example` |
-| `strategies/sar_snt3_v3/` 类真实策略 | 业务逻辑与真实资金参数不进模板 |
+| `strategies/` 下真实策略目录 | 业务逻辑与真实资金参数不进模板 |
 | `data/ logs/ backtest_output*/` | 运行时生成 |
 
 **复制命令**：
 
 ```bash
-TEMPLATE_DIR="{已检测的模板目录}"
+TEMPLATE_DIR="{克隆的模板目录}"
 PROJECT_DIR="{project_path}"
 
 # 整体镜像复制（模板已是干净的开源子集，无需再挑拣）
@@ -421,6 +418,9 @@ cp -r $TEMPLATE_DIR/. $PROJECT_DIR/
 
 # 创建本地 .env（从模板）
 cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env
+
+# 清理临时克隆目录
+rm -rf "$TEMPLATE_DIR"
 ```
 
 > **与旧版差异**：v3.7 模板即完整可运行项目（单体模式，直连 Binance 公共行情），
@@ -528,9 +528,9 @@ fi
 ```bash
 cd {project_path}
 git init
-echo "data/" >> .gitignore    # K线数据不入库
+# .gitignore 已从模板复制（含 data/、.env 排除规则）
 git add .
-git commit -m "init: scaffold from trading-dev-skill template"
+git commit -m "init: scaffold from strategy-template"
 ```
 
 > `.env` 已在模板 `.gitignore` 中排除，不会误提交。
@@ -1246,7 +1246,7 @@ Phase 1: 脚手架创建（一次性）
 
 ### .env.example 模板
 
-以模板文件为准：`templates/.env.example`。关键字段：
+以模板文件为准：`.env.example`（从 strategy-template 仓库获取）。关键字段：
 
 ```bash
 DATA_PATH=./data/klines

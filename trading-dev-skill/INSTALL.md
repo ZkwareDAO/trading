@@ -50,13 +50,14 @@ ln -s /home/qpw/workspace/trading/trading-dev-skill ~/.claude/skills/trading-dev
 
 ## 自定义配置
 
-### 模板目录
+### 模板来源
 
-默认从 `~/.claude/skills/trading-dev/templates/` 读取模板。如需覆盖：
+模板从 GitHub 仓库 `https://github.com/ZkwareDAO/strategy-template.git` 自动克隆。
+如需使用本地缓存（离线场景）：
 
 ```bash
 # 在 .env 或 shell profile 中设置
-export TRADING_DEV_TEMPLATE_DIR=/custom/path/to/templates
+export TRADING_DEV_TEMPLATE_DIR=/path/to/local/strategy-template
 ```
 
 ### Benchmark 输出路径
@@ -99,29 +100,11 @@ trading/
 │   └── trading-dev.md           # /trading-dev 命令入口
 ├── trading-dev-skill/
 │   ├── SKILL.md                 # Skill 定义（Claude Code 读取）
-│   ├── INSTALL.md               # 本文件
-│   └── templates/               # 项目模板
-│       ├── strategy_core/       # 基类框架
-│       ├── backtest/            # 回测引擎
-│       │   └── config/
-│       │       ├── main.example.yaml
-│       │       ├── main.legacy.example.yaml
-│       │       ├── strategies.example.yaml
-│       │       └── example/
-│       ├── data_manager/        # K线数据管理
-│       ├── scripts/             # 辅助脚本
-│       ├── config/              # 配置模板
-│       ├── docs/strategy/       # 开发规范文档
-│       ├── strategies/          # 策略空壳（__init__.py）
-│       ├── requirements.txt
-│       ├── .env.example
-│       ├── .gitignore
-│       ├── run_strategies_manager.py
-│       ├── run_strategy.py
-│       ├── start.sh
-│       └── stop.sh
+│   └── INSTALL.md               # 本文件
 └── cta_volume_resonance/        # 未来 skill 示例
 ```
+
+> **项目模板**已从 skill 目录中移除，改为从 `https://github.com/ZkwareDAO/strategy-template.git` 自动克隆。
 
 ## 新增 Skill 流程
 
