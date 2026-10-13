@@ -53,10 +53,16 @@ ln -s /home/qpw/workspace/trading/trading-dev-skill ~/.claude/skills/trading-dev
 ### 模板来源
 
 模板从 GitHub 仓库 `https://github.com/ZkwareDAO/strategy-template.git` 自动克隆。
-如需使用本地缓存（离线场景）：
 
+**指定版本（tag）**：
 ```bash
-# 在 .env 或 shell profile 中设置
+# 默认拉取 v1.0.0；可覆盖为其他 tag
+export STRATEGY_TEMPLATE_TAG=v1.0.0
+```
+
+**离线回退（本地缓存）**：
+```bash
+# GitHub 克隆失败时使用本地缓存
 export TRADING_DEV_TEMPLATE_DIR=/path/to/local/strategy-template
 ```
 

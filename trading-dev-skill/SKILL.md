@@ -371,8 +371,14 @@ default_params:                # Core.__init__ 从 params 读取的参数及默�
 ```bash
 # 克隆模板仓库到临时目录
 TEMPLATE_REPO="https://github.com/ZkwareDAO/strategy-template.git"
+TEMPLATE_TAG="${STRATEGY_TEMPLATE_TAG:-v1.0.0}"  # 默认 v1.0.0；可覆盖为其他 tag
 TEMPLATE_DIR=$(mktemp -d)
-git clone --depth 1 "$TEMPLATE_REPO" "$TEMPLATE_DIR"
+
+if [ -n "$TEMPLATE_TAG" ]; then
+    git clone --depth 1 --branch "$TEMPLATE_TAG" "$TEMPLATE_REPO" "$TEMPLATE_DIR"
+else
+    git clone --depth 1 "$TEMPLATE_REPO" "$TEMPLATE_DIR"
+fi
 
 # 克隆失败时回退到本地缓存（如有）
 if [ $? -ne 0 ] && [ -n "$TRADING_DEV_TEMPLATE_DIR" ] && [ -d "$TRADING_DEV_TEMPLATE_DIR" ]; then
@@ -1243,6 +1249,8 @@ Phase 1: 脚手架创建（一次性）
 |----------|--------|------|
 | `HTTPS_PROXY` / `HTTP_PROXY` | （空=直连） | 访问 Binance 公共源的代理（国内网络通常需要） |
 | `LOG_LEVEL` | `INFO` | 策略进程日志级别（manager 透传） |
+| `STRATEGY_TEMPLATE_TAG` | `v1.0.0` | 指定模板仓库 tag 版本 |
+| `TRADING_DEV_TEMPLATE_DIR` | （空） | 模板本地缓存路径（GitHub 克隆失败时回退） |
 
 ### .env.example 模板
 
