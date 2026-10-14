@@ -480,6 +480,20 @@ $PYTHON_CMD subscribe_websocket.py \
 | `LOGS_DIR` | ./logs | 日志目录 |
 | `DEPLOY_OUTPUTS_DIR` | ./deploy_outputs | 部署产物目录 |
 
+### 语言支持
+
+deploy.sh 自动检测策略语言类型（无需手动配置）：
+- 存在 `Cargo.toml` → Rust 模式
+- 存在 `requirements.txt` 或 `strategy_core/` → Python 模式
+
+| 模式 | 启动命令 | 配置来源 |
+|------|----------|----------|
+| Python | `scripts/run_live_batch.sh` | `strategies/<name>/overrides/<SYM>.yaml` |
+| Rust | `cargo run --release -- run` | `config/{name}/example.yaml` |
+
+> Phase 3（K线数据准备）和 Phase 5（启动策略）的数据格式两种语言共用，
+> Python 辅助脚本（data_readiness_check.py 等）对两种模式通用。
+
 ### WebSocket
 
 | 变量 | 默认值 |

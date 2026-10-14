@@ -7,7 +7,23 @@
 #   实盘启动:         scripts/run_live_batch.sh --strategies N --symbols S --daemon --yes
 #                     （内部转调 run_strategies_manager.py，共用 cta_strategy_core.pid）
 #   全量启动:         ./start.sh
+#
+# 支持两种语言（自动检测）:
+#   Python: run_strategy.py + scripts/run_live_batch.sh
+#   Rust:   cargo run --release -- run
 set -euo pipefail
+
+# === 语言自动检测 ===
+detect_lang() {
+    local dir="$1"
+    if [ -f "${dir}/Cargo.toml" ]; then
+        echo "rust"
+    elif [ -f "${dir}/requirements.txt" ] || [ -d "${dir}/strategy_core" ]; then
+        echo "python"
+    else
+        echo "python"
+    fi
+}
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEPLOY_DATE=$(date +%Y%m%d_%H%M%S)
@@ -64,30 +80,49 @@ log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOGS_DIR/deploy-${DE
 # === Phase 0: preflight ===
 log "=== Phase 0: Preflight ==="
 
-if [ ! -f "${PROJECT_DIR}/run_strategy.py" ]; then
-    log "FATAL: run_strategy.py not found under ${PROJECT_DIR}"
-    log "  Set --project-dir (or \$PROJECT_DIR) to the CTA project root."
-    exit 1
-fi
 PROJECT_ABS="$(cd "$PROJECT_DIR" && pwd)"
+LANG=$(detect_lang "$PROJECT_ABS")
+log "Detected language: $LANG"
 
-# The template's deps live in .venv, and many hosts have no `python3` on PATH.
-if [ -z "$PYTHON_CMD" ]; then
-    if [ -x "${PROJECT_ABS}/.venv/bin/python" ]; then
-        PYTHON_CMD="${PROJECT_ABS}/.venv/bin/python"
-    elif command -v python3 &>/dev/null; then
-        PYTHON_CMD="python3"
-    elif command -v python &>/dev/null; then
-        PYTHON_CMD="python"
-    else
-        log "FATAL: no usable Python found"
+if [ "$LANG" = "rust" ]; then
+    # Rust 模式预检
+    if [ ! -f "${PROJECT_ABS}/Cargo.toml" ]; then
+        log "FATAL: Cargo.toml not found under ${PROJECT_ABS}"
         exit 1
     fi
+    if ! command -v cargo &>/dev/null; then
+        log "FATAL: cargo not found (required for Rust strategies)"
+        exit 1
+    fi
+    git --version &>/dev/null || { log "FATAL: git not found"; exit 1; }
+    log "OK: cargo + git available"
+    log "OK: project root $PROJECT_ABS [rust]"
+    PYTHON_CMD=""  # Rust 不需要 Python
+else
+    # Python 模式预检
+    if [ ! -f "${PROJECT_DIR}/run_strategy.py" ]; then
+        log "FATAL: run_strategy.py not found under ${PROJECT_DIR}"
+        log "  Set --project-dir (or \$PROJECT_DIR) to the CTA project root."
+        exit 1
+    fi
+
+    if [ -z "$PYTHON_CMD" ]; then
+        if [ -x "${PROJECT_ABS}/.venv/bin/python" ]; then
+            PYTHON_CMD="${PROJECT_ABS}/.venv/bin/python"
+        elif command -v python3 &>/dev/null; then
+            PYTHON_CMD="python3"
+        elif command -v python &>/dev/null; then
+            PYTHON_CMD="python"
+        else
+            log "FATAL: no usable Python found"
+            exit 1
+        fi
+    fi
+    $PYTHON_CMD -c 'import sys' &>/dev/null || { log "FATAL: Python unusable: $PYTHON_CMD"; exit 1; }
+    git --version &>/dev/null || { log "FATAL: git not found"; exit 1; }
+    log "OK: python ($PYTHON_CMD) + git available"
+    log "OK: project root $PROJECT_ABS [python]"
 fi
-$PYTHON_CMD -c 'import sys' &>/dev/null || { log "FATAL: Python unusable: $PYTHON_CMD"; exit 1; }
-git --version &>/dev/null || { log "FATAL: git not found"; exit 1; }
-log "OK: python ($PYTHON_CMD) + git available"
-log "OK: project root $PROJECT_ABS"
 
 # === Phase 1: config ===
 log "=== Phase 1: Config Init ==="
@@ -103,28 +138,66 @@ log "Config loaded"
 
 # === Phase 2: git pull + analyze ===
 log "=== Phase 2: Git Pull + Analyze ==="
-if [ -n "$GIT_URL" ]; then
-    $PYTHON_CMD "${SCRIPT_DIR}/git_pull.py" \
-        --git-url "$GIT_URL" \
-        --strategies-dir "$STRATEGIES_DIR" \
-        --branch "$GIT_BRANCH"
+
+if [ "$LANG" = "rust" ]; then
+    # Rust: git pull + cargo check
+    STRATEGY_DIR="${STRATEGIES_DIR}/${STRATEGY_NAME}"
+    if [ -n "$GIT_URL" ]; then
+        if [ -d "${STRATEGY_DIR}/.git" ]; then
+            log "git pull ${STRATEGY_DIR}"
+            (cd "$STRATEGY_DIR" && git pull origin "$GIT_BRANCH") || log "WARN: git pull failed"
+        else
+            log "git clone $GIT_URL → ${STRATEGY_DIR}"
+            mkdir -p "$STRATEGIES_DIR"
+            git clone "$GIT_URL" "$STRATEGY_DIR" || { log "FATAL: git clone failed"; exit 1; }
+        fi
+    else
+        log "STRATEGIES_GIT_URL not set — using strategies already on disk"
+    fi
+
+    [ -z "$STRATEGY_NAME" ] && { log "FATAL: --strategy required"; exit 1; }
+    [ -d "$STRATEGY_DIR" ] || { log "FATAL: strategy dir not found: $STRATEGY_DIR"; exit 1; }
+
+    # cargo check 验证编译
+    log "cargo check..."
+    (cd "$STRATEGY_DIR" && cargo check --release) || { log "FATAL: cargo check failed"; exit 1; }
+    log "✅ Rust 策略编译通过"
+
+    # 从配置读取代币清单
+    RUST_SYMBOLS=""
+    for cfg in "$STRATEGY_DIR"/config/"$STRATEGY_NAME"/*.yaml; do
+        [ -f "$cfg" ] || continue
+        syms=$(grep -E '^\s*-?\s*(symbol|name):' "$cfg" 2>/dev/null | sed 's/.*: *//' | tr -d '"'"'"' \r' | paste -sd, -)
+        [ -n "$syms" ] && RUST_SYMBOLS="${RUST_SYMBOLS:+${RUST_SYMBOLS},}${syms}"
+    done
+    [ -n "$RUST_SYMBOLS" ] && export RUST_SYMBOLS
+
+    echo ""
+    echo -n "Continue with deployment? (y/n): "; read -r CONFIRM
+    [ "$CONFIRM" != "y" ] && { log "Cancelled"; exit 0; }
 else
-    log "STRATEGIES_GIT_URL not set — using strategies already on disk"
+    # Python: 原有逻辑
+    if [ -n "$GIT_URL" ]; then
+        $PYTHON_CMD "${SCRIPT_DIR}/git_pull.py" \
+            --git-url "$GIT_URL" \
+            --strategies-dir "$STRATEGIES_DIR" \
+            --branch "$GIT_BRANCH"
+    else
+        log "STRATEGIES_GIT_URL not set — using strategies already on disk"
+    fi
+
+    $PYTHON_CMD "${SCRIPT_DIR}/git_pull.py" --strategies-dir "$STRATEGIES_DIR" --list
+
+    [ -z "$STRATEGY_NAME" ] && { log "FATAL: --strategy required"; exit 1; }
+
+    $PYTHON_CMD "${SCRIPT_DIR}/git_pull.py" \
+        --strategies-dir "$STRATEGIES_DIR" \
+        --strategy "$STRATEGY_NAME" --analyze || log "WARN: analysis reported issues"
+
+    echo ""
+    echo -n "Continue with deployment? (y/n): "; read -r CONFIRM
+    [ "$CONFIRM" != "y" ] && { log "Cancelled"; exit 0; }
 fi
-
-# List strategies (symbols come from overrides/ file names)
-$PYTHON_CMD "${SCRIPT_DIR}/git_pull.py" --strategies-dir "$STRATEGIES_DIR" --list
-
-[ -z "$STRATEGY_NAME" ] && { log "FATAL: --strategy required"; exit 1; }
-
-$PYTHON_CMD "${SCRIPT_DIR}/git_pull.py" \
-    --strategies-dir "$STRATEGIES_DIR" \
-    --strategy "$STRATEGY_NAME" --analyze || log "WARN: analysis reported issues"
-
-# Confirm
-echo ""
-echo -n "Continue with deployment? (y/n): "; read -r CONFIRM
-[ "$CONFIRM" != "y" ] && { log "Cancelled"; exit 0; }
 
 # === Phase 2.5: per-symbol config init ===
 # 必须排在 Phase 3 之前：K线需求是从 overrides/<SYMBOL>.yaml 的
