@@ -241,6 +241,152 @@ def with_venv_env(venv_python):
     return env
 
 
+def detect_lang(project_path):
+    """自动检测策略语言类型
+
+    检测规则：
+    - 存在 Cargo.toml → rust
+    - 存在 requirements.txt 或 strategy_core/ → python
+    - 默认 python（向后兼容）
+    """
+    p = Path(project_path)
+    if (p / "Cargo.toml").is_file():
+        return "rust"
+    if (p / "requirements.txt").is_file() or (p / "strategy_core").is_dir():
+        return "python"
+    return "python"
+
+
+def read_symbols_rust(strategy_dir):
+    """从 Rust 策略配置读取代币清单
+
+    Rust 配置结构：config/{strategy}/example.yaml 或 config/{strategy}/{SYMBOL}.yaml
+    代币在配置的 symbols 列表中（字符串或对象格式）。
+    返回 (symbols 列表, 来源描述, strategy_name)。
+    """
+    config_root = strategy_dir / "config"
+    symbols = []
+    strategy_name = None
+
+    if not config_root.is_dir():
+        return [], None, None
+
+    # 扫描所有 yaml 文件（跳过 _global）
+    for yaml_file in sorted(config_root.rglob("*.yaml")):
+        if yaml_file.name.startswith("_"):
+            continue
+        try:
+            with open(yaml_file, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            continue
+        if not isinstance(cfg, dict):
+            continue
+
+        # 获取策略名
+        if "strategy" in cfg and isinstance(cfg["strategy"], str):
+            strategy_name = cfg["strategy"]
+
+        # 从 symbols 列表收集代币
+        for sym in cfg.get("symbols") or []:
+            if isinstance(sym, dict):
+                s = sym.get("symbol") or sym.get("name")
+            elif isinstance(sym, str):
+                s = sym
+            else:
+                continue
+            if s:
+                symbols.append(str(s).upper())
+
+        # 单文件模式：顶层 symbol 字段
+        if "symbol" in cfg:
+            symbols.append(str(cfg["symbol"]).upper())
+
+    # 去重保序
+    seen = set()
+    unique = []
+    for s in symbols:
+        if s not in seen:
+            seen.add(s)
+            unique.append(s)
+
+    src = str(config_root) if unique else None
+    return unique, src, strategy_name
+
+
+def run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash, commission):
+    """执行 Rust 策略回测
+
+    Rust 回测通过 cargo run --release -- backtest 调用。
+    逐个代币串行执行，输出到 discovery_outputs/{strategy}/。
+    """
+    out_dir = Path(out_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 定位 Cargo.toml
+    cargo_toml = proj_dir / "Cargo.toml"
+    if not cargo_toml.is_file():
+        print(f"  ❌ 未找到 Cargo.toml: {cargo_toml}")
+        return False
+
+    # 定位策略配置
+    config_root = proj_dir / "config"
+    strategy_name = None
+    config_file = None
+
+    for yaml_file in sorted(config_root.rglob("*.yaml")):
+        if yaml_file.name.startswith("_"):
+            continue
+        try:
+            with open(yaml_file, encoding="utf-8") as f:
+                cfg = yaml.safe_load(f) or {}
+        except Exception:
+            continue
+        if isinstance(cfg, dict) and "strategy" in cfg:
+            strategy_name = cfg["strategy"]
+            config_file = yaml_file
+            break
+
+    if not config_file:
+        print(f"  ❌ 未找到策略配置文件（config/*.yaml 中无 strategy 字段）")
+        return False
+
+    # 先编译
+    print(f"  🔨 编译 Rust 项目...")
+    r = subprocess.run(["cargo", "build", "--release"], cwd=str(proj_dir))
+    if r.returncode != 0:
+        print(f"  ❌ cargo build 失败")
+        return False
+
+    # 逐个代币执行回测
+    all_ok = True
+    for symbol in symbols:
+        cmd = [
+            "cargo", "run", "--release", "--", "backtest",
+            "--config", str(config_file),
+            "--symbol", symbol,
+            "--start", start,
+            "--output_dir", str(out_dir),
+            "--cash", str(cash),
+            "--leverage", "1",
+        ]
+        if end:
+            cmd += ["--end", end]
+        if commission:
+            # Rust 版可能不支持 --commission 参数，忽略
+            pass
+
+        print(f"  $ {' '.join(cmd)}")
+        r = subprocess.run(cmd, cwd=str(proj_dir))
+        if r.returncode != 0:
+            print(f"  ❌ {symbol}: 回测失败 (exit {r.returncode})")
+            all_ok = False
+        else:
+            print(f"  ✅ {symbol}: 回测完成")
+
+    return all_ok
+
+
 def main():
     ap = argparse.ArgumentParser(description="指定代币/策略/时间范围的回测探索")
     ap.add_argument("--start", required=True,
@@ -312,6 +458,32 @@ def main():
             skip += 1
             continue
 
+        # 自动检测语言类型
+        lang = detect_lang(proj_dir)
+        print(f"  语言: {lang}")
+
+        if lang == "rust":
+            # Rust 分支
+            symbols, src, strategy_name = read_symbols_rust(proj_dir)
+            if not symbols:
+                print(f"  ⚠ {name}: 无法从 Rust 配置确定代币清单，跳过")
+                skip += 1
+                continue
+            print(f"  代币({len(symbols)}): {', '.join(symbols)}  ← {src}")
+            print(f"  策略名: {strategy_name}")
+
+            out_dir = output_root / name
+            out_dir.mkdir(parents=True, exist_ok=True)
+
+            if run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash, commission):
+                print(f"  ✅ {name}: 回测完成 → {out_dir}/")
+                success += 1
+            else:
+                print(f"  ❌ {name}: 回测失败")
+                fail += 1
+            continue
+
+        # Python 分支（现有逻辑不变）
         batch_script = proj_dir / "scripts" / "run_backtest_batch.sh"
         if not batch_script.is_file():
             print(f"  ⚠ {name}: 缺少 scripts/run_backtest_batch.sh（需模板 v3.7+），跳过")

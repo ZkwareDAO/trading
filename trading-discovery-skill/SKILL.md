@@ -173,18 +173,27 @@ python3 discovery.py --start 20260601 --end 20260801
 workspace/
 ├── config.yaml                        ← 策略登记表（git_url，fetch_strategies 读）
 ├── backtest.yaml                       ← 回测 run-profile（data_dir/output_dir/并发）
-├── sar_snt/                            ← 策略目录（git clone 目标，= config.yaml 顶层 key）
-│   ├── config/strategies.yaml          ← 代币清单（仓库自带，clone 后才有）
-│   ├── strategies/sar_snt/overrides/   ← per-symbol 配置（init_overrides 兜底）
+├── sar_snt/                            ← Python 策略目录
+│   ├── config/strategies.yaml          ← 代币清单
+│   ├── strategies/sar_snt/overrides/   ← per-symbol 配置
 │   └── scripts/run_backtest_batch.sh    ← 批量回测 wrapper
+├── my_rust_strategy/                   ← Rust 策略目录
+│   ├── Cargo.toml                      ← Rust 项目标识
+│   ├── crates/strategies/src/*.rs       ← 策略代码
+│   └── config/{name}/example.yaml      ← per-strategy 配置
 │
-├── data/klines/1m/                     ← K线数据（download_data.py 写入，回测读）
+├── data/klines/1m/                     ← K线数据（两种语言共用）
 │
-└── discovery_outputs/sar_snt/          ← 回测结果（discovery.py 写入）
-    └── ...
+└── discovery_outputs/                  ← 回测结果（两种语言共用）
+    ├── sar_snt/                        ← Python 策略结果
+    └── my_rust_strategy/               ← Rust 策略结果
 ```
 
-**数据流转**：`config.yaml`（git_url）→ `fetch_strategies.py` clone → `strategies.yaml`（代币）→ `init_overrides.py` 兜底配置 → `run_backtest_batch.sh` 回测 → `discovery_outputs/`。
+**数据流转**：
+- Python：`config.yaml` → `fetch_strategies.py` clone → `strategies.yaml` → `init_overrides.py` → `run_backtest_batch.sh` → `discovery_outputs/`
+- Rust：`config.yaml` → `fetch_strategies.py` clone → `config/{name}/example.yaml` → `cargo run --release -- backtest` → `discovery_outputs/`
+
+> **lang 自动检测**：discovery.py 根据策略目录自动判断语言类型（Cargo.toml → rust，requirements.txt/strategy_core/ → python），无需手动配置。
 
 ---
 
