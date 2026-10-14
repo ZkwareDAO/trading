@@ -856,14 +856,41 @@ python3 -m pytest strategies/{strategy_name}/tests/ -v
 
 按 `docs/strategy/REVIEW_CHECKLIST.md` 逐项检查，输出结果。
 
-### Step 4: 重写/同步 README.md（强制）
+### Step 4: 重写/同步 README.md（强制，Phase 3 前置条件）
 
-策略开发完成后，项目根目录 `README.md` 必须与开发的策略保持一致。按场景处理：
+策略开发完成后，项目根目录 `README.md` 必须与开发的策略保持一致。
+**未完成此步骤不得进入 Phase 3。**
 
-#### 场景 A：新项目（Phase 1 刚创建，本次开发的是项目主策略）→ **重写**
+#### 触发时机
 
-脚手架复制出来的 README 是模板视角（主角是 `example_ma_cross` 参考实现），
-新项目的主角是本次开发的策略，必须重写策略相关段落：
+Phase 2 执行顺序：
+```
+Step 0: 加载规范文档
+Step 1: 生成策略代码
+Step 2: 验证配置
+Step 3: 运行审查检查表
+Step 4: 重写/同步 README.md  ← 必须完成后才能进 Phase 3
+```
+
+#### 场景判断
+
+```bash
+# 场景 A：新项目（git 只有 1 个 commit = Phase 1 刚创建）
+# 场景 B：已有项目（git 有多个 commit）
+COMMIT_COUNT=$(git -C {project_path} rev-list --count HEAD 2>/dev/null || echo "0")
+if [ "$COMMIT_COUNT" -le 1 ]; then
+    SCENE="A"  # 重写
+else
+    SCENE="B"  # 增量同步
+fi
+```
+
+#### 场景 A：新项目 → **重写**
+
+脚手架复制出来的 README 是模板视角（主角是参考实现），
+新项目的主角是本次开发的策略，必须重写策略相关段落。
+
+**双语言模板**：
 
 ```markdown
 # {strategy_name} — {一句话策略定位}
@@ -872,29 +899,39 @@ python3 -m pytest strategies/{strategy_name}/tests/ -v
 
 ## 策略概述
 
-- 入场：{spec.entry.description}（完整条件清单见 strategies/{name}/.strategy-spec.yaml）
-- 出场：{spec.exit 摘要} + overrides 的 risk 段统一风控兜底
-- 参数：per-symbol overrides（strategies/{name}/overrides/<SYMBOL>.yaml，实盘回测共用）
+- 入场：{spec.entry.description}
+- 出场：{spec.exit 摘要}
+- 参数：per-symbol 配置（实盘回测共用）
 
 ## 快速开始
 
+### Python 模式
+```bash
 python -m backtest.run_backtest --strategies {strategy_name}:{SYMBOL} --start 20260601 --end 20260709
-（替换模板里的 example_ma_cross 示例命令）
+```
+
+### Rust 模式
+```bash
+cargo run --release -- backtest -- backtest --config config/{strategy_name}/example.yaml --symbol {SYMBOL} --start 20260601 --end 20260709
+```
 
 ## 项目结构
+
 （模板结构保留，strategies/ 段把 {strategy_name} 列为主策略，
-  example_ma_cross / example_mtf_trend 标注为"框架参考实现"）
+  example_ma_cross / example_dual_ma / example_mtf_trend 标注为"框架参考实现"）
 
 ## 配置体系 / 文档导航 / 免责声明
+
 （框架通用段落原样保留）
 ```
 
 **重写规则**：
 - 主角换成开发策略；参考实现降级为"框架参考实现"一节，不占快速开始
-- 策略参数不复制进 README——参数细节留在 overrides YAML 的注释里
-- 框架通用段落（配置体系三层模型、免责声明、文档导航、测试命令）保留不动
+- 策略参数不复制进 README——参数细节留在配置文件（Python: overrides YAML / Rust: config/{name}/example.yaml）的注释里
+- 框架通用段落（配置体系、免责声明、文档导航、测试命令）保留不动
+- 根据 `STRATEGY_LANG` 只保留对应语言的快速开始命令
 
-#### 场景 B：已有项目追加新策略 → **增量同步**
+#### 场景 B：已有项目 → **增量同步**
 
 | 位置 | 更新内容 |
 |------|----------|
@@ -904,6 +941,39 @@ python -m backtest.run_backtest --strategies {strategy_name}:{SYMBOL} --start 20
 
 **规则**：README 只描述"有什么"，不复制策略参数。参考实现级别的通用范例才写进
 "参考策略"表；一次性业务策略只在项目结构里出现目录名即可。
+
+#### 验证（强制）
+
+更新完成后，**必须验证** README 确实被更新了：
+
+```bash
+cd {project_path}
+
+# 验证 1：README 包含策略名
+if grep -q "{strategy_name}" README.md; then
+    echo "✅ README 已更新：包含策略名 {strategy_name}"
+else
+    echo "❌ README 未更新：未找到策略名 {strategy_name}"
+    echo "   请重新执行场景 $SCENE 的更新"
+    # 不进入 Phase 3
+fi
+
+# 验证 2：README 不包含模板残留（仅场景 A）
+if [ "$SCENE" = "A" ]; then
+    if grep -q "example_ma_cross" README.md && ! grep -q "框架参考实现" README.md; then
+        echo "❌ README 仍为模板视角：example_ma_cross 未标注为参考实现"
+        # 不进入 Phase 3
+    fi
+fi
+```
+
+#### 失败处理
+
+| 情况 | 处理 |
+|------|------|
+| 用户明确说"跳过 README" | 记录警告，允许进入 Phase 3，但最终 benchmark 报告中注明"README 未更新" |
+| 验证不通过 | 阻止进入 Phase 3，提示重新更新 |
+| README 文件不存在 | 从模板复制一份，按场景 A 处理 |
 
 ---
 
