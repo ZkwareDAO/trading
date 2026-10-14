@@ -635,15 +635,22 @@ docs/strategy/REVIEW_CHECKLIST.md     # 提交前检查项（10 类）
 docs/strategy/EXAMPLES.md             # 常见问题与踩坑
 docs/strategy/STRATEGY_SPEC.md        # spec 字段 schema
 
+# Python 模式参考实现
 strategies/example_ma_cross/          # ⬅ 单周期参考实现（必读，QUICKSTART Step 0 强制）
   ├── strategy.py                     # Strategy 接口层（最简形态）
   ├── example_ma_cross_core.py        # Core 逻辑层（★ 注释是框架契约重点）
   ├── overrides/BTCUSDT.yaml          # per-symbol 配置逐字段注释
   └── tests/                          # 测试写法
+
+# Rust 模式参考实现
+crates/strategies/src/example_dual_ma.rs   # ⬅ 单周期参考实现（Rust 版）
+crates/strategies/src/example_mtf_trend.rs  # ⬅ 多周期参考实现（Rust 版）
+config/example_dual_ma/example.yaml         # per-strategy 配置示例
 ```
 
-**多周期策略额外必读**：`strategies/example_mtf_trend/`（1d 定方向 + 4h 触发 + 1h 确认，
-演示每个周期分别 `get_closed_data()` + 单独数据检查的标准写法）。
+**多周期策略额外必读**：
+- Python：`strategies/example_mtf_trend/`（1d 定方向 + 4h 触发 + 1h 确认）
+- Rust：`crates/strategies/src/example_mtf_trend.rs`（演示多周期 `get_closed_data()` 标准写法）
 
 ### Step 1: 生成策略代码
 
@@ -925,7 +932,8 @@ cargo run --release -- backtest -- backtest --config config/{strategy_name}/exam
 ## 项目结构
 
 （模板结构保留，strategies/ 段把 {strategy_name} 列为主策略，
-  example_ma_cross / example_dual_ma / example_mtf_trend 标注为"框架参考实现"）
+  Python 参考实现：example_ma_cross / example_mtf_trend
+  Rust 参考实现：example_dual_ma / example_mtf_trend（位于 crates/strategies/src/）
 
 ## 配置体系 / 文档导航 / 免责声明
 
