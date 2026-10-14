@@ -4,28 +4,36 @@
 从实盘机器同步策略项目快照到本地，按 snapshot/{day}/{策略文件夹}/ 存放。
 
 用法:
-    python3 sync-exee.py                       # 备份昨天（默认）
-    python3 sync-exee.py --date 20260807       # 备份指定日期
-    python3 sync-exee.py --config config.yaml  # 指定配置文件
+     python3 sync-exee.py                       # 备份昨天（默认）
+     python3 sync-exee.py --date 20260807       # 备份指定日期
+     python3 sync-exee.py --config config.yaml  # 指定配置文件
 
 流程:
   1. 读 config.yaml，遍历所有 model(product/paper/smoking) 下配置的策略
   2. rsync 拉取策略项目，排除 logs / .venv / backtest_output（.gitignore 产物）
      —— data 目录体积大，一并排除，仅按第 3 步拉取必要子集
   3. 额外同步 data 指定文件（day 默认昨天，格式 YYYYMMDD）:
-       data/signals/{策略名}/{day}.csv
-       data/positions/                       （整个目录）
-       data/history_positions/{策略名}/{day}.csv
+       Python:
+         data/signals/{策略名}/{day}.csv
+         data/positions/                       （整个目录）
+         data/history_positions/{策略名}/{day}.csv
+       Rust:
+         data/store/{day}/signal.csv           （Store 快照）
+         data/store/{day}/position.csv         （当前持仓）
+         data/store/{day}/history_position.csv （平仓历史）
+         data/store/{day}/trade.csv            （成交记录）
+         data/store/{day}/equity.csv           （权益曲线）
+         data/history_positions/{策略名}/{day}.csv （24 列对外报表）
      data 子集独立存放至 replay_data/{day}/{策略文件夹}/data/
   4. 代码存放至 snapshot/{day}/{策略文件夹}/，目录结构与远程一致
      （与 replay_outputs 对仗：replay_data=实盘输入基准，replay_outputs=回测结果）
-  5. 同步完成后扫描所有快照的 strategies/*/overrides/*.yaml，
-     收集代币去重，生成 symbols.yaml（供 download_data.py 读取）
+  5. 同步完成后扫描所有快照，收集代币去重，生成 symbols.yaml（供 download_data.py 读取）
 
 约定:
-  - 策略文件夹 = config 中 path 的 basename
-  - 策略名     = config 中的 key，同时作为 data 子目录的 strategy_id
-  - host 字段可填 user@ip 或 ssh 别名；端口/密钥走 ~/.ssh/config
+   - 策略文件夹 = config 中 path 的 basename
+   - 策略名     = config 中的 key，同时作为 data 子目录的 strategy_id
+   - host 字段可填 user@ip 或 ssh 别名；端口/密钥走 ~/.ssh/config
+   - lang 字段: python（默认）| rust
 """
 
 import argparse
@@ -65,14 +73,26 @@ def load_config(path):
         return yaml.safe_load(f) or {}
 
 
-def iter_strategies(config):
-    """遍历所有 model 下的策略，yield (策略名, host, remote_path)
+def detect_lang(project_path):
+    """自动检测策略语言类型
 
-    config 结构:
-        product:
-          strategy_name1: {host: ..., path: ...}
-        paper: ...
-        smoking: ...
+    检测规则：
+    - 存在 Cargo.toml → rust
+    - 存在 requirements.txt 或 strategy_core/ → python
+    - 默认 python（向后兼容）
+    """
+    p = Path(project_path)
+    if (p / "Cargo.toml").is_file():
+        return "rust"
+    if (p / "requirements.txt").is_file() or (p / "strategy_core").is_dir():
+        return "python"
+    return "python"
+
+
+def iter_strategies(config):
+    """遍历所有 model 下的策略，yield (策略名, host, remote_path, lang)
+
+    lang 自动检测：config 中显式指定 lang 优先，否则通过 detect_lang() 自动判断。
     """
     for model in MODEL_KEYS:
         strategies = config.get(model) or {}
@@ -80,11 +100,16 @@ def iter_strategies(config):
             continue
         for name, cfg in strategies.items():
             if isinstance(cfg, dict) and cfg.get("path"):
-                yield name, cfg.get("host", ""), cfg["path"]
+                lang = cfg.get("lang") or detect_lang(cfg["path"])
+                yield name, cfg.get("host", ""), cfg["path"], lang
 
 
 def collect_symbols(snapshot_base):
-    """扫描所有快照的 strategies/*/overrides/*.yaml，收集代币去重
+    """扫描所有快照，收集代币去重
+
+    支持两种模板：
+    - Python: strategies/*/overrides/*.yaml 文件名即代币
+    - Rust: config/{strategy}/example.yaml 中的 symbols 列表
 
     多个策略可能代币重复，统一去重后排序。
     跳过 .tmp-* 临时目录。
@@ -95,19 +120,39 @@ def collect_symbols(snapshot_base):
     for folder_dir in snapshot_base.iterdir():
         if not folder_dir.is_dir() or folder_dir.name.startswith(".tmp-"):
             continue
+
+        # Python 模式：strategies/*/overrides/*.yaml
         strategies_dir = folder_dir / "strategies"
-        if not strategies_dir.is_dir():
-            continue
-        # 每个 strategy 子目录下的 overrides/*.yaml 文件名即代币
-        for strat_dir in strategies_dir.iterdir():
-            if not strat_dir.is_dir():
-                continue
-            overrides_dir = strat_dir / "overrides"
-            if not overrides_dir.is_dir():
-                continue
-            for f in overrides_dir.glob("*.yaml"):
-                if f.is_file() and not f.name.startswith("."):
-                    symbols.add(f.stem.upper())
+        if strategies_dir.is_dir():
+            for strat_dir in strategies_dir.iterdir():
+                if not strat_dir.is_dir():
+                    continue
+                overrides_dir = strat_dir / "overrides"
+                if not overrides_dir.is_dir():
+                    continue
+                for f in overrides_dir.glob("*.yaml"):
+                    if f.is_file() and not f.name.startswith("."):
+                        symbols.add(f.stem.upper())
+
+        # Rust 模式：config/{strategy}/example.yaml 中的 symbols
+        config_dir = folder_dir / "config"
+        if config_dir.is_dir():
+            for yaml_file in config_dir.rglob("*.yaml"):
+                if yaml_file.name.startswith("_"):
+                    continue  # 跳过 _global
+                try:
+                    config = yaml.safe_load(yaml_file.read_text(encoding="utf-8")) or {}
+                except Exception:
+                    continue
+                for sym in config.get("symbols", []):
+                    if isinstance(sym, dict) and "symbol" in sym:
+                        symbols.add(sym["symbol"].upper())
+                    elif isinstance(sym, str):
+                        symbols.add(sym.upper())
+                # 单文件模式
+                if "symbol" in config:
+                    symbols.add(str(config["symbol"]).upper())
+
     return sorted(symbols)
 
 
@@ -121,7 +166,7 @@ def write_symbols_yaml(symbols, path):
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        f.write("# 自动生成 — 由 sync-exee.py 从快照 overrides 收集去重，勿手改\n")
+        f.write("# 自动生成 — 由 sync-exee.py 从快照收集去重，勿手改\n")
         f.write("# 供 download_data.py 读取\n")
         f.write("symbols:\n")
         for sym in symbols:
@@ -158,12 +203,21 @@ def rsync_pull(host, remote, local, excludes=None):
     return run(cmd)
 
 
-def sync_data_files(host, remote_path, local_dir, day, name):
+def sync_data_files(host, remote_path, local_dir, day, name, lang="python"):
     """同步 data 指定子集
 
-    - data/signals/{name}/{day}.csv
-    - data/positions/                   （整个目录）
-    - data/history_positions/{name}/{day}.csv
+    Python 模板：
+     - data/signals/{name}/{day}.csv
+     - data/positions/                   （整个目录）
+     - data/history_positions/{name}/{day}.csv
+
+    Rust 模板：
+     - data/store/{day}/signal.csv           （Store 快照）
+     - data/store/{day}/position.csv         （当前持仓）
+     - data/store/{day}/history_position.csv （平仓历史）
+     - data/store/{day}/trade.csv            （成交记录）
+     - data/store/{day}/equity.csv           （权益曲线）
+     - data/history_positions/{name}/{day}.csv （24 列对外报表）
 
     单个 csv 缺失不算错（部分策略当天无信号/历史持仓）；
     --ignore-missing-args 让缺失文件不污染退出码。
@@ -171,11 +225,21 @@ def sync_data_files(host, remote_path, local_dir, day, name):
     本地 host 走纯本地 rsync（无 ssh）。
     """
     prefix = "" if is_local(host) else f"{host}:"
-    pulls = [
-        f"data/signals/{name}/{day}.csv",
-        "data/positions",
-        f"data/history_positions/{name}/{day}.csv",
-    ]
+    if lang == "rust":
+        pulls = [
+            f"data/store/{day}/signal.csv",
+            f"data/store/{day}/position.csv",
+            f"data/store/{day}/history_position.csv",
+            f"data/store/{day}/trade.csv",
+            f"data/store/{day}/equity.csv",
+            f"data/history_positions/{name}/{day}.csv",
+        ]
+    else:
+        pulls = [
+            f"data/signals/{name}/{day}.csv",
+            "data/positions",
+            f"data/history_positions/{name}/{day}.csv",
+        ]
     ok = True
     for rel in pulls:
         local_target = local_dir / Path(rel).parent
@@ -212,7 +276,7 @@ def main():
 
     seen = set()
     success, fail = 0, 0
-    for name, host, remote_path in iter_strategies(config):
+    for name, host, remote_path, lang in iter_strategies(config):
         folder = Path(remote_path).name or name
         local_dir = snapshot_base / folder
 
@@ -224,7 +288,7 @@ def main():
         seen.add(folder)
 
         print(f"\n--- {name} → snapshot/{day}/{folder}/ ---")
-        print(f"  源: {host or '(本地)'}:{remote_path}")
+        print(f"  源: {host or '(本地)'}:{remote_path} [lang={lang}]")
         if not host:
             print(f"  ⚠ {name}: 缺少 host，跳过")
             fail += 1
@@ -236,8 +300,11 @@ def main():
             shutil.rmtree(tmp_dir)
         tmp_dir.mkdir(parents=True, exist_ok=True)
 
-        # 步骤 2: 拉取代码（排除产物/venv/data）
-        if not rsync_pull(host, remote_path, tmp_dir, excludes=EXCLUDE_DIRS):
+        # 步骤 2: 拉取代码（排除产物/venv/data；Rust 排除 target/）
+        excludes = list(EXCLUDE_DIRS)
+        if lang == "rust" and "target" not in excludes:
+            excludes.append("target")
+        if not rsync_pull(host, remote_path, tmp_dir, excludes=excludes):
             print(f"  ❌ {name}: 代码同步失败")
             shutil.rmtree(tmp_dir, ignore_errors=True)
             fail += 1
@@ -245,7 +312,7 @@ def main():
 
         # 步骤 3: 拉取 data 指定子集 → replay_data/{day}/{folder}/data/
         data_dir = data_base / folder
-        sync_data_files(host, remote_path, data_dir, day, name)
+        sync_data_files(host, remote_path, data_dir, day, name, lang=lang)
 
         # 步骤 4: 原子移动到最终位置
         if local_dir.exists():
@@ -254,7 +321,7 @@ def main():
         print(f"  ✅ {name}: 已备份到 snapshot/{day}/{folder}/")
         success += 1
 
-    # 步骤 5: 扫描快照 overrides 收集代币去重 → 生成 symbols.yaml
+    # 步骤 5: 扫描快照收集代币去重 → 生成 symbols.yaml
     symbols = collect_symbols(snapshot_base)
     symbols_path = snapshot_base / "symbols.yaml"
     write_symbols_yaml(symbols, symbols_path)

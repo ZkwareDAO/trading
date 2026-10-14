@@ -240,14 +240,17 @@ product:                # 实盘
   strategy_name1:
     host: user@1.2.3.4
     path: /home/trader/strategyA
+    lang: python          # python（默认）| rust
 paper:                  # 纸上交易
   strategy_name2:
     host: user@1.2.3.4
     path: /home/trader/strategyB
+    lang: rust
 smoking:                # 模拟盘
   strategy_name3:
     host: user@1.2.3.4
     path: /home/trader/strategyC
+    lang: python
 ```
 
 | 字段 | 说明 |
@@ -256,6 +259,12 @@ smoking:                # 模拟盘
 | 策略名 key | 策略标识，同时作为 `data/` 子目录的 strategy_id |
 | `host` | `user@ip` 或 ssh 别名，端口/密钥走 `~/.ssh/config` |
 | `path` | 实盘项目根目录，basename 即快照文件夹名 |
+
+> **lang 自动检测**：无需手动配置。sync-exee.py 和 replay.py 会根据 `path` 指向的项目根目录自动判断语言类型：
+> - 存在 `Cargo.toml` → Rust 策略（拉取 `data/store/{day}/*.csv`，排除 `target/`，用 `cargo run -- backtest` 回测）
+> - 存在 `requirements.txt` 或 `strategy_core/` → Python 策略（拉取 `data/signals/`、`data/positions/`，用 `scripts/run_backtest_batch.sh` 回测）
+>
+> config.yaml 中也可显式指定 `lang: rust` 覆盖自动检测（默认不填即可）。
 
 ---
 
