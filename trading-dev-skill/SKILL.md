@@ -366,11 +366,18 @@ default_params:                # Core.__init__ 从 params 读取的参数及默�
 
 从 GitHub 仓库克隆模板代码到新项目。
 
-**模板来源**：`https://github.com/ZkwareDAO/strategy-template.git`
+**模板来源**：
+- Python: `https://github.com/ZkwareDAO/strategy-template.git`
+- Rust: `https://github.com/ZkwareDAO/strategy-template-rs.git`
 
 ```bash
-# 克隆模板仓库到临时目录
-TEMPLATE_REPO="https://github.com/ZkwareDAO/strategy-template.git"
+# 根据 STRATEGY_LANG 选择仓库
+STRATEGY_LANG="${STRATEGY_LANG:-python}"
+if [ "$STRATEGY_LANG" = "rust" ]; then
+    TEMPLATE_REPO="https://github.com/ZkwareDAO/strategy-template-rs.git"
+else
+    TEMPLATE_REPO="https://github.com/ZkwareDAO/strategy-template.git"
+fi
 TEMPLATE_TAG="${STRATEGY_TEMPLATE_TAG:-v1.0.0}"  # 默认 v1.0.0；可覆盖为其他 tag
 TEMPLATE_DIR=$(mktemp -d)
 
@@ -927,9 +934,11 @@ cargo run --release -- backtest -- backtest --config config/{strategy_name}/exam
 
 **重写规则**：
 - 主角换成开发策略；参考实现降级为"框架参考实现"一节，不占快速开始
-- 策略参数不复制进 README——参数细节留在配置文件（Python: overrides YAML / Rust: config/{name}/example.yaml）的注释里
+- 策略参数不复制进 README——参数细节留在配置文件（Python: `strategies/{name}/overrides/<SYMBOL>.yaml` / Rust: `config/{name}/example.yaml`）的注释里
 - 框架通用段落（配置体系、免责声明、文档导航、测试命令）保留不动
-- 根据 `STRATEGY_LANG` 只保留对应语言的快速开始命令
+- 根据 `STRATEGY_LANG` 只保留对应语言的快速开始命令：
+  - `python` → 只保留 `### Python 模式` 段
+  - `rust` → 只保留 `### Rust 模式` 段
 
 #### 场景 B：已有项目 → **增量同步**
 
@@ -1006,60 +1015,63 @@ fi
 | 中期 | 20260101-20260709 | 至少一个代币费后收益 ≥ 20% |
 | 长期 | 20250101-20260709 | 至少一个代币费后收益 ≥ 20% |
 
+**回测命令根据 `STRATEGY_LANG` 选择**：
+
+#### Python 模式回测
+
 三个周期都用同一条批量命令，只换 `--start` / `--end`。
 经项目自带的 `scripts/run_backtest_batch.sh` 调用（它负责 overrides 预检、
 笛卡尔积展开、`PYTHONPATH`，再转调 `backtest.batch_runner`）。
 并发由 `config/backtest.yaml` 的 `max_workers` 控制；策略参数自动读
 `strategies/{strategy_name}/overrides/<SYMBOL>.yaml`。
 
-`--yes` 跳过任务数 > 6 时的交互确认，非交互环境必须带。
-
-### Step 1: 短期回测
-
 ```bash
+# Step 1: 短期回测
 bash scripts/run_backtest_batch.sh \
     --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
     --start 20260601 --end 20260709 --log-level INFO --yes
-```
 
-### Step 2: 中期回测
-
-```bash
+# Step 2: 中期回测
 bash scripts/run_backtest_batch.sh \
     --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
     --start 20260101 --end 20260709 --log-level INFO --yes
-```
 
-### Step 3: 长期回测
-
-```bash
+# Step 3: 长期回测
 bash scripts/run_backtest_batch.sh \
     --strategies {strategy_name} --symbols BTCUSDT,ETHUSDT,SOLUSDT \
     --start 20250101 --end 20260709 --log-level INFO --yes
-```
 
-### Step 4: 单标的复核
-
-`batch_runner` 是 `run_backtest` 的批量外壳。要单独复核某个代币、
-或需要看完整 stdout 时用单次入口：
-
-```bash
+# Step 4: 单标的复核
 python -m backtest.run_backtest \
     --strategies {strategy_name}:BTCUSDT \
     --start 20250101 --end 20260710 --log-level INFO
 ```
 
-`run_backtest` CLI 共 7 个参数：`--strategies`（name:symbol）、`--start`、`--end`、
-`--profile`、`--config-path`、`--overrides`、`--log-level`。
-symbol 唯一来源是 `--strategies` 的 `name:symbol`，参数来源是
-`overrides/<SYMBOL>.yaml`，输出目录与资金费率由 `--profile`（默认 `config/backtest.yaml`）提供。
+#### Rust 模式回测
 
-要换一套回测参数而不改动入库文件，复制 `config/quick.example.yaml`
-成 `config/<名字>.yaml`，用 `--profile <名字>` 运行。
+Rust 版回测通过 `cargo run --release -- backtest` 调用，当前无内置批量脚本。
+**注意**：Rust 版使用 per-strategy 配置（`config/{name}/example.yaml`），
+与 Python 的 per-symbol overrides 不同，回测时需指定 `--config`。
 
-**⚠ 不要用 `--daemon`**：batch_runner 的 daemon 模式重建子命令时只传
-`--profile` 与 `--batch-id`，会丢掉 `--run/--start/--end`，等于跑成空清单。
-需要后台执行请在外层 `nohup`。
+```bash
+# Step 1-3: 短期/中期/长期回测（循环执行）
+for symbol in BTCUSDT ETHUSDT SOLUSDT; do
+    cargo run --release -- backtest \
+        --config config/{strategy_name}/example.yaml \
+        --symbol $symbol \
+        --start 20260601 --end 20260709
+done
+
+# Step 4: 单标的复核
+cargo run --release -- backtest \
+    --config config/{strategy_name}/example.yaml \
+    --symbol BTCUSDT \
+    --start 20250101 --end 20260710
+```
+
+> **Rust 回测输出**：`backtest_output/{run_id}/`，含 `result.json`（指标）、
+> `result.txt`（文本报告）、`*.png`（图表）、`state/{day}/`（每日快照）。
+> 验收时从 `result.json` 提取 metrics（字段名可能与 Python 版不同）。
 
 **产物路径**：`{output_dir}/{strategy}/{date}/{time}/{symbol}/`，
 指标在 `backtest_result.json` 的 `metrics` 段（不在顶层）。
@@ -1296,6 +1308,7 @@ Phase 1: 脚手架创建（一次性）
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
+| `STRATEGY_LANG` | `python` | 策略开发语言：`python` 或 `rust` |
 | `DATA_PATH` | `./data/klines` | K线数据存储路径（= settings.yaml 的 csv_dir） |
 | `CTA_ENV` | `dev` | 运行环境（dev/test/prod） |
 | `BENCHMARK_OUTPUT_PATH` | `./benchmark_output` | benchmark 报告输出路径 |
@@ -1324,14 +1337,14 @@ Phase 1: 脚手架创建（一次性）
 
 ### .env.example 模板
 
-以模板文件为准：`.env.example`（从 strategy-template 仓库获取）。关键字段：
+以模板文件为准：`.env.example`（从对应语言模板仓库获取）。关键字段：
 
 ```bash
 DATA_PATH=./data/klines
 CTA_ENV=dev
 BENCHMARK_OUTPUT_PATH=./benchmark_output
 
-# ---- 直连交易所下单（settings.yaml 的 direct_trading.enabled=true 时必填）----
+# ---- 直连交易所下单（direct_trading.enabled=true 时必填）----
 BINANCE_API_KEY=
 BINANCE_API_SECRET=
 
@@ -1339,6 +1352,9 @@ BINANCE_API_SECRET=
 # HTTPS_PROXY=http://127.0.0.1:7890
 # HTTP_PROXY=http://127.0.0.1:7890
 ```
+
+> **Rust 模式**：配置结构不同，详见 `config/{strategy}/example.yaml`（per-strategy），
+> 全局默认值在 `config/_global.example.yaml`。
 
 ---
 

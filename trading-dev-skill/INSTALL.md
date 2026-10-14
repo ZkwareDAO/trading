@@ -5,8 +5,9 @@
 | 依赖 | 最低版本 | 说明 |
 |------|---------|------|
 | Claude Code | 最新版 | CLI / Desktop / IDE 扩展均可 |
-| Python | 3.10+ | 策略运行环境 |
-| ta-lib C 库 | 0.4.0 | 回测指标计算（可选，缺则回测不可用） |
+| Python | 3.10+ | Python 模式策略运行环境 |
+| Rust | 最新稳定版 | Rust 模式策略运行环境（rustc + cargo） |
+| ta-lib C 库 | 0.4.0 | 回测指标计算（可选，缺则回测不可用；仅 Python 模式需要） |
 
 ## 安装方式
 
@@ -52,7 +53,18 @@ ln -s /home/qpw/workspace/trading/trading-dev-skill ~/.claude/skills/trading-dev
 
 ### 模板来源
 
-模板从 GitHub 仓库 `https://github.com/ZkwareDAO/strategy-template.git` 自动克隆。
+根据 `STRATEGY_LANG` 选择模板仓库：
+
+| 语言 | 仓库 | 默认 Tag |
+|------|------|----------|
+| Python（默认） | `https://github.com/ZkwareDAO/strategy-template.git` | `v1.0.0` |
+| Rust | `https://github.com/ZkwareDAO/strategy-template-rs.git` | `v1.0.0` |
+
+**选择语言**：
+```bash
+# 默认 Python；切换 Rust 模式
+export STRATEGY_LANG=rust
+```
 
 **指定版本（tag）**：
 ```bash
@@ -123,6 +135,9 @@ trading/
 ## 使用流程
 
 ```
+# 选择语言（默认 Python）
+export STRATEGY_LANG=python   # 或 rust
+
 /trading-dev new              → 创建项目脚手架 + 策略开发 + 回测验证
 /trading-dev new --from <src> → 全自动模式
 /trading-dev scaffold         → 只创建脚手架
