@@ -23,14 +23,14 @@
 
 ### Phase 1：任务触发与初始化检查
 - **1.1 用户自然语言输入**：发起 replay（复盘）指令。
-- **1.2 初始化状态检查**：确认 `templates/` 下是否已存在脚本与配置（`sync-exee.py`、`replay.py`、`config.yaml`）。
+- **1.2 初始化状态检查**：确认 `scripts/` 下是否已存在脚本（`sync-exee.py`、`replay.py`），且工作目录已有配置（`config.yaml`）。
   - 已初始化 → 跳过环境准备，直接进 Phase 2
   - 未初始化 → 进 Phase 1.5
 
 ### Phase 1.5：环境准备与配置（仅首次/重置）
 > 涉及 AI 协助与人工确认。仅当 Phase 1.2 判定未初始化时执行。
 
-- **1.5.1 备份**：AI 协助备份 `templates/` 下所有文件（`config.yaml`、`sync-exee.py`、`replay.py`），保留可回滚副本。
+- **1.5.1 备份**：AI 协助备份 `scripts/` 下脚本（`sync-exee.py`、`replay.py`）与工作目录的 `config.yaml`，保留可回滚副本。
 - **1.5.2 配置环境**：
   1. 在 `product`/`paper`/`smoking` 三个分组下，为每个策略填写 `host`（`user@ip` 或 ssh 别名）和 `path`（实盘项目根目录）。
   2. 确认本机有 `python3`、`pyyaml`、`rsync`（备份用）、`ssh`。
@@ -187,7 +187,7 @@ python3 replay.py --date 20260807 --config config.yaml
 
 ### 时序关键点
 
-1. **首次/重置才走 Phase 1.5**：已初始化环境直接跳到 Phase 2。初始化判定 = `templates/` 下 `sync-exee.py`/`replay.py`/`config.yaml` 齐全。
+1. **首次/重置才走 Phase 1.5**：已初始化环境直接跳到 Phase 2。初始化判定 = `scripts/` 下 `sync-exee.py`/`replay.py` 齐全且工作目录有 `config.yaml`。
 
 2. **确认回环**：Phase 2.2（备份信息）是"不通过 → 用户改 `config.yaml` → 回 2.2 重确认"的循环，直到通过才前进。
 

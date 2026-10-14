@@ -24,7 +24,7 @@
 ### Phase 1：任务触发与初始化检查
 - **1.1 自然语言输入**：输入通常包含策略来源（git_url）、期望代币、时间范围。
 - **1.2 触发词检测**：识别关键词后激活 skill。
-- **1.3 初始化 SKILL 模板检查**：确认 `templates/` 下脚本配置齐全（`fetch_strategies.py`/`discovery.py`/`download_data.py`/`init_overrides.py`/`config.example.yaml`/`backtest.example.yaml`/`.env.example`），以及工作目录是否已有用户配置（`config.yaml` 存在且至少一个已 clone 策略目录）。
+- **1.3 初始化 SKILL 模板检查**：确认 `scripts/` 下脚本齐全（`fetch_strategies.py`/`discovery.py`/`download_data.py`/`init_overrides.py`），且 `templates/` 下配置模板齐全（`config.example.yaml`/`backtest.example.yaml`/`.env.example`），以及工作目录是否已有用户配置（`config.yaml` 存在且至少一个已 clone 策略目录）。
   - 已初始化 → 跳到 Phase 2.2
   - 未初始化 → 进 Phase 1.4
 

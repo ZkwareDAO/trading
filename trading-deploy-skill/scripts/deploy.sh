@@ -222,12 +222,9 @@ fi
 # === Phase 3: data readiness loop ===
 log "=== Phase 3: K-line Data Readiness ==="
 
-# Calculate requirements (use shared calc_data_requirements.py if available)
+# Calculate requirements (calc_data_requirements.py was removed in template
+# v3.7 refactor; use the shared default unless overridden)
 CALC_SCRIPT="${SCRIPT_DIR}/calc_data_requirements.py"
-if [ ! -f "$CALC_SCRIPT" ]; then
-    # fallback to discovery skill's copy
-    CALC_SCRIPT="$(dirname "$SCRIPT_DIR")/../trading-discovery-skill/templates/calc_data_requirements.py"
-fi
 
 REQUIRED_DAYS=30
 if [ -f "$CALC_SCRIPT" ]; then

@@ -54,7 +54,7 @@ Phase 4   → 回测执行与结果通知
 
 系统解析指令后，检查 SKILL 模板是否已就绪。
 
-**判断逻辑**：确认 `trading-discovery-skill/templates/` 下脚本与配置模板是否齐全（`fetch_strategies.py`、`discovery.py`、`download_data.py`、`init_overrides.py`、`config.example.yaml`、`backtest.example.yaml`、`.env.example`），以及工作目录是否已有用户配置（`config.yaml` 存在且至少有一个已 clone 的策略目录）。
+**判断逻辑**：确认 `trading-discovery-skill/scripts/` 下脚本齐全（`fetch_strategies.py`、`discovery.py`、`download_data.py`、`init_overrides.py`），且 `templates/` 下配置模板齐全（`config.example.yaml`、`backtest.example.yaml`、`.env.example`），以及工作目录是否已有用户配置（`config.yaml` 存在且至少有一个已 clone 的策略目录）。
 
 | 判断 | 流向 |
 |------|------|

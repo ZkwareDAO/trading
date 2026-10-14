@@ -83,12 +83,15 @@ cp templates/.env.example .env
 ```
 trading-discovery-skill/
 ├── SKILL.md                 # Skill 定义
-├── INSTALL.md               # 本文件
-└── templates/               # 模板文件
-    ├── fetch_strategies.py  # 策略代码获取（git clone / pull）
-    ├── discovery.py         # 回测执行（遍历策略目录调 wrapper）
-    ├── download_data.py     # Binance 1m K线下载
-    ├── init_overrides.py    # per-symbol 配置兜底
+├── references/
+│   ├── ANALYSIS.md          # 流程分析
+│   └── INSTALL.md           # 本文件
+├── scripts/                 # 可执行脚本
+│   ├── fetch_strategies.py  # 策略代码获取（git clone / pull）
+│   ├── discovery.py         # 回测执行（遍历策略目录调 wrapper）
+│   ├── download_data.py     # Binance 1m K线下载
+│   └── init_overrides.py    # per-symbol 配置兜底
+└── templates/               # 配置模板
     ├── config.example.yaml  # 策略登记表模板（git_url）
     ├── backtest.example.yaml # 回测 run-profile 模板
     └── .env.example         # 环境变量模板
@@ -101,11 +104,11 @@ trading-discovery-skill/
 cp templates/config.example.yaml config.yaml
 
 # 2. 拉取策略代码
-python3 templates/fetch_strategies.py --config config.yaml --strategies-dir .
+python3 scripts/fetch_strategies.py --config config.yaml --strategies-dir .
 
 # 3. 回测探索
-python3 templates/discovery.py --start 20260601 --end 20260801
-python3 templates/discovery.py --start 20260601 --strategies sar_snt
+python3 scripts/discovery.py --start 20260601 --end 20260801
+python3 scripts/discovery.py --start 20260601 --strategies sar_snt
 ```
 
 详细流程见 SKILL.md。

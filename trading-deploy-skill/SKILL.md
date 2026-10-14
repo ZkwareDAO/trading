@@ -303,15 +303,11 @@ $PYTHON_CMD init_overrides.py \
 
 ## Phase 3: K线数据准备（loop）
 
-### Step 1: 计算数据需求
+### Step 1: 数据需求天数（默认 30 天）
 
-```bash
-$PYTHON_CMD calc_data_requirements.py \
-    --strategy-dir "${STRATEGIES_DIR}/${STRATEGY_NAME}" \
-    --kline-data-dir "${KLINE_DATA_DIR}"
-```
-
-> 共享模板，优先使用 `trading-discovery-skill/templates/calc_data_requirements.py`。
+数据需求计算脚本 `calc_data_requirements.py` 已在模板 v3.7 重构中移除，
+deploy.sh 直接使用默认 `REQUIRED_DAYS=30`（可通过环境变量覆盖）。
+如需精确计算，按策略回看的指标周期人工评估。
 
 ### Step 2: 数据就绪检查 → loop
 

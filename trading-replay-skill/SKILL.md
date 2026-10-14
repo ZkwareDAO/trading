@@ -51,7 +51,7 @@ Phase 6   → 结果输出与验证
 
 系统解析指令后，检查当前运行环境/任务状态是否已初始化。
 
-**判断逻辑**：确认 `trading-replay-skill/templates/` 下是否已存在脚本与配置文件内容（`sync-exee.py`、`replay.py`、`config.yaml`）。
+**判断逻辑**：确认 `trading-replay-skill/scripts/` 下是否已存在脚本（`sync-exee.py`、`replay.py`），且工作目录已有配置文件（`config.yaml`）。
 
 | 判断 | 流向 |
 |------|------|
@@ -109,7 +109,7 @@ Phase 6   → 结果输出与验证
 
 ### 3.1 执行备份脚本
 
-- **动作**：执行 `templates/sync-exee.py`，从实盘机器拉取策略代码与运行数据。
+- **动作**：执行 `scripts/sync-exee.py`，从实盘机器拉取策略代码与运行数据。
 - **主要运行** `sync-exee.py`。
 
 ```bash
@@ -160,7 +160,7 @@ python3 download_data.py --symbols-file ./snapshot/20260807/symbols.yaml --data-
 
 ### 5.1 执行策略回测代码
 
-- **动作**：执行 `templates/replay.py`，读取 `config.yaml` 中所有策略并执行每日回放。
+- **动作**：执行 `scripts/replay.py`，读取 `config.yaml` 中所有策略并执行每日回放。
 - **主要运行** `replay.py`。
 
 ```bash

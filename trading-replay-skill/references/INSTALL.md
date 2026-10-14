@@ -101,15 +101,16 @@ crontab /tmp/trading-replay-crontab
 ```
 trading-replay-skill/
 ├── SKILL.md                 # Skill 定义
-├── INSTALL.md               # 本文件
-└── templates/               # 模板文件
-    ├── replay.sh            # 每日回放回测脚本
-    ├── sync-exee.py         # 每日策略代码备份脚本
-    ├── discover_remote.py   # 远程策略发现
-    ├── analyze_snapshot.py  # 快照策略分析
-    ├── strategy_analyzer.py
+├── references/
+│   ├── ANALYSIS.md          # 流程分析
+│   └── INSTALL.md           # 本文件
+├── scripts/                 # 可执行脚本
+│   ├── replay.py            # 每日回放回测脚本
+│   ├── sync-exee.py         # 每日策略代码备份脚本
+│   └── download_data.py     # K线数据下载
+└── templates/               # 配置模板
     ├── config.example.yaml  # 全局配置模板
-    ├── .env.example         # 环境变量模板
+    ├── backtest.example.yaml # 回测 run-profile 模板
     └── crontab.example      # 定时任务模板
 ```
 

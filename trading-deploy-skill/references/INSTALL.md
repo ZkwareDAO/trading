@@ -87,14 +87,17 @@ cp templates/.env.example .env
 ```
 trading-deploy-skill/
 ├── SKILL.md                 # Skill 定义
-├── INSTALL.md               # 本文件
-└── templates/               # 模板文件
-    ├── deploy.sh            # 部署入口脚本
-    ├── run_strategy.sh      # 单标的调试启动（正式部署走 scripts/run_live_batch.sh）
-    ├── git_pull.py          # git pull + 策略分析
-    ├── create_config.py     # 运行时配置生成
-    ├── data_readiness_check.py  # K线数据就绪检查
-    ├── subscribe_websocket.py   # WebSocket 订阅验证
+├── references/
+│   ├── ANALYSIS.md          # 流程分析
+│   └── INSTALL.md           # 本文件
+├── scripts/                 # 可执行脚本
+│   ├── deploy.sh            # 部署入口脚本
+│   ├── run_strategy.sh      # 单标的调试启动（正式部署走 scripts/run_live_batch.sh）
+│   ├── git_pull.py          # git pull + 策略分析
+│   ├── create_config.py     # 运行时配置生成
+│   ├── data_readiness_check.py  # K线数据就绪检查
+│   └── subscribe_websocket.py   # WebSocket 订阅验证
+└── templates/               # 配置模板
     ├── config.example.yaml  # 全局配置模板
     └── .env.example         # 环境变量模板
 ```

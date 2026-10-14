@@ -55,7 +55,7 @@ git pull 拉代码 → AI 分析配置 → WebSocket 数据验证 → K线数据
 **⚠ 新建配置一律 `trading_mode: paper_trading`**，即使模板是 live（未回测验证就 live 会下真单）。开关 `--init-configs`，默认关闭（写盘动作需复核）。
 
 ### Phase 3：K线数据准备（loop）
-- **Step 1 计算数据需求**：`calc_data_requirements.py`（共享模板，优先 `trading-discovery-skill/templates/`）。
+- **Step 1 数据需求天数**：默认 30 天（`calc_data_requirements.py` 已在 v3.7 重构中移除）。
 - **Step 2 数据就绪检查 → loop**：`data_readiness_check.py`。
 
 loop 流程：检查数据 → 充足 YES 进 Phase 4 / 不足 NO → 尝试下载 → 成功回检查 / 失败询问跳过 → 跳过进 Phase 4 (partial) / 不跳过退出。退出条件：数据充足 | 用户跳过 | 用户取消 | 最多 5 轮重试。
@@ -118,7 +118,7 @@ v3.7 起策略参数唯一事实来源是 `strategies/<name>/overrides/<SYMBOL>.
  │                          ▼
  │   ┌──────────────────────────────────────────────────┐
  │   │ Phase 3: K线数据准备 (loop)                        │
- │   │  calc_data_requirements → data_readiness_check     │
+ │   │  data_readiness_check (REQUIRED_DAYS 默认 30)       │
  │   │  ┌─ 检查充足? ─YES─→ Phase 4                       │
  │   │  │   NO → 下载 → 成功?YES→回检查                   │
  │   │  │              NO→询问跳过                        │
