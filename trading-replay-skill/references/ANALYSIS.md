@@ -55,7 +55,7 @@ python3 sync-exee.py --date 20260807 --config config.yaml
 具体操作：
 1. 策略代码同步 → `snapshot/{day}/{策略文件夹}/`（纯代码，不含 data）
 2. 同步所需数据 → `replay_data/{day}/{策略文件夹}/data/`
-3. 同步仓位信息 → `data/signals/{策略名}/{day}.csv`、`data/positions/`、`data/history_positions/{策略名}/{day}.csv`
+3. 同步仓位信息 → Python: `data/signals/`、`data/positions/`、`data/history_positions/`（整目录，目录名为 runtime 名）；Rust: `data/state/{day}/*.csv` + `data/state/history_positions/`
 4. 扫描所有快照 `strategies/*/overrides/*.yaml` 文件名，收集代币去重 → 生成 `snapshot/{day}/symbols.yaml`
 
 **排除项**：`logs`、`.venv`、`backtest_output`（.gitignore 产物）不拉取。
@@ -156,7 +156,7 @@ python3 replay.py --date 20260807 --config config.yaml
  │   │  sync-exee.py --date YYYYMMDD                     │
  │   │   ├─ 代码 → snapshot/{day}/{策略文件夹}/            │
  │   │   ├─ 数据 → replay_data/{day}/{策略文件夹}/data/    │
- │   │   ├─ 仓位 → signals/positions/history_positions    │
+ │   │   ├─ 仓位 → Python: signals/positions/history_positions（整目录）；Rust: data/state/
  │   │   └─ 扫 overrides 去重 → snapshot/{day}/symbols.yaml│
  │   │   排除: logs/.venv/backtest_output                 │
  │   └──────────────────────┬───────────────────────────┘
@@ -216,9 +216,10 @@ workspace/
 │   └── strategyB/
 │
 ├── replay_data/20260807/strategyA/data/ ← 实盘基准数据（sync-exee.py 写入）
-│   ├── signals/strategyA/20260807.csv
-│   ├── positions/
-│   └── history_positions/strategyA/20260807.csv
+│   ├── signals/{runtime名}/20260807.csv       ← Python
+│   ├── positions/{runtime名}.json
+│   ├── history_positions/{runtime名}/20260807.csv
+│   └── state/20260807/*.csv + state/history_positions/  ← Rust
 │
 ├── data/klines/1m/                       ← K线数据（download_data.py 写入，回测读）
 │   ├── BTCUSDT_1m.csv

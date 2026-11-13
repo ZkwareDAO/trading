@@ -37,6 +37,7 @@ Phase 3   → 数据同步（实盘快照同步）
 Phase 4   → 数据下载（从快照 overrides 收取代币，拉最新K线）
 Phase 5   → 回测执行
 Phase 6   → 结果输出与验证
+Phase 7   → 看板数据生成（frontend-data v2，供 strategy-kanban 前端消费）
 ```
 
 ---
@@ -120,7 +121,10 @@ python3 sync-exee.py --date 20260807 --config config.yaml
 
 1. 执行策略代码同步脚本 → 代码存入 `snapshot/{day}/{策略文件夹}/`
 2. 同步所需数据 → 数据存入 `replay_data/{day}/{策略文件夹}/data/`
-3. 同步仓位信息 → `data/signals/{策略名}/{day}.csv`、`data/positions/`、`data/history_positions/{策略名}/{day}.csv`
+3. 同步仓位信息（拉整目录，目录名为 runtime 名而非 config key）：
+   - Python：`data/signals/`、`data/positions/`、`data/history_positions/`
+   - Rust：`data/state/{day}/signal.csv`、`position.csv`、`history_position.csv`、
+     `stop.csv`、`cooldown.csv`、`data/state/history_positions/`
 4. 扫描所有快照 `strategies/*/overrides/*.yaml` 文件名，收集代币去重 → 生成 `snapshot/{day}/symbols.yaml`
 
 **排除项**：`logs`、`.venv`、`backtest_output`（.gitignore 产物）不拉取。
@@ -188,6 +192,7 @@ python3 replay.py --date 20260807 --config config.yaml
    - `--yes` 跳过任务数确认（replay 跑在自动流/crontab）。
    - 输出目录由 `backtest.yaml.output_dir` 直指 `replay_outputs/{day}/{策略文件夹}/`，回测原生写入，无需 cp。
 5. **设定回测日期**：默认为昨天（复盘昨日实盘），可用 `--date` 指定当天或其他日期，亦可用 `--start`/`--end` 自定义区间。
+   **交易窗口只含回放日**（Rust `--start day --end day+1`），`warmup_days` 通过 `--warmup-start` 只加载预热数据、不产生交易。
 6. 回测结果输出到 `replay_outputs/{day}/{策略文件夹}/`。
 
 ---
@@ -200,6 +205,47 @@ python3 replay.py --date 20260807 --config config.yaml
 - **目录**：`replay_outputs/{day}/{策略文件夹}/`（由 `backtest.yaml.output_dir` 直指，回测原生写入）。
 
 确认结果文件存在（如 `backtest_result.json`）即为复盘完成。
+
+---
+
+## Phase 7: 看板数据生成（frontend-data v2）
+
+> **触发条件**：`config.yaml` 的 `frontend_data_dir` 非空（或 CLI `--frontend-out`）时，
+> Phase 5 回测成功后自动执行；为空则跳过 Phase 7，不算失败。
+
+### 7.1 生成前端可消费数据
+
+- **动作**：执行 `scripts/generate-kanban-data.py`，把实盘基准数据（`replay_data/{day}`）与回放回测结果（`replay_outputs/{day}`）转换为 strategy-kanban 前端消费的 **frontend-data v2（CSV 参数化）布局**，格式逐列对齐 `strategy-kanban/docs/frontend-data-sample/`。
+- **数据说明**：目录组织与各文件字段见 [`references/FRONTEND-DATA.md`](references/FRONTEND-DATA.md)。
+- **前置**：Phase 3（实盘快照）、Phase 5（回测）已完成；`data/klines` 有对应代币（用于 OPEN 仓位浮动盈亏 mark 价）。
+
+```bash
+python3 generate-kanban-data.py --date 20261026
+# 输出根：config.yaml 的 frontend_data_dir（未配置则回退 REPLAY_WORKSPACE/frontend-data）
+python3 generate-kanban-data.py --all --out /path/to/strategy-kanban/public/frontend-data
+```
+
+**具体操作项**：
+
+1. 读 `replay_data/{day}/{项目}/data/state/{day}/{signal,position,history_position,cooldown}.csv` 与 `data/state/history_positions/{runtime}/{day}.csv` → 实盘侧运行实例（按 `(strategy, symbol)` 聚合，`mode` 从 runtime 后缀解析）。
+2. 读 `replay_outputs/{day}/{项目}/{strategy}/{run_date}/{HHMMSS}/{SYMBOL}/` 的 `backtest_result.json` + `engine/…` → 回测侧，逐 run 生成 `backtest_results/{run_stamp}/{SYMBOL}.json`。
+3. 分配 `batch_id`（`{day}-{HHMM}`，按 `--batch-gap` 秒时序聚簇）与 `sweep`（轮次，从 0）；每 `(strategy, symbol)` 标 `is_latest=1`。
+4. 由引擎信号（`engine/signals/*/signal.csv`，缺则按仓位一开一平反推）与实盘信号产出 `backtest_signals/positions.csv`、`live_signals/positions.csv`；实盘 vs 回放信号按 `(时间戳精确 → 时间窗口)` 匹配生成 `signal_comparison.csv`（无实盘信号的纯回测标的不出对比表，对齐样例存在规则）。
+5. 写 `{day}/manifest.csv`、`{day}/backtest_runs.csv`、`{day}/{strategy}/{meta.json,manifest.csv,…}`，并 upsert `catalog.csv`。
+
+**口径要点**（详见样例 README 第 6/8 节，脚本内置）：
+
+| 项 | 规则 |
+|----|------|
+| 时间 | ISO8601 UTC `2026-10-26T01:45:00Z`；日期目录 `YYYYMMDD` |
+| `run_stamp/batch_id/run_id` | 标识符，非时间 |
+| 比率（`roe`/`max_drawdown`/`win_rate`/`*_return`） | 小数，`0.0164`=1.64% |
+| `pnl_pct`/`price_diff_pct` | 百分数，`2.2049`=2.2049% |
+| `total_pnl`/`floating_pnl` | 金额 ÷ 初始资金（`result.config.initial_cash`，兜底 10000） |
+| 空回测（`signals_processed=0`） | 保留 run 行，**不生成** positions/signals CSV |
+| `has_live=0/has_backtest=0` | 不建对应文件，不用表头占位 |
+
+> `sweep` 与 `is_latest` 由脚本落盘，前端页面须用 `is_latest=1` 过滤，否则同日多轮次仓位会叠加。
 
 ---
 
@@ -216,9 +262,11 @@ workspace/
 │   └── strategyB/
 │
 ├── replay_data/20260807/strategyA/data/ ← 实盘基准数据（sync-exee.py 写入）
-│   ├── signals/strategyA/20260807.csv
-│   ├── positions/
-│   └── history_positions/strategyA/20260807.csv
+│   ├── signals/{runtime名}/20260807.csv       ← Python
+│   ├── positions/{runtime名}.json
+│   ├── history_positions/{runtime名}/20260807.csv
+│   └── state/20260807/{signal,position,history_position,stop,cooldown}.csv
+│       └── state/history_positions/{runtime名}/20260807.csv  ← Rust
 │
 ├── data/klines/1m/                       ← K线数据（download_data.py 写入，回测读）
 │   ├── BTCUSDT_1m.csv
@@ -226,16 +274,38 @@ workspace/
 │
 └── replay_outputs/20260807/strategyA/    ← 回测结果（replay.py 写入）
     └── ...
+
+frontend-data/                            ← 看板数据（generate-kanban-data.py 写入）
+├── catalog.csv
+└── 20260807/
+    ├── manifest.csv                      ← 每日收益页
+    ├── backtest_runs.csv                 ← 每日回放页
+    └── {strategy}/
+        ├── meta.json / manifest.csv
+        ├── live_positions/signals.csv     ← 有实盘时
+        ├── backtest_runs/positions/signals.csv
+        ├── signal_comparison.csv          ← 有实盘信号时
+        └── backtest_results/{run_stamp}/{SYMBOL}.json
 ```
 
 **目录对仗**：`replay_data`（实盘输入基准）↔ `replay_outputs`（回测输出结果）。
-**数据流转**：`symbols.yaml`（sync 产出）→ `download_data.py` 读 → `data/klines/`（回测输入）。
+**数据流转**：`symbols.yaml`（sync 产出）→ `download_data.py` 读 → `data/klines/`（回测输入）；`replay_data` + `replay_outputs` → `generate-kanban-data.py` → `frontend-data/`（前端消费，布局对齐 `strategy-kanban/docs/frontend-data-sample`）。
 
 ---
 
 ## config.yaml 结构
 
 ```yaml
+# 工作区根目录（可选）。设置后 snapshot/replay_data/replay_outputs
+# 以及相对的 data_dir/frontend_data_dir 都以它为基准
+workspace: /path/to/replay-workspace
+
+# K线根目录（可选）：绝对路径，或相对 workspace
+data_dir: data/klines
+
+# 看板输出根目录（可选）：绝对路径，或相对 workspace；留空则跳过 Phase 7
+frontend_data_dir: frontend-data
+
 product:                # 实盘
   strategy_name1:
     host: user@1.2.3.4
@@ -248,23 +318,29 @@ paper:                  # 纸上交易
     lang: rust
 smoking:                # 模拟盘
   strategy_name3:
-    host: user@1.2.3.4
+    host: 127.0.0.1      # 本地源：无需 SSH，走本地 rsync
     path: /home/trader/strategyC
     lang: python
 ```
 
 | 字段 | 说明 |
 |------|------|
+| `data_dir` | 可选，顶层 K 线根目录；默认 `./data/klines`。Python 回测通过软链接入快照，Rust 直接作为 `--data-dir` |
 | 顶层 key | model 类型：`product`/`paper`/`smoking` |
 | 策略名 key | 策略标识，同时作为 `data/` 子目录的 strategy_id |
 | `host` | `user@ip` 或 ssh 别名，端口/密钥走 `~/.ssh/config` |
 | `path` | 实盘项目根目录，basename 即快照文件夹名 |
 
 > **lang 自动检测**：无需手动配置。sync-exee.py 和 replay.py 会根据 `path` 指向的项目根目录自动判断语言类型：
-> - 存在 `Cargo.toml` → Rust 策略（拉取 `data/store/{day}/*.csv`，排除 `target/`，用 `cargo run -- backtest` 回测）
-> - 存在 `requirements.txt` 或 `strategy_core/` → Python 策略（拉取 `data/signals/`、`data/positions/`，用 `scripts/run_backtest_batch.sh` 回测）
+> - 存在 `Cargo.toml` → Rust 策略（拉取 `data/state/{day}/*.csv` + `data/state/history_positions/`，排除 `target/`，用 `cargo run -- backtest` 回测）
+> - 存在 `requirements.txt` 或 `strategy_core/` → Python 策略（拉取 `data/signals/`、`data/positions/`、`data/history_positions/` 整目录，用 `scripts/run_backtest_batch.sh` 回测）
 >
 > config.yaml 中也可显式指定 `lang: rust` 覆盖自动检测（默认不填即可）。
+>
+> **Rust 仓位读取注意**：`data/state/{day}/position.csv` 每行带 `deleted`（0/1）软删标志，
+> `deleted=1` 为已平仓仓位（软删行），读取当前持仓须按 `deleted==0` 过滤，否则会把已平仓
+> 仓位全部误读为持仓。当日/历史平仓明细以 `history_position.csv` 和
+> `data/state/history_positions/{runtime名}/{day}.csv` 为准。
 
 ---
 
@@ -280,23 +356,48 @@ python3 sync-exee.py [--date YYYYMMDD] [--config config.yaml] [--snapshot-dir ./
 |------|------|------|
 | `--date` | 昨天 | 备份日期 `YYYYMMDD` |
 | `--config` | `config.yaml` | 配置文件路径 |
-| `--snapshot-dir` | `./snapshot` | 代码快照根目录 |
-| `--data-dir` | `./replay_data` | data 子集根目录 |
+| `--snapshot-dir` | `<workspace>/snapshot` | 代码快照根目录 |
+| `--data-dir` | `<workspace>/replay_data` | data 子集根目录 |
 
 ### replay.py — 每日回放回测
 
 ```bash
-python3 replay.py [--date YYYYMMDD] [--config config.yaml] [--snapshot-dir ./snapshot] [--output-dir ./replay_outputs] [--start YYYYMMDD] [--end YYYYMMDD]
+python3 replay.py [--date YYYYMMDD] [--config config.yaml] [--snapshot-dir ./snapshot] [--output-dir ./replay_outputs] [--start YYYYMMDD] [--end YYYYMMDD] [--data-dir DIR] [--frontend-out DIR]
 ```
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
 | `--date` | 昨天 | 回放日期 `YYYYMMDD` |
 | `--config` | `config.yaml` | 配置文件路径 |
-| `--snapshot-dir` | `./snapshot` | 快照根目录 |
-| `--output-dir` | `./replay_outputs` | 回测结果根目录 |
+| `--snapshot-dir` | `<workspace>/snapshot` | 快照根目录 |
+| `--output-dir` | `<workspace>/replay_outputs` | 回测结果根目录 |
 | `--start` | = date | 回测开始日期 |
 | `--end` | = date | 回测结束日期 |
+| `--data-dir` | `config.yaml` 的 `data_dir`（相对 `workspace`）→ `<workspace>/data/klines` | K 线根目录 |
+| `--frontend-out` | `config.yaml` 的 `frontend_data_dir`（相对 `workspace`） | 看板输出根目录；非空则自动生成 |
+
+### generate-kanban-data.py — 看板数据生成（Phase 7）
+
+```bash
+python3 generate-kanban-data.py [--date YYYYMMDD | --start YYYYMMDD --end YYYYMMDD | --all] [--out DIR]
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--date` / `--start`+`--end` / `--all` | replay_data 最新一天 | 日期选择，三选一 |
+| `--replay-data` | `$REPLAY_WORKSPACE/replay_data` | 实盘快照根目录 |
+| `--replay-outputs` | `$REPLAY_WORKSPACE/replay_outputs` | 回测输出根目录 |
+| `--snapshot` | `$REPLAY_WORKSPACE/snapshot` | 代码快照（引擎/杠杆/meta 来源） |
+| `--klines` | `$REPLAY_WORKSPACE/data/klines` | K线（OPEN 仓位 mark 价） |
+| `--out` | `$REPLAY_WORKSPACE/frontend-data` | frontend-data 输出根目录 |
+| `--batch-gap` | 1800 | 同策略回放批次聚簇间隔（秒），决定 sweep/batch_id |
+| `--time-window` | 600 | 信号对比时间窗口（秒） |
+| `--run` | all | all=同日全部批次（样例语义）；latest=每标的仅最新 |
+| `--display-names` | 无 | JSON 映射 `{strategy: 中文名}` 写入 display_name |
+| `--prune` | 关 | 删除目标日下不在本次清单里的旧策略目录 |
+| `--dry-run` | 关 | 只打印统计不写文件 |
+
+> 环境变量 `REPLAY_WORKSPACE` 指向 replay 工作区根（含 replay_data/replay_outputs/snapshot/data）。默认值按 `trading-replay-run` 兜底。
 
 ---
 

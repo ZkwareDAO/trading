@@ -1,24 +1,28 @@
+# 看板数据输出根目录（可选）。非空时 replay 结束后自动生成
+# {frontend_data_dir}/{YYYYMMDD}/...；留空则跳过 Phase 7
+frontend_data_dir: ""
+
 product:
   strategy_name1:
     host: 127.0.0.1
-    path: /home/qpw/workspace/{strategy_name}
+    path: /path/to/{strategy_name}
   strategy_name2:
     host: 127.0.0.1
-    path: /home/qpw/workspace/{strategy_name}
+    path: /path/to/{strategy_name}
 
 paper:
   strategy_name2:
     host: 127.0.0.1
-    path: /home/qpw/workspace/{strategy_name}
+    path: /path/to/{strategy_name}
   strategy_name3:
     host: 127.0.0.1
-    path: /home/qpw/workspace/{strategy_name}
+    path: /path/to/{strategy_name}
 
 smoking:
   strategy_name4:
     host: 127.0.0.1
-    path: /home/qpw/workspace/{strategy_name}
+    path: /path/to/{strategy_name}
   strategy_name5:
     host: 127.0.0.1
-    path: /home/qpw/workspace/{strategy_name}
+    path: /path/to/{strategy_name}
   

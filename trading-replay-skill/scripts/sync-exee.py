@@ -13,17 +13,17 @@
   2. rsync 拉取策略项目，排除 logs / .venv / backtest_output（.gitignore 产物）
      —— data 目录体积大，一并排除，仅按第 3 步拉取必要子集
   3. 额外同步 data 指定文件（day 默认昨天，格式 YYYYMMDD）:
-       Python:
-         data/signals/{策略名}/{day}.csv
-         data/positions/                       （整个目录）
-         data/history_positions/{策略名}/{day}.csv
-       Rust:
-         data/store/{day}/signal.csv           （Store 快照）
-         data/store/{day}/position.csv         （当前持仓）
-         data/store/{day}/history_position.csv （平仓历史）
-         data/store/{day}/trade.csv            （成交记录）
-         data/store/{day}/equity.csv           （权益曲线）
-         data/history_positions/{策略名}/{day}.csv （24 列对外报表）
+       Python（目录名为 runtime 名，非 config key，故拉整目录）:
+         data/signals/                         （整个目录，{runtime名}/{day}.csv）
+         data/positions/                       （整个目录，{runtime名}.json）
+         data/history_positions/               （整个目录，{runtime名}/{day}.csv）
+       Rust（实盘落盘为 data/state/，Store 快照按日期分目录）:
+         data/state/{day}/signal.csv           （信号）
+         data/state/{day}/position.csv         （持仓表，deleted=1 为已平仓软删行）
+         data/state/{day}/history_position.csv （平仓历史）
+         data/state/{day}/stop.csv             （止损状态）
+         data/state/{day}/cooldown.csv         （冷却状态）
+         data/state/history_positions/         （整个目录，对外固定列报表 {runtime名}/{day}.csv）
      data 子集独立存放至 replay_data/{day}/{策略文件夹}/data/
   4. 代码存放至 snapshot/{day}/{策略文件夹}/，目录结构与远程一致
      （与 replay_outputs 对仗：replay_data=实盘输入基准，replay_outputs=回测结果）
@@ -49,8 +49,9 @@ import yaml
 LOCAL_HOSTS = {"", "127.0.0.1", "localhost", "::1"}
 
 # 同步时排除的目录：运行产物、虚拟环境、大数据目录
-# data 整体排除：体积大，仅按需求第 3 步拉取必要子集
-EXCLUDE_DIRS = ["logs", ".venv", "backtest_output", "data"]
+# data 整体排除：体积大，仅按需求第 3 步拉取必要子集。
+# 以 "/" 锚定项目根目录（rsync 无锚定会匹配任意层级，曾误伤 crates/data 源码 crate）
+EXCLUDE_DIRS = ["/logs", "/.venv", "/backtest_output", "/data"]
 
 # config 顶层 model 分组
 MODEL_KEYS = ["product", "paper", "smoking"]
@@ -104,7 +105,7 @@ def iter_strategies(config):
                 yield name, cfg.get("host", ""), cfg["path"], lang
 
 
-def collect_symbols(snapshot_base):
+def collect_symbols(snapshot_base, config=None):
     """扫描所有快照，收集代币去重
 
     支持两种模板：
@@ -140,18 +141,37 @@ def collect_symbols(snapshot_base):
             for yaml_file in config_dir.rglob("*.yaml"):
                 if yaml_file.name.startswith("_"):
                     continue  # 跳过 _global
+                # {SYMBOL}.yaml 文件名模式：stem 即代币（如 AG.yaml/AU.yaml）
+                # 仅限策略子目录内的文件；config/strategies.yaml 等根级文件不算代币
+                if yaml_file.parent != config_dir:
+                    stem = yaml_file.stem.upper()
+                    if stem != "EXAMPLE" and not stem.startswith("."):
+                        symbols.add(stem)
                 try:
-                    config = yaml.safe_load(yaml_file.read_text(encoding="utf-8")) or {}
+                    strat_cfg = yaml.safe_load(yaml_file.read_text(encoding="utf-8")) or {}
                 except Exception:
                     continue
-                for sym in config.get("symbols", []):
+                for sym in strat_cfg.get("symbols", []):
                     if isinstance(sym, dict) and "symbol" in sym:
                         symbols.add(sym["symbol"].upper())
                     elif isinstance(sym, str):
                         symbols.add(sym.upper())
                 # 单文件模式
-                if "symbol" in config:
-                    symbols.add(str(config["symbol"]).upper())
+                if "symbol" in strat_cfg:
+                    symbols.add(str(strat_cfg["symbol"]).upper())
+
+    # 单文件模式兜底：仍无代币时，扫源项目 data/klines/1m/{SYMBOL}_1m.csv
+    # （模板单文件配置无 symbols 字段，代币隐含在本地 K线文件名中；
+    #   远程 host 无法直接扫，留待 replay 阶段兜底）
+    if not symbols and config:
+        for _name, host, remote_path, _lang in iter_strategies(config):
+            if not is_local(host):
+                continue
+            klines_dir = Path(remote_path) / "data" / "klines" / "1m"
+            if not klines_dir.is_dir():
+                continue
+            for f in klines_dir.glob("*_1m.csv"):
+                symbols.add(f.name.replace("_1m.csv", "").upper())
 
     return sorted(symbols)
 
@@ -206,18 +226,19 @@ def rsync_pull(host, remote, local, excludes=None):
 def sync_data_files(host, remote_path, local_dir, day, name, lang="python"):
     """同步 data 指定子集
 
-    Python 模板：
-     - data/signals/{name}/{day}.csv
-     - data/positions/                   （整个目录）
-     - data/history_positions/{name}/{day}.csv
+    Python 模板（拉整目录：目录名为 runtime 名如 DOLPHINV2_4H_2_BTCUSDT_LIVE，
+    与 config key 可能不同，拼路径会拉空）：
+     - data/signals/               （整个目录）
+     - data/positions/             （整个目录，{runtime名}.json）
+     - data/history_positions/     （整个目录）
 
-    Rust 模板：
-     - data/store/{day}/signal.csv           （Store 快照）
-     - data/store/{day}/position.csv         （当前持仓）
-     - data/store/{day}/history_position.csv （平仓历史）
-     - data/store/{day}/trade.csv            （成交记录）
-     - data/store/{day}/equity.csv           （权益曲线）
-     - data/history_positions/{name}/{day}.csv （24 列对外报表）
+    Rust 模板（实盘落盘在 data/state/，非 data/store/）：
+     - data/state/{day}/signal.csv           （信号）
+     - data/state/{day}/position.csv         （持仓表，deleted=1 为已平仓软删行，读取需过滤）
+     - data/state/{day}/history_position.csv （平仓历史）
+     - data/state/{day}/stop.csv             （止损状态）
+     - data/state/{day}/cooldown.csv         （冷却状态）
+     - data/state/history_positions/         （整个目录，对外固定列报表）
 
     单个 csv 缺失不算错（部分策略当天无信号/历史持仓）；
     --ignore-missing-args 让缺失文件不污染退出码。
@@ -227,18 +248,18 @@ def sync_data_files(host, remote_path, local_dir, day, name, lang="python"):
     prefix = "" if is_local(host) else f"{host}:"
     if lang == "rust":
         pulls = [
-            f"data/store/{day}/signal.csv",
-            f"data/store/{day}/position.csv",
-            f"data/store/{day}/history_position.csv",
-            f"data/store/{day}/trade.csv",
-            f"data/store/{day}/equity.csv",
-            f"data/history_positions/{name}/{day}.csv",
+            f"data/state/{day}/signal.csv",
+            f"data/state/{day}/position.csv",
+            f"data/state/{day}/history_position.csv",
+            f"data/state/{day}/stop.csv",
+            f"data/state/{day}/cooldown.csv",
+            "data/state/history_positions",
         ]
     else:
         pulls = [
-            f"data/signals/{name}/{day}.csv",
+            "data/signals",
             "data/positions",
-            f"data/history_positions/{name}/{day}.csv",
+            "data/history_positions",
         ]
     ok = True
     for rel in pulls:
@@ -250,8 +271,8 @@ def sync_data_files(host, remote_path, local_dir, day, name, lang="python"):
         cmd += [f"{prefix}{remote_path}/{rel}", f"{local_target}/"]
         print(f"  $ {' '.join(cmd)}")
         r = subprocess.run(cmd)
-        # positions 是目录，缺失才告警；csv 缺失可接受
-        if r.returncode != 0 and not rel.endswith(day + ".csv"):
+        # positions 等目录，缺失才告警；单日 csv 缺失可接受
+        if r.returncode != 0 and not rel.endswith(".csv"):
             ok = False
     return ok
 
@@ -260,16 +281,33 @@ def main():
     ap = argparse.ArgumentParser(description="每日策略项目备份")
     ap.add_argument("--date", default=None, help="备份日期 YYYYMMDD，默认昨天")
     ap.add_argument("--config", default="config.yaml", help="配置文件路径")
-    ap.add_argument("--snapshot-dir", default="./snapshot", help="快照根目录")
-    ap.add_argument("--data-dir", default="./replay_data", help="data 子集根目录")
+    ap.add_argument("--snapshot-dir", default=None,
+                    help="快照根目录（默认 <workspace>/snapshot）")
+    ap.add_argument("--data-dir", default=None,
+                    help="data 子集根目录（默认 <workspace>/replay_data）")
     args = ap.parse_args()
 
     day = parse_day(args.date)
     config = load_config(args.config)
 
-    snapshot_base = Path(args.snapshot_dir) / day
+    # 路径基准：config.yaml 的 workspace（可选）；绝对路径直接用，相对路径以 workspace 为基准。
+    workspace_cfg = str(config.get("workspace") or "").strip()
+    workspace = Path(workspace_cfg).expanduser().resolve() if workspace_cfg else None
+
+    def resolve_path(value, default_rel):
+        if value:
+            p = Path(value).expanduser()
+            if p.is_absolute() or workspace is None:
+                return p.resolve()
+            return (workspace / p).resolve()
+        return (workspace / default_rel).resolve() if workspace else Path(default_rel).resolve()
+
+    if workspace:
+        print(f"  工作区(workspace): {workspace}")
+
+    snapshot_base = resolve_path(args.snapshot_dir, "snapshot") / day
     snapshot_base.mkdir(parents=True, exist_ok=True)
-    data_base = Path(args.data_dir) / day
+    data_base = resolve_path(args.data_dir, "replay_data") / day
     data_base.mkdir(parents=True, exist_ok=True)
 
     print(f"=== sync-exee 开始，日期 {day} ===")
@@ -322,7 +360,7 @@ def main():
         success += 1
 
     # 步骤 5: 扫描快照收集代币去重 → 生成 symbols.yaml
-    symbols = collect_symbols(snapshot_base)
+    symbols = collect_symbols(snapshot_base, config=config)
     symbols_path = snapshot_base / "symbols.yaml"
     write_symbols_yaml(symbols, symbols_path)
     print(f"\n✅ 生成 {symbols_path}（{len(symbols)} 个代币，已去重）")
