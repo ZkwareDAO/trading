@@ -36,6 +36,7 @@ Phase 1.4 → 首次环境准备（仅首次/重置）
 Phase 2   → 信息确认与代码获取（git clone）
 Phase 3   → 配置校验与预处理（init_overrides 兜底）
 Phase 4   → 回测执行与结果通知
+Phase 5   → 看板数据生成（frontend-data/discovery）
 ```
 
 ---
@@ -167,6 +168,45 @@ python3 discovery.py --start 20260601 --end 20260801
 
 ---
 
+## Phase 5: 看板数据生成
+
+### 5.1 转换为 frontend-data/discovery 布局
+
+- **触发条件**：`backtest.yaml` 的 `frontend_data_dir` 非空（或 CLI `--frontend-out DIR`）时，
+  Phase 4 有成功回测后自动执行 `scripts/generate-discovery-data.py`，输出到
+  `{frontend_data_dir}/discovery/`；**为空则跳过 Phase 5，不算失败**。
+- **手动执行**：也可单独运行下方命令，把 `discovery_outputs/` 转为与
+  `frontend-data-v2/discovery/` 同构的产物，供前端「策略发现」页面消费。
+
+```bash
+python3 generate-discovery-data.py \
+    --discovery-outputs ./discovery_outputs \
+    --out /path/to/frontend-data
+```
+
+产物：
+
+```text
+{out}/discovery/
+├── runs.csv                                  # 28 列，source=discovery
+└── {strategy}/
+    ├── meta.json
+    └── backtest_results/{run_stamp}/
+        ├── {SYMBOL}.json
+        └── config.json
+```
+
+口径：
+
+1. `data_day` / `run_day` = 源目录 `run_date`（`YYYYMMDD`）；`run_stamp` = `YYYYMMDDTHHMMSS`。
+2. `batch_id`、`sweep`、`is_latest` 按同策略同日重算；前端只取 `is_latest=1`。
+3. `display_name = source_strategy`（配置策略名），不读取任何前端文件；
+   如需中文名，用可选 `--display-names <json>`。
+4. 幂等：按 `(strategy, run_stamp, symbol)` upsert 到已有 `runs.csv`，不覆盖历史行。
+5. `--prune` 清理本次未涉及的旧策略目录；`--dry-run` 只打印不写盘。
+
+---
+
 ## 目录结构
 
 ```
@@ -184,14 +224,20 @@ workspace/
 │
 ├── data/klines/1m/                     ← K线数据（两种语言共用）
 │
-└── discovery_outputs/                  ← 回测结果（两种语言共用）
-    ├── sar_snt/                        ← Python 策略结果
-    └── my_rust_strategy/               ← Rust 策略结果
+├── discovery_outputs/                  ← 回测结果（两种语言共用）
+│   ├── sar_snt/                        ← Python 策略结果
+│   └── my_rust_strategy/               ← Rust 策略结果
+│
+└── frontend-data/                      ← 看板数据（Phase 5 生成）
+    └── discovery/
+        ├── runs.csv
+        └── {strategy}/{meta.json, backtest_results/{run_stamp}/{SYMBOL}.json, config.json}
 ```
 
 **数据流转**：
 - Python：`config.yaml` → `fetch_strategies.py` clone → `strategies.yaml` → `init_overrides.py` → `run_backtest_batch.sh` → `discovery_outputs/`
 - Rust：`config.yaml` → `fetch_strategies.py` clone → `config/{name}/example.yaml` → `cargo run --release -- backtest` → `discovery_outputs/`
+- 看板：`discovery_outputs/` → `generate-discovery-data.py` → `frontend-data/discovery/`
 
 > **lang 自动检测**：discovery.py 根据策略目录自动判断语言类型（Cargo.toml → rust，requirements.txt/strategy_core/ → python），无需手动配置。
 
@@ -222,8 +268,13 @@ cash: 5000               # 初始资金
 commission: 0.0004        # 手续费（币安合约 taker 0.04%）
 data_dir: "./data/klines"      # K线目录（必须与 settings.yaml csv_dir 一致）
 output_dir: "./discovery_outputs"   # 产物根（discovery.py 每策略覆盖为子目录）
+frontend_data_dir: ""    # frontend-data 根；非空时自动转换到 {该目录}/discovery/
 max_workers: 4           # 并发数
 ```
+
+> **Rust 策略的 data_dir**：discovery.py 将其解析为绝对路径，软链到 `<策略目录>/data/klines`
+> （策略仓 `run_backtest_batch.sh` 硬编码该路径），并以 `--data-dir` 传给回测命令。
+> 已存在真实 `data/klines` 目录时不覆盖。
 
 ---
 
@@ -258,7 +309,7 @@ python3 init_overrides.py --strategy-dir ./strategies/sar_snt/strategies/sar_snt
 ### discovery.py — 回测执行
 
 ```bash
-python3 discovery.py --start 20260601 [--end 20260801] [--config config.yaml] [--backtest-config backtest.yaml] [--strategies-dir .] [--output-root ./discovery_outputs] [--strategies sar_snt] [--log-level INFO]
+python3 discovery.py --start 20260601 [--end 20260801] [--config config.yaml] [--backtest-config backtest.yaml] [--strategies-dir .] [--output-root ./discovery_outputs] [--frontend-out DIR] [--strategies sar_snt] [--log-level INFO]
 ```
 
 | 参数 | 默认 | 说明 |
@@ -269,8 +320,24 @@ python3 discovery.py --start 20260601 [--end 20260801] [--config config.yaml] [-
 | `--backtest-config` | `backtest.yaml` | 回测 run-profile |
 | `--strategies-dir` | `.` | 策略目录父目录 |
 | `--output-root` | `./discovery_outputs` | 产物根目录 |
+| `--frontend-out` | `backtest.yaml` 的 `frontend_data_dir` | frontend-data 根目录；设置后自动转换 |
 | `--strategies` | 全部 | 只回测指定策略 |
 | `--log-level` | `INFO` | 透传给 wrapper 的日志级别 |
+
+### generate-discovery-data.py — 看板数据生成（Phase 5）
+
+```bash
+python3 generate-discovery-data.py [--discovery-outputs ./discovery_outputs] [--out ./frontend-data] [--display-names file.json] [--batch-gap 1800] [--prune] [--dry-run]
+```
+
+| 参数 | 默认 | 说明 |
+|------|------|------|
+| `--discovery-outputs` | `./discovery_outputs` | discovery.py 产物根目录 |
+| `--out` | `./frontend-data` | frontend-data 根目录，产物写入 `{out}/discovery/` |
+| `--display-names` | 无 | 可选 JSON 映射；默认 `display_name = source_strategy` |
+| `--batch-gap` | `1800` | 同策略批次聚簇间隔（秒），决定 `batch_id`/`sweep` |
+| `--prune` | 关 | 删除输出目录下本次未涉及的旧策略目录 |
+| `--dry-run` | 关 | 只打印统计，不写文件 |
 
 ---
 

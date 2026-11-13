@@ -39,6 +39,7 @@ config.yaml 结构（= templates/config.example.yaml，git_url 字段已不再�
 """
 
 import argparse
+import json
 import os
 import subprocess
 import sys
@@ -76,6 +77,33 @@ def load_yaml(path) -> dict:
         sys.exit(f"❌ 配置文件不存在: {path}")
     with open(p, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
+
+
+def read_strategy_config(proj_dir, strategy_name) -> dict:
+    """读取策略目录下第一份含 strategy 字段的 YAML。"""
+    cfg_dir = Path(proj_dir) / "config" / (strategy_name or "")
+    if not cfg_dir.is_dir():
+        return {}
+    for path in sorted(cfg_dir.glob("*.yaml")):
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(data, dict) and data.get("strategy"):
+            return data
+    return {}
+
+
+def write_project_meta(out_dir, strategy, engine, config) -> None:
+    """落盘 engine/timeframe/leverage，供 frontend 转换器读取。"""
+    meta = {"strategy": strategy, "engine": engine}
+    if isinstance(config, dict):
+        for key in ("timeframe", "leverage", "warmup_days"):
+            if config.get(key) is not None:
+                meta[key] = config[key]
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    (Path(out_dir) / ".meta.json").write_text(
+        json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def discover_strategy_dirs(strategies_parent: Path, config: dict, only=None):
@@ -287,6 +315,13 @@ def read_symbols_rust(strategy_dir):
         if "strategy" in cfg and isinstance(cfg["strategy"], str):
             strategy_name = cfg["strategy"]
 
+        # 目录模式：{SYMBOL}.yaml 文件名即代币
+        # （config/{strategy}/BTCUSDT.yaml；文件名定义 symbol，见策略仓 config.rs load_dir）
+        if yaml_file.parent != config_root:
+            stem = yaml_file.stem.upper()
+            if stem != "EXAMPLE" and not stem.startswith("."):
+                symbols.append(stem)
+
         # 从 symbols 列表收集代币
         for sym in cfg.get("symbols") or []:
             if isinstance(sym, dict):
@@ -314,14 +349,45 @@ def read_symbols_rust(strategy_dir):
     return unique, src, strategy_name
 
 
-def run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash, commission):
+def ensure_klines_link(proj_dir, data_dir):
+    """把工作区 K 线目录软链到策略目录 data/klines
+
+    Rust 策略仓自带的 scripts/run_backtest_batch.sh 以 $PROJ_DIR/data/klines
+    作为 --data-dir（路径写死在策略仓内），因此由本脚本根据 backtest.yaml
+    的 data_dir 建立软链，使 K 线目录可配置且策略仓无需改动。
+    已存在真实目录时不覆盖（尊重策略仓本地数据）。
+    """
+    if not data_dir:
+        return
+    src = Path(data_dir).expanduser().resolve()
+    if not src.is_dir():
+        print(f"  ⚠ K线目录不存在，跳过软链: {src}")
+        return
+    link = Path(proj_dir) / "data" / "klines"
+    if link.is_symlink():
+        if link.resolve() == src:
+            return
+        link.unlink()
+    elif link.exists():
+        print(f"  ⚠ {link} 已是真实目录，沿用策略仓自带 K 线（忽略 data_dir）")
+        return
+    link.parent.mkdir(parents=True, exist_ok=True)
+    link.symlink_to(src, target_is_directory=True)
+    print(f"  K线软链: {link} → {src}")
+
+
+def run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash, commission,
+                      data_dir=None, strategy_name=None):
     """执行 Rust 策略回测
 
     Rust 回测通过 cargo run --release -- backtest 调用。
     逐个代币串行执行，输出到 discovery_outputs/{strategy}/。
+    data_dir 非空时先软链到策略目录 data/klines（wrapper 硬编码该路径）。
+    strategy_name 非空且 config/<name>/ 存在时，用目录模式配置（含 per-symbol）。
     """
     out_dir = Path(out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    ensure_klines_link(proj_dir, data_dir)
 
     # 定位 Cargo.toml
     cargo_toml = proj_dir / "Cargo.toml"
@@ -329,27 +395,32 @@ def run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash, commission):
         print(f"  ❌ 未找到 Cargo.toml: {cargo_toml}")
         return False
 
-    # 定位策略配置
+    # 定位策略配置：优先 config/<strategy>/ 目录模式（含 per-symbol 覆盖），
+    # 否则回退扫描第一个含 strategy 字段的 YAML（单文件模式）
     config_root = proj_dir / "config"
-    strategy_name = None
-    config_file = None
-
-    for yaml_file in sorted(config_root.rglob("*.yaml")):
-        if yaml_file.name.startswith("_"):
-            continue
-        try:
-            with open(yaml_file, encoding="utf-8") as f:
-                cfg = yaml.safe_load(f) or {}
-        except Exception:
-            continue
-        if isinstance(cfg, dict) and "strategy" in cfg:
-            strategy_name = cfg["strategy"]
-            config_file = yaml_file
-            break
-
-    if not config_file:
-        print(f"  ❌ 未找到策略配置文件（config/*.yaml 中无 strategy 字段）")
-        return False
+    def pick_config(symbol):
+        """按代币选配置：{symbol}.yaml → example.yaml → 策略目录 → 首个含 strategy 的 YAML"""
+        if strategy_name:
+            strat_dir = config_root / strategy_name
+            if strat_dir.is_dir():
+                per = strat_dir / f"{symbol}.yaml"
+                if per.is_file():
+                    return per
+                example = strat_dir / "example.yaml"
+                if example.is_file():
+                    return example
+                return strat_dir
+        for yaml_file in sorted(config_root.rglob("*.yaml")):
+            if yaml_file.name.startswith("_"):
+                continue
+            try:
+                with open(yaml_file, encoding="utf-8") as f:
+                    cfg = yaml.safe_load(f) or {}
+            except Exception:
+                continue
+            if isinstance(cfg, dict) and "strategy" in cfg:
+                return yaml_file
+        return None
 
     # 先编译
     print(f"  🔨 编译 Rust 项目...")
@@ -361,15 +432,21 @@ def run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash, commission):
     # 逐个代币执行回测
     all_ok = True
     for symbol in symbols:
+        config_target = pick_config(symbol)
+        if not config_target:
+            print(f"  ❌ 未找到策略配置文件（config/*.yaml 中无 strategy 字段）")
+            return False
         cmd = [
             "cargo", "run", "--release", "--", "backtest",
-            "--config", str(config_file),
+            "--config", str(config_target),
             "--symbol", symbol,
             "--start", start,
-            "--output_dir", str(out_dir),
+            "--output-dir", str(out_dir),
             "--cash", str(cash),
             "--leverage", "1",
         ]
+        if data_dir:
+            cmd += ["--data-dir", str(Path(data_dir).expanduser().resolve())]
         if end:
             cmd += ["--end", end]
         if commission:
@@ -401,6 +478,9 @@ def main():
                     help="策略目录的父目录（策略文件夹在其下查找）")
     ap.add_argument("--output-root", default="./discovery_outputs",
                     help="discovery 产物根目录，每个策略一份子目录")
+    ap.add_argument("--frontend-out", default=None,
+                    help="frontend-data 根目录（覆盖 backtest.yaml 的 "
+                         "frontend_data_dir；为空则跳过自动转换）")
     ap.add_argument("--strategies", default=None,
                     help="只回测指定策略（逗号分隔目录名），默认全部")
     ap.add_argument("--python", default=None,
@@ -417,10 +497,25 @@ def main():
     if Path(args.config).is_file():
         config = load_yaml(args.config)
 
+    # 预检 1: backtest.yaml 是否存在（缺失时给出模板路径与必填字段）
+    bt_path = Path(args.backtest_config)
+    if not bt_path.is_file():
+        skill_root = Path(__file__).resolve().parent.parent
+        template = skill_root / "templates" / "backtest.example.yaml"
+        print(f"❌ 配置文件不存在: {args.backtest_config}")
+        print("   请先复制模板并填写：")
+        print(f"     cp {template} {args.backtest_config}")
+        print("     data_dir            K 线目录（需含 1m/{SYMBOL}_1m.csv）")
+        print("     frontend_data_dir   看板输出目录（留空则不生成前端数据）")
+        sys.exit(1)
+
     bt_config = load_yaml(args.backtest_config)
 
     # backtest.yaml 固定口径：data_dir = K 线目录，output_dir 每策略覆盖
+    # Python 分支沿用原始写法（profile 需与 settings.csv_dir 字符串一致）；
+    # Rust 分支用绝对路径建软链（相对 CWD 解析）。
     data_dir = bt_config.get("data_dir") or "./data/klines"
+    data_dir_abs = str(Path(data_dir).expanduser().resolve())
     cash = bt_config.get("cash", 5000)
     commission = bt_config.get("commission", 0.0004)
     max_workers = bt_config.get("max_workers", 4)
@@ -441,6 +536,22 @@ def main():
     print(f"  K线目录(data_dir): {data_dir}")
     print(f"  产物根(output_root): {output_root}")
     print(f"  并发(max_workers): {max_workers}")
+
+    # 预检 2: K 线目录（Python 引擎可自动补数据，Rust 不会；仅告警不阻断）
+    kline_dir = Path(data_dir).expanduser().resolve()
+    kline_1m = kline_dir / "1m"
+    has_klines = kline_1m.is_dir() and any(kline_1m.glob("*_1m.csv"))
+    if not has_klines:
+        downloader = Path(__file__).with_name("download_data.py")
+        print(f"  ⚠ K线目录不存在或为空: {kline_1m}")
+        print("     Rust 策略不会自动下载，请先执行：")
+        print(f"       python3 {downloader} --symbols BTCUSDT --data-dir {kline_dir}")
+        print("     Python 策略引擎可能自动补数据；若失败请同样先下载")
+
+    # 预检 3: frontend_data_dir
+    if not (args.frontend_out or bt_config.get("frontend_data_dir")):
+        print("  ⚠ 未配置 frontend_data_dir（或 --frontend-out），"
+              "本次不会生成 frontend-data")
     print()
 
     entries = list(discover_strategy_dirs(strategies_parent, config, only))
@@ -450,6 +561,7 @@ def main():
                  "且 config.yaml 无登记）")
 
     success, fail, skip = 0, 0, 0
+    failures = []
     for name, proj_dir in entries:
         print(f"--- {name} → {proj_dir} ---")
 
@@ -474,13 +586,18 @@ def main():
 
             out_dir = output_root / name
             out_dir.mkdir(parents=True, exist_ok=True)
+            write_project_meta(out_dir, strategy_name, "rust",
+                               read_strategy_config(proj_dir, strategy_name))
 
-            if run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash, commission):
+            if run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash,
+                                 commission, data_dir=data_dir_abs,
+                                 strategy_name=strategy_name):
                 print(f"  ✅ {name}: 回测完成 → {out_dir}/")
                 success += 1
             else:
                 print(f"  ❌ {name}: 回测失败")
                 fail += 1
+                failures.append(f"{name}: Rust 回测失败（检查 K 线目录/策略配置）")
             continue
 
         # Python 分支（现有逻辑不变）
@@ -514,6 +631,7 @@ def main():
         # 步骤 2: 每策略一份 output_dir = discovery_outputs/{策略目录}/
         out_dir = output_root / name
         out_dir.mkdir(parents=True, exist_ok=True)
+        write_project_meta(out_dir, strategies_arg, "python", {})
 
         # 写入该策略的 run-profile（output_dir/data_dir/cash/commission/并发）
         # wrapper 用 --profile <name> 读取 config/<name>.yaml；data_dir 必须与
@@ -566,8 +684,35 @@ def main():
         else:
             print(f"  ❌ {name}: 回测失败 (exit {r.returncode})")
             fail += 1
+            failures.append(f"{name}: Python 回测失败 exit {r.returncode}")
+
+    # Phase 5: 自动转换为 frontend-data/discovery
+    # 输出目录优先取 --frontend-out，其次 backtest.yaml 的 frontend_data_dir。
+    frontend_out = args.frontend_out or bt_config.get("frontend_data_dir") or ""
+    if frontend_out and success > 0:
+        converter = Path(__file__).with_name("generate-discovery-data.py")
+        if not converter.is_file():
+            print(f"  ⚠ 未找到转换脚本: {converter}，跳过 frontend-data 生成")
+        else:
+            frontend_abs = Path(frontend_out).expanduser().resolve()
+            cmd = [sys.executable, str(converter),
+                   "--discovery-outputs", str(output_root),
+                   "--out", str(frontend_abs)]
+            print("\n=== Phase 5: 生成 frontend-data ===")
+            print(f"  $ {' '.join(cmd)}")
+            rc = subprocess.run(cmd).returncode
+            if rc == 0:
+                print(f"  ✅ frontend-data → {frontend_abs}/discovery/")
+            else:
+                print(f"  ❌ frontend-data 生成失败 (exit {rc})")
+                fail += 1
+                failures.append("frontend-data: 转换失败")
 
     print(f"\n=== 完成: {success} 成功, {fail} 失败, {skip} 跳过 ===")
+    if failures:
+        print("失败原因：")
+        for item in failures:
+            print(f"  - {item}")
     sys.exit(1 if fail else 0)
 
 

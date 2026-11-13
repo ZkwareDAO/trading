@@ -41,6 +41,9 @@ commission: 0.0004   # 币安合约 taker 0.04%
 # 数据与输出（data_dir 必须与 settings.yaml 的 csv_dir 一致，启动时校验）
 data_dir: "./data/klines"
 output_dir: "./backtest_output"
+# frontend-data 根目录：非空时 Phase 5 自动转换到 {frontend_data_dir}/discovery/
+# 也可用 CLI --frontend-out 覆盖；留空则跳过自动转换
+frontend_data_dir: ""
 use_today_as_output_date: true
 log_level: "INFO"
 
