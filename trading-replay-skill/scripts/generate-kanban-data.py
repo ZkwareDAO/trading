@@ -52,6 +52,7 @@ import argparse
 import csv
 import json
 import os
+import yaml
 import re
 import shutil
 from collections import Counter, defaultdict
@@ -894,29 +895,150 @@ def metrics_of(result: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def load_strategy_spec(snapshot_root: str, day: str, names: List[str]) -> Dict[str, Any]:
+    """从快照策略工程中读取 strategy-spec（docs/strategy/specs/*.yaml）。"""
+    base = Path(snapshot_root) / day
+    wanted = {n for n in names if n}
+    if not base.is_dir() or not wanted:
+        return {}
+    for path in sorted(base.rglob("*.strategy-spec.yaml")):
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(data, dict) and str(data.get("strategy_name")) in wanted:
+            return data
+    return {}
+
+
+# 指标名白名单：只识别 spec 文本/参数键中明确出现的名称
+_INDICATOR_ALIASES = [
+    ("ADX", "ADX"), ("EMA", "EMA"), ("ATR", "ATR"), ("RSI", "RSI"),
+    ("MACD", "MACD"), ("OBV", "OBV"), ("VWAP", "VWAP"), ("SAR", "SAR"),
+    ("SUPERTREND", "Supertrend"), ("DONCHIAN", "Donchian"),
+    ("BOLLINGER", "Bollinger"), ("KDJ", "KDJ"), ("CCI", "CCI"),
+]
+
+
+def _extract_indicators(spec: Dict[str, Any]) -> List[str]:
+    """从 spec 已写的条件/说明/参数键中提取指标名，不补未写的指标。"""
+    entry = spec.get("entry") or {}
+    exit_cfg = spec.get("exit") or {}
+    texts = []
+    if entry.get("description"):
+        texts.append(str(entry["description"]))
+    texts += [str(v) for v in (entry.get("conditions") or [])]
+    texts += [str(exit_cfg[k]) for k in
+              ("stop_loss", "trailing_stop", "signal_reversal", "note") if exit_cfg.get(k)]
+    blob = " ".join(texts).upper()
+    keys = " ".join(str(k).upper() for k in (spec.get("default_params") or {}))
+    found: List[str] = []
+    for alias, canonical in _INDICATOR_ALIASES:
+        if (alias in blob or alias in keys) and canonical not in found:
+            found.append(canonical)
+    return found
+
+
+def _extract_indicator_params(spec: Dict[str, Any],
+                              indicators: List[str]) -> Dict[str, Dict[str, Any]]:
+    """只取 spec 显式给出的参数值，缺失的键不补默认值。"""
+    dp = spec.get("default_params") or {}
+    out: Dict[str, Dict[str, Any]] = {}
+
+    def put(name: str, pairs: List[Tuple[str, Any]]) -> None:
+        if name not in indicators:
+            return
+        values = {k: v for k, v in pairs if v is not None}
+        if values:
+            out[name] = values
+
+    put("ADX", [("period", dp.get("adx_period"))])
+    put("EMA", [("fast_period", dp.get("ema_fast")),
+                ("slow_period", dp.get("ema_slow"))])
+    put("ATR", [("period", dp.get("atr_period"))])
+    put("Donchian", [("period", dp.get("wave_breakout") or dp.get("donchian_period"))])
+    put("SAR", [("acceleration", dp.get("sar_acceleration")),
+                ("maximum", dp.get("sar_maximum"))])
+    put("Supertrend", [("period", dp.get("st_period")),
+                       ("factor", dp.get("st_factor"))])
+    put("RSI", [("period", dp.get("rsi_period"))])
+    return out
+
+
+def spec_meta(spec: Dict[str, Any]) -> Dict[str, Any]:
+    """strategy-spec -> meta；只做提取/原样转化，不自由发挥。"""
+    if not isinstance(spec, dict) or not spec:
+        return {}
+    entry = spec.get("entry") or {}
+    exit_cfg = spec.get("exit") or {}
+
+    entry_list = list(entry.get("conditions") or [])
+    if not entry_list and entry.get("description"):
+        entry_list = [str(entry["description"])]
+
+    exit_list = [str(exit_cfg[k]) for k in
+                 ("stop_loss", "trailing_stop", "signal_reversal") if exit_cfg.get(k)]
+    if exit_cfg.get("note"):
+        exit_list.append(str(exit_cfg["note"]))
+
+    # 风控：只取 spec 显式写出的 risk / position_sizing / stop_reason 原文
+    risk: List[str] = []
+    explicit_risk = spec.get("risk")
+    if isinstance(explicit_risk, list):
+        risk += [str(v) for v in explicit_risk if v]
+    elif isinstance(explicit_risk, dict):
+        for value in explicit_risk.values():
+            if isinstance(value, list):
+                risk += [str(v) for v in value if v]
+            elif value:
+                risk.append(str(value))
+    risk += [str(v) for v in (spec.get("position_sizing") or {}).values() if v]
+    stop_reason = exit_cfg.get("stop_reason") or {}
+    if isinstance(stop_reason, dict):
+        risk += [str(v) for v in stop_reason.values() if v]
+    risk = list(dict.fromkeys(risk))
+
+    # 前端只展示「开仓条件 / 风控条件」：把平仓相关原文合并进 risk
+    risk = list(dict.fromkeys(exit_list + risk))
+
+    indicators = _extract_indicators(spec)
+    params = _extract_indicator_params(spec, indicators)
+
+    return {
+        "description": str(entry.get("description") or ""),
+        "indicators": indicators,
+        "indicator_params": params,
+        "logic": {"entry": entry_list, "risk": risk},
+    }
+
+
 def meta_from_run(run: Run, engine: str, day: str, display_name: str,
-                  strategy_version: str, description: str = "") -> Dict[str, Any]:
+                  strategy_version: str, description: str = "",
+                  spec: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     text = run.config_text
     timeframe = (yaml_scalar(text, "timeframe") or "").lower()
     params = yaml_params(text) if text else {}
     warmup = to_float(yaml_scalar(text, "warmup_days"), None) if text else None
     m = metrics_of(run.result)
+    sm = spec_meta(spec or {})
     return {
         "schema_version": SCHEMA_VERSION,
         "day": day,
         "strategy": run.strategy,
         "source_strategy": run.source_strategy or m["source_strategy"] or run.strategy,
         "display_name": display_name,
-        "description": description or str((run.result.get("config") or {}).get("name")
-                                          or f"{run.strategy} 回放策略"),
+        "description": (description or sm.get("description")
+                        or str((run.result.get("config") or {}).get("name")
+                               or f"{run.strategy} 回放策略")),
         "version": strategy_version,
         "engine": engine,
         "timeframe": timeframe,
         "leverage": int(to_float(yaml_scalar(text, "leverage"), 1.0) or 1),
         "warmup_days": int(warmup) if warmup else None,
-        "indicators": sorted({re.sub(r"_[a-z0-9]+$", "", k).upper() for k in params}),
-        "indicator_params": params,
-        "logic": {},
+        "indicators": (sm.get("indicators")
+                       or sorted({re.sub(r"_[a-z0-9]+$", "", k).upper() for k in params})),
+        "indicator_params": sm.get("indicator_params") or params,
+        "logic": sm.get("logic") or {},
         "params": params,
         "captured_at": fmt_z(parse_dt(run.result.get("end_time"))
                              or parse_dt(run.result.get("start_time"))),
@@ -924,7 +1046,8 @@ def meta_from_run(run: Run, engine: str, day: str, display_name: str,
 
 
 def meta_from_snapshot(strategy: str, engine: str, day: str, display_name: str,
-                      args: argparse.Namespace) -> Dict[str, Any]:
+                      args: argparse.Namespace,
+                      spec: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """纯实盘策略（当日无回放 run）的 meta.json：读快照配置，读不到给默认。"""
     timeframe = leverage = warmup = None
     params: Dict[str, Any] = {}
@@ -951,21 +1074,23 @@ def meta_from_snapshot(strategy: str, engine: str, day: str, display_name: str,
                 warmup = to_float(yaml_scalar(text, "warmup_days"))
                 params = yaml_params(text)
                 break
+    sm = spec_meta(spec or {})
     return {
         "schema_version": SCHEMA_VERSION,
         "day": day,
         "strategy": strategy,
         "source_strategy": strategy,
         "display_name": display_name,
-        "description": f"{strategy} 实盘策略",
+        "description": sm.get("description") or f"{strategy} 实盘策略",
         "version": day,
         "engine": engine,
         "timeframe": timeframe or "",
         "leverage": int(leverage or 1),
         "warmup_days": int(warmup) if warmup else None,
-        "indicators": sorted({re.sub(r"_[a-z0-9]+$", "", k).upper() for k in params}),
-        "indicator_params": params,
-        "logic": {},
+        "indicators": (sm.get("indicators")
+                       or sorted({re.sub(r"_[a-z0-9]+$", "", k).upper() for k in params})),
+        "indicator_params": sm.get("indicator_params") or params,
+        "logic": sm.get("logic") or {},
         "params": params,
         "captured_at": datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
@@ -1305,6 +1430,9 @@ class DayBuilder:
             runs = sorted(per_strategy_runs.get(strategy, []),
                           key=lambda r: (r.run_stamp, r.symbol))
             display = next((r["_display"] for r in srows), strategy)
+            source = next((r.get("source_strategy") for r in srows
+                           if r.get("source_strategy")), strategy)
+            spec = load_strategy_spec(args.snapshot, self.day, [strategy, source])
             if runs:
                 write_csv(sdir / "backtest_runs.csv", RUNS_COLUMNS,
                           self._run_rows(runs, latest, engine, display_map))
@@ -1314,11 +1442,12 @@ class DayBuilder:
                 latest_overall = max(runs, key=lambda r: r.run_stamp)
                 write_json(sdir / "meta.json",
                            meta_from_run(latest_overall, engine, self.day, display,
-                                         self.day),
+                                         self.day, spec=spec),
                            True)
             else:
                 write_json(sdir / "meta.json",
-                           meta_from_snapshot(strategy, engine, self.day, display, args),
+                           meta_from_snapshot(strategy, engine, self.day, display,
+                                              args, spec=spec),
                            True)
             if runs:
 

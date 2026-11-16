@@ -160,7 +160,7 @@ sharpe_ratio,is_latest
   "warmup_days": 30,
   "indicators": [],
   "indicator_params": {},
-  "logic": {},
+  "logic": {"entry": [], "risk": []},
   "params": {},
   "captured_at": "2026-11-11T08:38:10Z"
 }
@@ -174,7 +174,7 @@ sharpe_ratio,is_latest
 | `version` | 当前取日期 |
 | `timeframe` / `leverage` / `warmup_days` | 来自快照配置 |
 | `indicators` / `indicator_params` | 从配置 params 推导 |
-| `logic` | 当前为空对象，需策略 spec 映射 |
+| `logic` | `entry` 开仓条件；`risk` 风控条件（含原平仓/止损/仓位管理原文）。不再单独输出 `exit` |
 | `params` | 策略参数 |
 | `captured_at` | 生成时间，ISO8601 UTC |
 
@@ -335,6 +335,6 @@ metrics, performance_summary, signals_processed, start_time, status, trades_coun
 ## 7. 已知限制
 
 1. `backtest_positions/signals` 与 `signal_comparison` 当前包含 warmup 区间（`start_date` 早于 `data_day`），如只需当日数据需按 `data_day` 过滤。
-2. `meta.json` 的 `indicators` / `logic` / `params` 依赖策略配置或 spec 映射，未配置时为空。
+2. `meta.json` 的 `indicators` / `logic` / `params` 依赖策略 spec；`logic` 仅含 `entry`（开仓）与 `risk`（风控，平仓内容已并入），未配置时为空。
 3. `display_name` 未传 `--display-names` 时等于 `strategy`。
 4. `backtest_results` 直接透传引擎结果，不同引擎（Rust/Python）键可能略有差异。

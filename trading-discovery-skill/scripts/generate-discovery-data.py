@@ -218,8 +218,11 @@ def scan_runs(discovery_outputs: Path, engine_override: Optional[str] = None) ->
         config = read_config(symbol_dir / "config.yaml")
         meta = project_meta(symbol_dir)
         if meta:
-            for key in ("strategy", "timeframe", "leverage", "warmup_days"):
-                if config.get(key) in (None, "") and meta.get(key) is not None:
+            for key in ("strategy", "timeframe", "leverage", "warmup_days",
+                        "description", "indicators", "indicator_params", "logic"):
+                current = config.get(key)
+                if (current in (None, "") or current == [] or current == {}) \
+                        and meta.get(key) not in (None, "", [], {}):
                     config[key] = meta[key]
         strategy = str(config.get("strategy") or strategy_dir)
 
@@ -346,9 +349,9 @@ def strategy_config(run: Run) -> Dict[str, Any]:
         "timeframe": str(cfg.get("timeframe") or ""),
         "leverage": to_float(cfg.get("leverage"), 1.0),
         "warmup_days": to_float(cfg.get("warmup_days"), None),
-        "indicators": [],
-        "indicator_params": {},
-        "logic": {},
+        "indicators": cfg.get("indicators") or [],
+        "indicator_params": cfg.get("indicator_params") or {},
+        "logic": cfg.get("logic") or {},
         "params": params,
     }
 

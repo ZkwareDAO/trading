@@ -94,13 +94,139 @@ def read_strategy_config(proj_dir, strategy_name) -> dict:
     return {}
 
 
-def write_project_meta(out_dir, strategy, engine, config) -> None:
-    """落盘 engine/timeframe/leverage，供 frontend 转换器读取。"""
+def read_strategy_spec(proj_dir, strategy_name) -> dict:
+    """读取策略仓的 strategy-spec（Rust: docs/strategy/specs；Python: strategies/<name>/.strategy-spec.yaml）。"""
+    root = Path(proj_dir)
+    candidates = [
+        root / "docs" / "strategy" / "specs" / f"{strategy_name}.strategy-spec.yaml",
+        root / "strategies" / strategy_name / ".strategy-spec.yaml",
+        root / ".strategy-spec.yaml",
+    ]
+    specs_dir = root / "docs" / "strategy" / "specs"
+    if specs_dir.is_dir():
+        candidates += sorted(specs_dir.glob("*.strategy-spec.yaml"))
+    for path in candidates:
+        if not path.is_file():
+            continue
+        try:
+            data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(data, dict) and (
+                data.get("strategy_name") == strategy_name
+                or path.name.startswith(strategy_name)):
+            return data
+    return {}
+
+
+# 指标名白名单：只识别 spec 文本/参数键中明确出现的名称
+_INDICATOR_ALIASES = [
+    ("ADX", "ADX"), ("EMA", "EMA"), ("ATR", "ATR"), ("RSI", "RSI"),
+    ("MACD", "MACD"), ("OBV", "OBV"), ("VWAP", "VWAP"), ("SAR", "SAR"),
+    ("SUPERTREND", "Supertrend"), ("DONCHIAN", "Donchian"),
+    ("BOLLINGER", "Bollinger"), ("KDJ", "KDJ"), ("CCI", "CCI"),
+]
+
+
+def _extract_indicators(spec) -> list:
+    """从 spec 已写的条件/说明/参数键中提取指标名，不补未写的指标。"""
+    entry = spec.get("entry") or {}
+    exit_cfg = spec.get("exit") or {}
+    texts = []
+    if entry.get("description"):
+        texts.append(str(entry["description"]))
+    texts += [str(v) for v in (entry.get("conditions") or [])]
+    texts += [str(exit_cfg[k]) for k in
+              ("stop_loss", "trailing_stop", "signal_reversal", "note") if exit_cfg.get(k)]
+    blob = " ".join(texts).upper()
+    keys = " ".join(str(k).upper() for k in (spec.get("default_params") or {}))
+    found = []
+    for alias, canonical in _INDICATOR_ALIASES:
+        if (alias in blob or alias in keys) and canonical not in found:
+            found.append(canonical)
+    return found
+
+
+def _extract_indicator_params(spec, indicators) -> dict:
+    """只取 spec 显式给出的参数值，缺失的键不补默认值。"""
+    dp = spec.get("default_params") or {}
+    out = {}
+
+    def put(name, pairs):
+        if name not in indicators:
+            return
+        values = {k: v for k, v in pairs if v is not None}
+        if values:
+            out[name] = values
+
+    put("ADX", [("period", dp.get("adx_period"))])
+    put("EMA", [("fast_period", dp.get("ema_fast")),
+                ("slow_period", dp.get("ema_slow"))])
+    put("ATR", [("period", dp.get("atr_period"))])
+    put("Donchian", [("period", dp.get("wave_breakout") or dp.get("donchian_period"))])
+    put("SAR", [("acceleration", dp.get("sar_acceleration")),
+                ("maximum", dp.get("sar_maximum"))])
+    put("Supertrend", [("period", dp.get("st_period")),
+                       ("factor", dp.get("st_factor"))])
+    put("RSI", [("period", dp.get("rsi_period"))])
+    return out
+
+
+def spec_meta(spec) -> dict:
+    """strategy-spec -> frontend meta；只做提取/原样转化，不自由发挥。"""
+    if not isinstance(spec, dict) or not spec:
+        return {}
+    entry = spec.get("entry") or {}
+    exit_cfg = spec.get("exit") or {}
+
+    entry_list = list(entry.get("conditions") or [])
+    if not entry_list and entry.get("description"):
+        entry_list = [str(entry["description"])]
+
+    exit_list = [str(exit_cfg[k]) for k in
+                 ("stop_loss", "trailing_stop", "signal_reversal") if exit_cfg.get(k)]
+    if exit_cfg.get("note"):
+        exit_list.append(str(exit_cfg["note"]))
+
+    # 风控：只取 spec 显式写出的 risk / position_sizing / stop_reason 原文
+    risk = []
+    explicit_risk = spec.get("risk")
+    if isinstance(explicit_risk, list):
+        risk += [str(v) for v in explicit_risk if v]
+    elif isinstance(explicit_risk, dict):
+        for value in explicit_risk.values():
+            if isinstance(value, list):
+                risk += [str(v) for v in value if v]
+            elif value:
+                risk.append(str(value))
+    risk += [str(v) for v in (spec.get("position_sizing") or {}).values() if v]
+    stop_reason = exit_cfg.get("stop_reason") or {}
+    if isinstance(stop_reason, dict):
+        risk += [str(v) for v in stop_reason.values() if v]
+    risk = list(dict.fromkeys(risk))
+
+    # 前端只展示「开仓条件 / 风控条件」：把平仓相关原文合并进 risk
+    risk = list(dict.fromkeys(exit_list + risk))
+
+    indicators = _extract_indicators(spec)
+    params = _extract_indicator_params(spec, indicators)
+
+    return {
+        "description": str(entry.get("description") or ""),
+        "indicators": indicators,
+        "indicator_params": params,
+        "logic": {"entry": entry_list, "risk": risk},
+    }
+
+
+def write_project_meta(out_dir, strategy, engine, config, spec=None) -> None:
+    """落盘 engine/timeframe/leverage + 策略逻辑，供 frontend 转换器读取。"""
     meta = {"strategy": strategy, "engine": engine}
     if isinstance(config, dict):
         for key in ("timeframe", "leverage", "warmup_days"):
             if config.get(key) is not None:
                 meta[key] = config[key]
+    meta.update(spec_meta(spec or {}))
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     (Path(out_dir) / ".meta.json").write_text(
         json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -587,7 +713,8 @@ def main():
             out_dir = output_root / name
             out_dir.mkdir(parents=True, exist_ok=True)
             write_project_meta(out_dir, strategy_name, "rust",
-                               read_strategy_config(proj_dir, strategy_name))
+                               read_strategy_config(proj_dir, strategy_name),
+                               spec=read_strategy_spec(proj_dir, strategy_name))
 
             if run_backtest_rust(proj_dir, start, end, symbols, out_dir, cash,
                                  commission, data_dir=data_dir_abs,
@@ -631,7 +758,8 @@ def main():
         # 步骤 2: 每策略一份 output_dir = discovery_outputs/{策略目录}/
         out_dir = output_root / name
         out_dir.mkdir(parents=True, exist_ok=True)
-        write_project_meta(out_dir, strategies_arg, "python", {})
+        write_project_meta(out_dir, strategies_arg, "python", {},
+                           spec=read_strategy_spec(proj_dir, str(strategies_arg)))
 
         # 写入该策略的 run-profile（output_dir/data_dir/cash/commission/并发）
         # wrapper 用 --profile <name> 读取 config/<name>.yaml；data_dir 必须与
