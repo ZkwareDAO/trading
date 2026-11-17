@@ -1,6 +1,6 @@
 ---
 name: trading-dev
-description: CTA 策略开发全生命周期 skill。支持交互/全自动/单步三种模式。一句话输入策略逻辑 → 自动脚手架 → 策略编码 → 回测验证 → benchmark 输出。loop-engineering 跨 Phase 大闭环。
+description: CTA 策略开发全生命周期 skill（Python/Rust；crypto/期货，期货仅 Rust）。支持交互/全自动/单步三种模式。一句话输入策略逻辑 → 自动脚手架 → 策略编码 → 回测验证 → benchmark 输出。loop-engineering 跨 Phase 大闭环。期货策略不提供下载，K 线路径必须由用户提供。
 origin: trading
 ---
 
@@ -12,12 +12,36 @@ origin: trading
 
 **核心行为：loop-engineering**。Phase 2（策略开发）和 Phase 3（回测验证）形成跨 Phase 大闭环——回测不达标时自动回到 Phase 2 修改策略逻辑，再跑 Phase 3，循环直到达标或达到最大轮次。
 
+## 语言与市场分流（先定，再进 Phase）
+
+两个正交维度，必须在 Phase 0 之前确定；后续所有命令、目录、配置都按这两个取值分叉。
+
+| 维度 | 取值 | 环境变量 | 决定 |
+|------|------|----------|------|
+| 语言 | `python`（默认）/ `rust` | `STRATEGY_LANG` | 模板仓库、脚手架结构、代码文件、回测命令 |
+| 市场 | `crypto`（默认）/ `futures` | `STRATEGY_MARKET` | K 线获取方式、配置体系、合约口径、验收口径 |
+
+| 组合 | 模板 | 关键差异 |
+|------|------|----------|
+| python + crypto | `ZkwareDAO/strategy-template` | venv + `strategies/{name}/overrides/{SYMBOL}.yaml` |
+| python + futures | 不支持 | Python 模板没有 `contracts.yaml`/整数手/交易时段能力；期货只能用 Rust |
+| rust + crypto | `ZkwareDAO/strategy-template-rs` | workspace crates + `config/<group>/strategy.yaml` + `download` |
+| rust + futures | 同上 | 不下载数据；`roll_build` 或用户 1m CSV；`contracts.yaml` 必配 |
+
+**硬规则**：
+- 用户明确说"期货"时，`STRATEGY_LANG=rust`、`STRATEGY_MARKET=futures`；**绝不执行任何下载命令**，必须先拿到用户提供的 K 线路径（见 Phase 0 Step 0C）。
+- 用户说期货但要求 Python 时：说明当前 Python 模板不支持期货撮合/合约口径，
+  要么切 Rust，要么明确降级为"crypto 兼容模式"（结果不可信，不进入验收）。
+- 市场未明确时按 crypto 处理，但要在执行确认里写明假设；用户后续可改。
+- Rust 模式的权威参考是模板仓库的 `docs/strategy/` 与 `crates/strategies/src/`，本 skill 的命令与字段必须与其保持一致。
+
 ## When to Activate
 
 - 用户执行 `/trading-dev`（无参数）-> **进入交互式引导**
 - 用户执行 `/trading-dev new` — 创建新 CTA 策略项目（交互模式）
 - 用户执行 `/trading-dev new --from <source>` — 从指定来源自动开发策略（全自动模式）
 - 用户说"新建策略项目"、"创建交易项目"、"开发新策略"
+- 用户说"开发期货策略"（自动进入 rust + futures 分支，先索要 K 线路径）
 - 用户执行 `/trading-dev scaffold` — 只创建脚手架
 - 用户执行 `/trading-dev develop` — 只生成策略代码
 - 用户执行 `/trading-dev backtest` — 只跑回测
@@ -116,7 +140,29 @@ Step 3: 汇总确认 -> 用户确认后进 Phase 0
 **若用户选了 2/3/4 之一**：按 `--from <source>` 全自动模式执行。
 **若用户选 1 或直接描述**：按自然语言提取执行。**若回车**：进交互模式多轮收集（Phase 0 Step 1）。
 
-**单步子命令（develop/backtest/benchmark）时**：列出当前目录下候选项目（含 `strategy_core/` 的目录）供选择；无候选则提示先跑 `new`。
+**单步子命令（develop/backtest/benchmark）时**：列出当前目录下候选项目（含 `strategy_core/` 或 `crates/strategies/` 的目录）供选择；无候选则提示先跑 `new`。
+
+### Step 2.5 话术模板：语言与市场
+
+```
+🧭 交互式引导 - 第 2.5 步：开发语言与市场
+
+  1. Python + crypto（默认） ← 适合快速验证，直接用 Binance 公共数据
+  2. Rust + crypto           ← 模板 workspace，回测性能好
+  3. Rust + futures          ← 国内期货；需你提供 K 线路径，不自动下载
+
+请选择（默认：1）
+（Python + 期货当前模板不支持；需要期货请选 3）
+```
+
+**期货选择后必须追问（阻塞项，拿不到就不进 Phase 1）**：
+
+```
+期货回测需要你提供 1m K 线，二选一：
+  A. 逐合约原始 CSV 目录（文件名如 CU2612.csv；列 symbol,bob|open_time,open,high,low,close,volume,position）
+  B. 已生成的 1m CSV 绝对路径（标准 10 列，timestamp 含 UTC 偏移）
+交易所（SHFE/DCE/CZCE/INE）、品种代码（如 CU）、初始权益（元，够开 ≥1 手）？
+```
 
 ### Step 3 话术模板：汇总确认
 
@@ -125,7 +171,11 @@ Step 3: 汇总确认 -> 用户确认后进 Phase 0
 
   操作:     new（全流程）
   模式:     交互 / 全自动
+  语言:     python / rust
+  市场:     crypto / futures
   策略来源: <描述或 --from 来源>
+  数据位置: crypto 默认下载 / futures <用户提供路径>
+  （仅期货）交易所/品种/初始权益: SHFE / CU / 1000000
 
 确认执行？
   > y / 回车   ← 进 Phase 0
@@ -151,7 +201,9 @@ Step 3: 汇总确认 -> 用户确认后进 Phase 0
 | 环境变量 | 展示后用户可修改 | 全部使用默认值 | 展示后用户可修改 |
 | 进入下一 Phase | 用户确认后 | 自动进入 | 用户确认后 |
 
-### Step 0: 环境预检（自动检测，自动修复）
+### Step 0: 环境预检（按语言/市场分叉）
+
+#### 0A Python 模式（`STRATEGY_LANG=python`）
 
 ```bash
 # 1. Python 版本（需要 3.10+）
@@ -176,43 +228,99 @@ TALIB_FOUND=$(ldconfig -p 2>/dev/null | grep -c libta_lib || echo "0")
 # 3. pip 可用
 PIP_AVAILABLE=$(command -v pip &>/dev/null && echo "1" || echo "0")
 
-# 4. K 线数据（路径约定：{csv_dir}/{interval}/{SYMBOL}_{interval}.csv）
-KLINE_SRC="${KLINE_DATA_DIR:-${DATA_PATH:-./data}/klines}"
-KLINE_READY="0"
-if [ -d "$KLINE_SRC/1m" ] && [ -f "$KLINE_SRC/1m/BTCUSDT_1m.csv" ]; then
-    KLINE_READY="1"
-fi
-
-# 5. 磁盘空间（需要 ≥ 2G）
+# 4. 磁盘空间（需要 ≥ 2G）
 DISK_AVAIL=$(df -h . 2>/dev/null | awk 'NR==2{print $4}')
 DISK_GB=$(df -BG . 2>/dev/null | awk 'NR==2{print int($4)}')
 DISK_OK="0"
 [ "${DISK_GB:-0}" -ge 2 ] && DISK_OK="1"
 ```
 
+#### 0B Rust 模式（`STRATEGY_LANG=rust`）
+
+**Phase 0 只做主机级预检**：项目目录此时还不存在，workspace 与 `config/contracts.yaml`
+只能在 Phase 1 复制模板后检查（见 Phase 1 Step 2）。
+
+```bash
+# 1. Rust 工具链：模板 rust-toolchain.toml 钉死版本，rustup 会在项目目录自动切换
+cargo --version
+rustc --version
+rustup show active-toolchain 2>/dev/null || true
+
+# 2. 磁盘空间（需要 ≥ 2G，target/ 编译产物较大）
+DISK_GB=$(df -BG . 2>/dev/null | awk 'NR==2{print int($4)}')
+[ "${DISK_GB:-0}" -ge 2 ] && DISK_OK="1" || DISK_OK="0"
+```
+
+> Rust 版本以模板 `rust-toolchain.toml` 为准（当前 1.98.1），不要用浮动 stable 覆盖，
+> 否则 `cargo fmt --check` / clippy 会因版本漂移产生无因 diff。
+
+#### 0C K 线数据预检（按市场分叉）
+
+**crypto**（可自动下载，Phase 0 不做项目内检查）：
+
+项目内的 `data/klines/` 目录在 Phase 1 Step 1 复制模板后才存在，Phase 0 只记录计划、
+不检查文件（非阻塞）。数据准备与落位统一在 Phase 1 Step 3 执行：
+
+| 语言 | Phase 1 Step 3 落位路径 |
+|------|------------------------|
+| Python | `{project_path}/data/klines/{interval}/{SYMBOL}_{interval}.csv` |
+| Rust | `{project_path}/data/klines/1m/{exchange}/{market}/{SYMBOL}_1m.csv` |
+
+**futures**（仅 Rust 模式；禁止下载，阻塞项）：
+
+```bash
+# 期望落位：data/klines/1m/<EXCHANGE>/cn_futures/<SYMBOL>_1m.csv
+# 或用户数据根目录，回测时用 --data-dir 指向
+FUT_KLINE="${FUTURES_KLINES_DIR:-}"
+FUT_EXCHANGE="${FUTURES_EXCHANGE:-SHFE}"
+FUT_SYMBOL="${FUTURES_SYMBOL:-CU}"
+if [ -n "$FUT_KLINE" ] && [ -e "$FUT_KLINE" ]; then
+    echo "✅ 用户已提供期货 K 线: $FUT_KLINE"
+else
+    echo "❌ 期货 K 线未提供：不进入 Phase 1/3"
+fi
+```
+
+**期货数据缺失时的标准处理**：
+
+1. 若用户给逐合约 CSV 目录（文件名 `{PRODUCT}{YYMM}.csv`，列
+   `symbol,bob|open_time,open,high,low,close,volume,position`），执行：
+
+   ```bash
+   cargo run -p strategy-data --bin roll_build -- \
+     --in <用户目录> --product <PRODUCT> --out <临时输出目录>
+   cp <临时输出目录>/1m/<PRODUCT>_CONT_1m.csv \
+      data/klines/1m/<EXCHANGE>/cn_futures/<PRODUCT>_1m.csv
+   ```
+
+   `roll_build` 按持仓量选主、只在下一交易日生效（因果口径），不做复权。
+2. 若用户给已生成的 1m CSV，确认是标准 10 列（`timestamp` 带 UTC 偏移）后放到
+   上述路径，或回测时 `--data-dir <用户数据根>`。
+3. 两者都没有：**停止，不得回测**。禁止用 mock、合成、其他品种或其他区间数据顶替；
+   禁止把"没跑"写成"跑通"。
+
 **预检结果映射**：
 
-| 检测项 | ✅ 条件 | ❌ 时的提示 |
-|--------|---------|------------|
-| Python 3.10+ | `PYTHON_CMD` 非空 | Ubuntu: `sudo apt install python3.12 python3.12-venv` / macOS: `brew install python@3.12` |
-| ta-lib C 库 | `TALIB_FOUND ≥ 1` | `wget ...ta-lib... && ./configure && make && sudo make install && ldconfig` |
-| pip 可用 | `PIP_AVAILABLE = 1` | `python3 -m ensurepip` |
-| K 线数据 | `KLINE_READY = 1` | 运行 `python scripts/download_data.py --symbol BTCUSDT,ETHUSDT,SOLUSDT --interval 1m --days 600`（脚手架创建后） |
-| 磁盘空间 ≥ 2G | `DISK_OK = 1` | 清理空间或更换 `DATA_PATH` |
+| 检测项 | 阶段 | ✅ 条件 | ❌ 时的提示 |
+|--------|------|---------|------------|
+| Python 3.10+（仅 Python） | Phase 0 | `PYTHON_CMD` 非空 | Ubuntu: `sudo apt install python3.12 python3.12-venv` / macOS: `brew install python@3.12` |
+| pip（仅 Python） | Phase 0 | `PIP_AVAILABLE = 1` | `python3 -m ensurepip` |
+| ta-lib C 库（仅 Python） | Phase 0 | `TALIB_FOUND ≥ 1` | `wget ...ta-lib... && ./configure && make && sudo make install && ldconfig` |
+| Rust 工具链（仅 Rust） | Phase 0 | `cargo --version` 成功 | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh` |
+| 磁盘空间 ≥ 2G | Phase 0 | `DISK_OK = 1` | 清理空间或更换数据目录 |
+| futures K 线（用户路径） | Phase 0 | 用户路径非空且存在 | **阻塞**：按上面二选一索要，拿不到就停 |
+| workspace 可解析（仅 Rust） | Phase 1 Step 2 | `cargo metadata` 成功 | 检查 `rust-toolchain.toml`、网络与 `Cargo.lock` |
+| `config/contracts.yaml`（仅期货） | Phase 1 Step 2 | 文件存在且 symbol 已声明 | **阻塞**：先补合约参数，否则会静默退化成 crypto 兼容模式 |
+| crypto K 线 | Phase 1 Step 3 | symlink 或下载完成 | 自动准备（非阻塞） |
 
-**阻塞 vs 非阻塞**：
+**阻塞项处理**：
+- **Phase 0（主机级）**：Python/pip（Python 模式）、Rust 工具链（Rust 模式）、
+  期货用户 K 线路径不达标 → 报错退出，不进入 Phase 1。
+- **Phase 1 Step 2（项目级）**：workspace 不可解析、期货 `contracts.yaml` 缺失或未声明
+  symbol → 报错退出，不进入 Phase 2。
 
-| 检测项 | 不达标时 | 原因 |
-|--------|----------|------|
-| Python 3.10+ | **阻塞** — 无法创建 venv 和运行回测 | 核心依赖 |
-| ta-lib C 库 | **非阻塞** — 降级安装；模板参考实现为纯 pandas，无 talib 依赖 | 可后续安装 |
-| pip 可用 | **阻塞** — 无法安装依赖 | 核心依赖 |
-| K 线数据 | **非阻塞** — Phase 1 自动 symlink/下载 | 可自动修复 |
-| 磁盘空间 | **非阻塞** — 警告，可能回测输出空间不足 | 可后续清理 |
-
-**阻塞项处理**：Python/pip 不可用 → 报错退出，提示安装命令。这是唯一需要用户干预的情况。
-
-**非阻塞项处理**：ta-lib 缺失 → 降级安装核心依赖；K 线数据缺失 → Phase 1 自动下载；磁盘不足 → 警告继续。
+**非阻塞项处理**：ta-lib 缺失 → 降级安装核心依赖；crypto K 线缺失 → Phase 1 Step 3
+自动下载；磁盘不足 → 警告继续。
 
 ### Step 1: 策略信息获取
 
@@ -242,6 +350,21 @@ overrides/<SYMBOL>.yaml → symbols(取文件名全集), params, direction
 *_core.py → State fields, entry/exit logic (从 analyze() 代码逆向)
 ```
 
+**Rust 策略目录**读取位置：
+
+```python
+files_to_read = [
+    f"{strategy_dir}/crates/strategies/src/*.rs",   # strategy_type/timeframes/入场出场逻辑
+    f"{strategy_dir}/config/*/strategy.yaml",       # universe/timeframes/params/risk/sizing
+    f"{strategy_dir}/config/contracts.yaml",        # 期货合约参数（market=futures 判据）
+    f"{strategy_dir}/docs/strategy/specs/*.strategy-spec.yaml",
+]
+# 提取映射
+# strategy_type() / register_strategy! name → strategy_name
+# universe.exchange / contracts.yaml → market（binance/bybit=crypto；SHFE/DCE/CZCE/INE=futures）
+# timeframes[0] → 主周期；params → default_params；entry/exit/stop → spec 条件
+```
+
 **c. URL** → WebFetch → 解析 → 项目路径: `{cwd}/{strategy_name}`
 
 **d. 自然语言** → 从描述提取策略规格 → 项目路径: `{cwd}/{strategy_name}`
@@ -250,14 +373,19 @@ overrides/<SYMBOL>.yaml → symbols(取文件名全集), params, direction
 
 ```
 1. 项目路径？（默认: ./{strategy_name}）
-2. 策略名称？（如 ema_rsi_pullback，将作为 strategies/{name}/ 目录名）
-3. 策略前缀？（如 EMA_RSI，用于 {prefix}_core.py 命名）
-4. 交易方向？（long / short / neutral）
-5. 主时间框架？（如 4h）
-6. 交易标的？（如 BTCUSDT）
-7. 入场条件描述？（自然语言）
-8. 出场条件描述？（止损/止盈/移动止盈）
+2. 开发语言？（python / rust）
+3. 市场？（crypto / futures）
+4. 策略名称？（如 ema_rsi_pullback；Rust 时同时是 crates/strategies/src/{name}.rs 与注册名）
+5. 策略前缀？（如 EMA_RSI；Rust 可留空）
+6. 交易方向？（long / short / neutral）
+7. 主时间框架？（如 4h；期货常用 15m / 1h）
+8. 交易标的与交易所？（crypto: BTCUSDT/binance；futures: CU/SHFE）
+9. 期货专属：1m K 线路径（逐合约目录或已生成的 CSV）、初始权益（元）
+10. 入场条件描述？（自然语言）
+11. 出场条件描述？（止损/止盈/移动止盈；不许静默发明止损）
 ```
+
+> 期货未拿到 K 线路径时，只收集信息、不生成脚手架、不进入 Phase 1。
 
 > **项目路径规则**：默认 `{cwd}/{strategy_name}`。如果目录已存在，追加 `_v2`、`_v3` 等后缀避免覆盖。
 
@@ -267,11 +395,20 @@ overrides/<SYMBOL>.yaml → symbols(取文件名全集), params, direction
 
 ```yaml
 strategy_name: ema_rsi_pullback
+rust_module: ema_rsi_pullback   # Rust: crates/strategies/src/{rust_module}.rs；Python 可省略
 prefix: EMA_RSI
+market: crypto                 # crypto / futures；缺省按 exchange 推断
 direction: neutral
-timeframes: [4h, 1h]          # [0] 必须是触发主周期
+timeframes: [4h, 1h]          # [0] 必须是触发主周期（Rust 不写 1m，框架强制含 M1）
 extra_timeframes: [1d]        # 可选：除主周期外订阅的其他周期
 symbols: [BTCUSDT, ETHUSDT, SOLUSDT]
+data_source:                   # 期货必填；crypto 可写默认路径/下载命令
+  dir: data/klines             # 或 files: [/abs/path/CU_1m.csv]
+  note: "期货目标路径 data/klines/1m/SHFE/cn_futures/CU_1m.csv"
+backtest:                      # 回测区间；期货必须给 initial_cash
+  start: "20260601"
+  end: "20260709"
+  initial_cash: 1000000
 
 entry:
   description: "EMA 交叉 + RSI 回踩确认"
@@ -280,7 +417,7 @@ entry:
     - "RSI 回踩至 40-60 区间后反弹"
 
 exit:
-  stop_loss: "2 倍 ATR"        # 硬止损规则；不做空字符串
+  stop_loss: "2 倍 ATR"        # 硬止损规则；不做空字符串；未指定止损先问用户
   trailing_stop: ""            # 没有就留空字符串
   signal_reversal: ""
   note: "回落止盈/固定止盈由 overrides 的 risk 段统一风控兜底，策略内不实现"
@@ -295,22 +432,28 @@ state_fields:                  # 策略特有状态字段（BaseState 已有字�
     default: false
     persist: true
 
-default_params:                # Core.__init__ 从 params 读取的参数及默认值
+default_params:                # Core.__init__ / Params::default() 读取的参数及默认值
   ema_fast_period: 20
   ema_slow_period: 60
 ```
 
-> **参考范例**：模板自带两个参考实现的 spec——
-> `strategies/example_ma_cross/.strategy-spec.yaml`（单周期）、
-> `strategies/example_mtf_trend/.strategy-spec.yaml`（多周期）。
+> **参考范例**：
+> - Rust：`docs/strategy/specs/*.strategy-spec.yaml`（含 `futures_single_trend`、
+>   `futures_xsec_trend` 期货样例）；schema 见 `docs/strategy/STRATEGY_SPEC.md`。
+> - Python：`strategies/example_ma_cross/.strategy-spec.yaml`（单周期）、
+>   `strategies/example_mtf_trend/.strategy-spec.yaml`（多周期）。
+>
+> **期货硬约束**：`data_source` 必须来自用户；`default_params` 不得出现乘数/保证金率/
+> 手续费/交易时段（这些属于 `config/contracts.yaml`）；`backtest.initial_cash` 必填。
 
 ### Step 3: 执行确认（按模式）
 
-**全自动模式**：自动保存 `.strategy-spec.yaml`，直接进入 Phase 1。
+**全自动模式**：按下方语言分叉路径自动保存 `.strategy-spec.yaml`，直接进入 Phase 1。
 
 ```
 📋 策略: ema_rsi_pullback | EMA_RSI | neutral | [4h,1h] | [BTCUSDT,ETHUSDT,SOLUSDT]
-🔧 环境: Python 3.12 ✅ | ta-lib ⚠(不阻塞) | K线数据 ✅ | 磁盘 15G ✅
+📋 语言/市场: {python|rust} / {crypto|futures}
+🔧 环境: 工具链 ✅ | 数据 ✅(crypto 自动下载 / futures 用户路径) | 磁盘 15G ✅
 🚀 自动执行 loop-engineering 模式...
 ```
 
@@ -318,14 +461,18 @@ default_params:                # Core.__init__ 从 params 读取的参数及默�
 
 ```
 📋 环境预检:
-  Python 3.12: ✅
+  语言: Rust (cargo 1.x / rust-toolchain.toml) 或 Python 3.12
+  市场: crypto / futures
+  Python 3.12: ✅（仅 Python）
   ta-lib C 库: ⚠ 未装（参考实现为纯 pandas，不阻塞；需要 talib 指标时再装）
-  pip: ✅
-  K 线数据: ✅ (symlink → /path/to/data/klines/)
+  Rust 工具链: ✅（cargo/rustc；workspace 与 contracts.yaml 在 Phase 1 校验）
+  K 线数据: ✅ (crypto Phase 1 自动下载) / ✅ (futures 用户路径: <path>)
+  contracts.yaml: Phase 1 模板复制后校验（仅期货）
   磁盘空间: ✅ (15G 可用)
 
 📋 策略解析结果:
   名称: ema_rsi_pullback
+  语言/市场: rust / futures
   前缀: EMA_RSI
   方向: neutral
   时间框架: [4h, 1h]
@@ -344,7 +491,15 @@ default_params:                # Core.__init__ 从 params 读取的参数及默�
   安装: sudo apt install python3.12 python3.12-venv
 ```
 
-用户确认后，保存 `.strategy-spec.yaml` 到 `strategies/{strategy_name}/`，进入 Phase 1。
+用户确认后，保存 `.strategy-spec.yaml` 到项目内的最终路径（按语言分叉）：
+
+| 语言 | 落盘路径 |
+|------|----------|
+| Python | `{project_path}/strategies/{strategy_name}/.strategy-spec.yaml` |
+| Rust | `{project_path}/docs/strategy/specs/{strategy_name}.strategy-spec.yaml` |
+
+项目目录此时可能尚不存在：先 `mkdir -p` 目标目录再写文件；Phase 1 Step 1 用
+`tar` 镜像复制（排除 `.git`），合并写入不会删除已落盘的 spec。保存后进入 Phase 1。
 
 ---
 
@@ -355,8 +510,8 @@ default_params:                # Core.__init__ 从 params 读取的参数及默�
 | 步骤 | 交互模式 | 全自动模式 | 半交互模式 |
 |------|----------|-----------|-----------|
 | 复制模板 | 执行后展示文件列表 | 静默执行 | 执行后展示文件列表 |
-| Python 环境 | 展示安装结果 | 静默执行，失败时自动降级 | 展示安装结果 |
-| K 线数据 | 展示准备方式（symlink/下载/跳过） | 自动选择最佳方式 | 展示准备方式 |
+| Python 环境 / Rust 工具链 | 展示安装或自检结果 | 静默执行，失败时降级/报错 | 展示结果 |
+| K 线数据 | 展示准备方式（crypto symlink/下载；futures 用户路径） | crypto 自动下载；futures 只用用户路径 | 展示准备方式 |
 | Git init | 展示首次 commit | 静默执行 | 静默执行 |
 | 就绪报告 | 展示完整报告 | 展示单行摘要 | 展示完整报告 |
 
@@ -375,22 +530,33 @@ default_params:                # Core.__init__ 从 params 读取的参数及默�
 STRATEGY_LANG="${STRATEGY_LANG:-python}"
 if [ "$STRATEGY_LANG" = "rust" ]; then
     TEMPLATE_REPO="https://github.com/ZkwareDAO/strategy-template-rs.git"
+    # Rust 默认跟 main：strategy.yaml / 期货模板尚未打进 v1.0.0 tag
+    TEMPLATE_TAG="${STRATEGY_TEMPLATE_TAG:-}"
 else
     TEMPLATE_REPO="https://github.com/ZkwareDAO/strategy-template.git"
+    TEMPLATE_TAG="${STRATEGY_TEMPLATE_TAG:-v1.0.0}"
 fi
-TEMPLATE_TAG="${STRATEGY_TEMPLATE_TAG:-v1.0.0}"  # 默认 v1.0.0；可覆盖为其他 tag
-TEMPLATE_DIR=$(mktemp -d)
+TEMPLATE_TMP=""
+CLONE_FAILED="0"
 
-if [ -n "$TEMPLATE_TAG" ]; then
-    git clone --depth 1 --branch "$TEMPLATE_TAG" "$TEMPLATE_REPO" "$TEMPLATE_DIR"
-else
-    git clone --depth 1 "$TEMPLATE_REPO" "$TEMPLATE_DIR"
-fi
-
-# 克隆失败时回退到本地缓存（如有）
-if [ $? -ne 0 ] && [ -n "$TRADING_DEV_TEMPLATE_DIR" ] && [ -d "$TRADING_DEV_TEMPLATE_DIR" ]; then
-    echo "⚠ GitHub 克隆失败，使用本地缓存: $TRADING_DEV_TEMPLATE_DIR"
+# 本机已有最新模板（如 /home/qpw/workspace/strategy-template-rs）时优先用本地，
+# 避免 GitHub tag 落后于当前开发线
+if [ -n "${TRADING_DEV_TEMPLATE_DIR:-}" ] && [ -d "${TRADING_DEV_TEMPLATE_DIR:-}" ]; then
     TEMPLATE_DIR="$TRADING_DEV_TEMPLATE_DIR"
+else
+    TEMPLATE_TMP=$(mktemp -d)
+    TEMPLATE_DIR="$TEMPLATE_TMP"
+    if [ -n "$TEMPLATE_TAG" ]; then
+        git clone --depth 1 --branch "$TEMPLATE_TAG" "$TEMPLATE_REPO" "$TEMPLATE_DIR" || CLONE_FAILED="1"
+    else
+        git clone --depth 1 "$TEMPLATE_REPO" "$TEMPLATE_DIR" || CLONE_FAILED="1"
+    fi
+fi
+
+if [ "$CLONE_FAILED" = "1" ]; then
+    rm -rf "$TEMPLATE_TMP"
+    echo "❌ 模板克隆失败：检查网络，或设置 TRADING_DEV_TEMPLATE_DIR 指向本地模板"
+    exit 1
 fi
 ```
 
@@ -412,35 +578,84 @@ fi
 | `start.sh` / `stop.sh` | 启停脚本 |
 | `CLAUDE.md` / `README.md` / `ARCHITECTURE.md` | 项目文档 |
 
-**不复制**（模板中已排除，此处列出原因）：
+**Rust 模式复制列表（全量镜像 workspace）**：
+
+| 源路径 | 说明 |
+|--------|------|
+| `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml` / `rustfmt.toml` | workspace 定义、依赖锁、钉死工具链 |
+| `crates/core/` | Candle/Timeframe、Signal/订单状态机、Strategy trait、风控 |
+| `crates/engine/` | 回测/live 共用引擎、策略端口 `CrossSectionalStrategyPort`、配置校验 |
+| `crates/strategies/` | 策略插件 + `build.rs` 自动发现 + 6 个参考实现；新策略只加 `.rs` |
+| `crates/data/` | CSV 存储、1m 聚合、`roll_build`（期货主力连续）、归档下载 |
+| `crates/signals/` / `crates/positions/` / `crates/store/` | 信号状态机、仓位账本、统一 Store |
+| `crates/broker/` / `crates/indicators/` | trading-service 客户端/回测撮合、指标库 |
+| `crates/app/` | CLI（`backtest` / `run` / `download` / `inspect`）与报告输出 |
+| `config/` | `contracts.yaml` + 各 `config/<group>/strategy.yaml` + `_global.yaml` 样例 |
+| `scripts/` | `run_backtest_matrix.sh`（批量矩阵）、`collect_reports.py`、`prepare_ctp_1m.py` |
+| `docs/` | `docs/strategy/` 规范集 + `docs/design-package/` 架构 + `RUNBOOK.md` |
+| `contracts/` | trading-service 消息契约 |
+| `.gitignore` / `README.md` / `CHANGELOG.md` | 排除规则 / 项目说明 |
+
+**不复制**（模板中已排除，或复制时显式排除，此处列出原因）：
 
 | 排除项 | 原因 |
 |--------|------|
-| `.env` | 含真实凭证，只保留 `.env.example` |
-| `strategies/` 下真实策略目录 | 业务逻辑与真实资金参数不进模板 |
-| `data/ logs/ backtest_output*/` | 运行时生成 |
+| `.git/` | 模板仓库历史与 origin 会污染新项目；新项目由 Step 4 重新 `git init` |
+| `.env` | 含真实凭证/HMAC 密钥，只保留本地副本或由用户创建 |
+| `target/`、`backtest_output/`、`data/state*`、`logs/` | 编译/运行产物 |
+| `data/klines/` 下的真实行情 | 体积大且按市场授权，不随模板分发 |
+| `strategy.config.yaml` | 本地联调配置（含密钥） |
+
+> Rust 模板的 `config/_global.yaml` 在 `.gitignore` 中（含 HMAC 密钥），
+> 脚手架必须从 `config/_global.example.yaml` 复制生成，并提醒用户填写
+> `services.trading`；缺失会在 `run` 时 fail-fast（`backtest` 不依赖它）。
 
 **复制命令**：
 
 ```bash
 TEMPLATE_DIR="{克隆的模板目录}"
 PROJECT_DIR="{project_path}"
+mkdir -p "$PROJECT_DIR"
 
-# 整体镜像复制（模板已是干净的开源子集，无需再挑拣）
-cp -r $TEMPLATE_DIR/. $PROJECT_DIR/
+# 整体镜像复制，排除模板自身的 .git：新项目不继承模板 history/origin，
+# 首个 commit 由 Step 4 的 git init 产生
+tar --exclude=.git -C "$TEMPLATE_DIR" -cf - . | tar -C "$PROJECT_DIR" -xf - \
+    || { echo "❌ 模板复制失败"; exit 1; }
 
-# 创建本地 .env（从模板）
-cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env
+if [ "$STRATEGY_LANG" = "rust" ]; then
+    # Rust 模板的 _global.yaml/.env 不入库，需从 example 生成本地副本
+    [ -f "$PROJECT_DIR/config/_global.example.yaml" ] && \
+        cp "$PROJECT_DIR/config/_global.example.yaml" "$PROJECT_DIR/config/_global.yaml"
+    # .env 由用户按需创建（STRATEGY_SECRET / 代理等），不要写入密钥
+    echo "⚠ 请自行创建 .env 并填写 STRATEGY_SECRET / HTTP(S)_PROXY（勿入库）"
+else
+    # Python 模板保留 .env.example → .env
+    cp $PROJECT_DIR/.env.example $PROJECT_DIR/.env
+fi
 
-# 清理临时克隆目录
-rm -rf "$TEMPLATE_DIR"
+# spec 已在 Phase 0 落盘；镜像复制只写入模板文件，不删除它，这里只校验路径正确
+if [ "$STRATEGY_LANG" = "rust" ]; then
+    SPEC_FILE="$PROJECT_DIR/docs/strategy/specs/{strategy_name}.strategy-spec.yaml"
+else
+    SPEC_FILE="$PROJECT_DIR/strategies/{strategy_name}/.strategy-spec.yaml"
+fi
+test -f "$SPEC_FILE" || { echo "❌ spec 缺失或路径错误: $SPEC_FILE"; exit 1; }
+
+# 只清理本次自行克隆的临时目录；本地模板（TRADING_DEV_TEMPLATE_DIR）绝不删除
+if [ -n "$TEMPLATE_TMP" ]; then
+    rm -rf "$TEMPLATE_TMP"
+fi
 ```
 
 > **与旧版差异**：v3.7 模板即完整可运行项目（单体模式，直连 Binance 公共行情），
 > 无需再从 `.example` 生成运行时配置——`config/` 三层全部入库，
 > 新策略登记进 `config/strategies.yaml` 即可。
+> **Rust 版差异**：`config/_global.yaml` 与 `.env` 是 gitignore 的本地文件，
+> 必须显式生成；`strategy.yaml` 才是入库的策略级配置。
 
-### Step 2: 初始化 Python 环境
+### Step 2: 初始化开发环境（按语言分叉）
+
+#### Python 模式（`STRATEGY_LANG=python`）
 
 **按 Phase 0 预检结果执行**。预检已确认 Python 版本和 ta-lib 状态，此处直接执行安装。
 
@@ -467,7 +682,36 @@ fi
 
 > **ta-lib 处理逻辑**：Phase 0 预检已检测 C 库状态。C 库未安装时，pip install ta-lib 会失败，此处自动跳过并降级。模板参考实现（example_ma_cross / example_mtf_trend）是纯 pandas，不影响跑通链路。
 
-### Step 3: 准备回测 K 线数据
+#### Rust 模式（`STRATEGY_LANG=rust`）
+
+无 venv、无 pip；依赖由 cargo 解析，工具链由 `rust-toolchain.toml` 钉死。
+
+```bash
+cd {project_path}
+
+# 1. 工具链与依赖就绪（首次较慢）
+rustup show active-toolchain
+
+# 2. workspace 可解析（Phase 0 无法检查：项目当时还不存在；失败即阻塞）
+cargo metadata --no-deps --format-version 1 >/dev/null
+cargo fetch
+
+# 3. 基线自检：必须全绿，失败不进入 Phase 2
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace
+
+# 4. 期货额外确认：合约参数已声明
+#    config/contracts.yaml 必须包含目标 symbol（CU/AU/AG/RB/RU/I 等）
+grep -q "^\s*${FUTURES_SYMBOL}:" config/contracts.yaml && echo "✅ contracts OK"
+```
+
+> Rust 模式不安装 Python 依赖，也不跑 ta-lib 检测；若 `cargo test --workspace`
+> 失败，先修模板基线，不要带着红灯写新策略。
+
+### Step 3: 准备回测 K 线数据（按市场分叉）
+
+#### Python + crypto
 
 **数据路径约定**（回测/实盘/下载脚本三方一致，见 `backtest/run_backtest.py` 的 `_kline_csv_path`）：
 
@@ -525,14 +769,72 @@ else
 fi
 ```
 
+#### Rust + crypto
+
+Rust 的加载器只认 `{data_dir}/1m/{exchange}/{market}/{SYMBOL}_1m.csv`，
+crypto 的 exchange=`binance`、market=`crypto_perpetual`：
+
+```bash
+cd {project_path}
+DATA_DIR="${DATA_PATH:-./data/klines}"
+
+mkdir -p "$DATA_DIR/1m/binance/crypto_perpetual"
+# 已有共享数据 → symlink（零拷贝）；路径必须是 1m/<exchange>/<market>/<SYM>_1m.csv
+if [ -f "${KLINE_DATA_DIR:-}/1m/binance/crypto_perpetual/BTCUSDT_1m.csv" ]; then
+    ln -sf "$KLINE_DATA_DIR"/1m/binance/crypto_perpetual/*.csv \
+           "$DATA_DIR/1m/binance/crypto_perpetual/" 2>/dev/null
+else
+    # 无共享数据 → 下载（Binance 公共归档/fapi，无需 API key）
+    cargo run -p strategy-app -- download \
+        --symbol BTCUSDT --symbol ETHUSDT --symbol SOLUSDT \
+        --interval 1m --days 365 --data-dir "$DATA_DIR"
+fi
+```
+
+> 手工放置的 CSV 需标准 10 列
+> `timestamp,open,high,low,close,volume,quote_volume,trade_num,active_buy_volume,active_buy_quote_volume`
+> （旧 6 列兼容，扩展列缺省 0）；`timestamp` 必须带 UTC 偏移。
+
+#### 期货（仅 Rust 模式，禁止下载）
+
+模板**不附带期货行情**，也没有自动下载命令。必须由用户二选一提供：
+
+```bash
+# A. 逐合约原始 CSV 目录 → 生成主力连续 1m
+cargo run -p strategy-data --bin roll_build -- \
+    --in <用户目录> --product <PRODUCT> --out <临时输出目录>
+# 输出 {out}/1m/{PRODUCT}_CONT_1m.csv 与 {out}/roll_events.csv
+cp <临时输出目录>/1m/<PRODUCT>_CONT_1m.csv \
+   data/klines/1m/<EXCHANGE>/cn_futures/<PRODUCT>_1m.csv
+
+# B. 用户已生成的 1m CSV → 直接落位（或回测时 --data-dir 指向其根目录）
+mkdir -p data/klines/1m/<EXCHANGE>/cn_futures
+cp <用户CSV路径> data/klines/1m/<EXCHANGE>/cn_futures/<SYMBOL>_1m.csv
+```
+
+**硬规则**：
+- 期货 symbol 必须已在仓库根 `config/contracts.yaml` 声明；未声明会静默退化为
+  crypto 兼容模式（小数数量 + `fee_rate`），结果不可信。
+- 回测区间必须落在用户数据覆盖范围内；不足时先向用户要更长数据，不得用其他
+  品种/区间顶替。
+- `_global.yaml` 必须显式 `initial_cash`（元），且按 universe 等分后仍够开 ≥1 手。
+- 禁止 mock/合成/占位文件回测；没数据就停在 Phase 1，并把缺口写进交付说明。
+
 **验证数据就绪**：
 
 ```bash
-if [ -f "$DATA_DIR/1m/BTCUSDT_1m.csv" ]; then
-    lines=$(wc -l < "$DATA_DIR/1m/BTCUSDT_1m.csv")
-    echo "✅ 1m kline 数据就绪: BTCUSDT ${lines} 行"
+if [ "$STRATEGY_MARKET" = "futures" ]; then
+    FUT_FILE="data/klines/1m/${FUTURES_EXCHANGE:-SHFE}/cn_futures/${FUTURES_SYMBOL:-CU}_1m.csv"
+    [ -f "$FUT_FILE" ] && echo "✅ 期货 1m 数据就绪: $FUT_FILE ($(wc -l < "$FUT_FILE") 行)" \
+                      || echo "❌ 期货 1m 数据缺失，禁止回测: $FUT_FILE"
+elif [ "$STRATEGY_LANG" = "rust" ]; then
+    RUST_FILE="${DATA_PATH:-./data/klines}/1m/binance/crypto_perpetual/BTCUSDT_1m.csv"
+    [ -f "$RUST_FILE" ] && echo "✅ 1m kline 数据就绪: $RUST_FILE ($(wc -l < "$RUST_FILE") 行)" \
+                       || echo "⚠ 1m kline 数据未就绪，回测将报「区间无 1m 数据」"
 else
-    echo "⚠ 1m kline 数据未就绪，回测将失败"
+    PY_FILE="${DATA_PATH:-./data/klines}/1m/BTCUSDT_1m.csv"
+    [ -f "$PY_FILE" ] && echo "✅ 1m kline 数据就绪: BTCUSDT $(wc -l < "$PY_FILE") 行" \
+                      || echo "⚠ 1m kline 数据未就绪，回测将失败"
 fi
 ```
 
@@ -541,7 +843,7 @@ fi
 ```bash
 cd {project_path}
 git init
-# .gitignore 已从模板复制（含 data/、.env 排除规则）
+# 模板 .git 已在 Step 1 排除，此处生成全新仓库；.gitignore 来自模板（含 data/、.env 排除规则）
 git add .
 git commit -m "init: scaffold from strategy-template"
 ```
@@ -554,9 +856,10 @@ git commit -m "init: scaffold from strategy-template"
 ✅ 项目脚手架创建完成
 
 项目路径: {project_path}
-Python 环境: .venv (Python 3.x)
-依赖安装: ✅ / ⚠️ (ta-lib 需手动安装)
-kline 数据: ✅ (symlink) / ✅ (下载) / ⚠️ (需手动准备)
+语言/市场: {STRATEGY_LANG} / {STRATEGY_MARKET}
+Python 环境: .venv (Python 3.x) / Rust: cargo + rust-toolchain.toml
+依赖安装: ✅ / ⚠️ (ta-lib 需手动安装；Rust 基线 cargo test 结果)
+kline 数据: ✅ (crypto symlink/下载) / ✅ (futures 用户路径) / ⚠️ (需用户补数据)
 
 项目结构:
   {strategy_name}/
@@ -604,6 +907,40 @@ kline 数据: ✅ (symlink) / ✅ (下载) / ⚠️ (需手动准备)
   └── CLAUDE.md / README.md / ARCHITECTURE.md
 ```
 
+**Rust 模式项目结构（就绪报告用）**：
+
+```
+{strategy_name}/
+├── Cargo.toml / Cargo.lock / rust-toolchain.toml
+├── crates/
+│   ├── core/ engine/ signals/ positions/ store/ data/
+│   ├── broker/ indicators/ app/
+│   └── strategies/
+│       ├── build.rs                    # 自动发现 src/*.rs，无需手改
+│       ├── src/
+│       │   ├── registry.rs             # 冻结：register_strategy! 宏
+│       │   ├── example_dual_ma.rs      # crypto 单标参考
+│       │   ├── xsec_template.rs        # 横截面模板
+│       │   ├── futures_single_trend.rs # 期货 1:1 参考
+│       │   ├── futures_xsec_trend.rs   # 期货 1:N 参考
+│       │   └── {strategy_name}.rs      # ⬅ Phase 2 生成
+│       └── tests/
+├── config/
+│   ├── contracts.yaml                  # 期货乘数/保证金/费率/时段（唯一来源）
+│   ├── _global.yaml                    # 本地生成（gitignore），运行模式/权益/services
+│   └── {strategy_name}/
+│       ├── strategy.yaml               # ⬅ Phase 2 生成（策略级配置）
+│       └── _global.yaml                # 可选：本组权益/初始资金
+├── docs/strategy/
+│   ├── AI_WORKFLOW.md / AI_CONSTRAINTS.md / CONFIG_REFERENCE.md
+│   ├── CRYPTO_VS_FUTURES.md / REVIEW_CHECKLIST.md
+│   └── specs/{strategy_name}.strategy-spec.yaml
+├── scripts/run_backtest_matrix.sh
+├── data/klines/1m/<exchange>/<market>/<SYMBOL>_1m.csv
+├── backtest_output/                    # 运行产物
+└── README.md / CHANGELOG.md
+```
+
 ---
 
 ## Phase 2: 策略开发
@@ -621,7 +958,8 @@ kline 数据: ✅ (symlink) / ✅ (下载) / ⚠️ (需手动准备)
 | 审查检查表 | 展示审查结果 | 静默审查，不通过自动修复 | 展示审查结果 |
 | README 重写/同步 | 展示更新内容 | 静默执行 | 展示更新内容 |
 
-**单步模式**：`/trading-dev develop` 只执行 Phase 2（需要已有脚手架和 `.strategy-spec.yaml`）。
+**单步模式**：`/trading-dev develop` 只执行 Phase 2（需要已有脚手架和 `.strategy-spec.yaml`：
+Python `strategies/{name}/.strategy-spec.yaml`；Rust `docs/strategy/specs/{name}.strategy-spec.yaml`）。
 
 ### Step 0: 加载规范文档 + 参考实现（强制）
 
@@ -642,17 +980,47 @@ strategies/example_ma_cross/          # ⬅ 单周期参考实现（必读，QUI
   ├── overrides/BTCUSDT.yaml          # per-symbol 配置逐字段注释
   └── tests/                          # 测试写法
 
-# Rust 模式参考实现
-crates/strategies/src/example_dual_ma.rs   # ⬅ 单周期参考实现（Rust 版）
-crates/strategies/src/example_mtf_trend.rs  # ⬅ 多周期参考实现（Rust 版）
-config/example_dual_ma/example.yaml         # per-strategy 配置示例
+# Rust 模式规范文档（模板 docs/strategy/）
+docs/strategy/AI_WORKFLOW.md         # 从用户逻辑到可回测策略的流程 + 开工信息清单
+docs/strategy/AI_CONSTRAINTS.md      # 23 条禁止 + 12 条必须（含期货红线）
+docs/strategy/CONFIG_REFERENCE.md    # strategy.yaml/_global.yaml/contracts.yaml 字段
+docs/strategy/CRYPTO_VS_FUTURES.md   # crypto/期货五层差异
+docs/strategy/DEVELOPMENT_GUIDE.md   # StrategyBase / 策略端口 / 仓位模型
+docs/strategy/XSEC_GUIDE.md          # 横截面（1 策略 → 1 总仓 → N 子仓）
+docs/strategy/POSITION_MODEL.md      # 仓位与容量口径
+docs/strategy/REVIEW_CHECKLIST.md    # 提交前检查单
+docs/strategy/STRATEGY_SPEC.md       # spec 字段 schema
+docs/strategy/specs/*.strategy-spec.yaml  # 6 个模板 spec（含期货）
+
+# Rust 模式参考实现（按市场/形态选一个复制）
+crates/strategies/src/example_dual_ma.rs      # crypto 单标（直接 port，最小）
+crates/strategies/src/example_mtf_trend.rs    # crypto 多周期
+crates/strategies/src/xsec_template.rs        # crypto 横截面模板
+crates/strategies/src/xsec_momentum.rs        # crypto 横截面示例
+crates/strategies/src/futures_single_trend.rs # 期货 1:1（整数手 + 时段）
+crates/strategies/src/futures_xsec_trend.rs   # 期货 1:N（乘数 + top_k）
+config/example_dual_ma/strategy.yaml          # crypto 单标配置样例
+config/example_dual_ma_cu/strategy.yaml       # 同一代码跑 CU 期货
+config/ctp_single_cu/strategy.yaml            # 期货单标（组内 _global 配 initial_cash）
+config/ctp_multi_xsec/strategy.yaml           # 期货多标（merge_positions + rebalance）
+```
+
+**Rust 选型决策树**（照 `docs/strategy/AI_WORKFLOW.md` §3）：
+
+```text
+单标 N=1：crypto → example_dual_ma；futures → futures_single_trend
+多标 N>1：crypto → xsec_momentum；futures → futures_xsec_trend
+只写五个钩子 → 用 StrategyBase（common/mod.rs），实现 name/top_k/score/entry_allowed/stop
 ```
 
 **多周期策略额外必读**：
 - Python：`strategies/example_mtf_trend/`（1d 定方向 + 4h 触发 + 1h 确认）
-- Rust：`crates/strategies/src/example_mtf_trend.rs`（演示多周期 `get_closed_data()` 标准写法）
+- Rust：`crates/strategies/src/example_mtf_trend.rs`（演示多周期 `series.closed(tf)` 只读已闭合序列的标准写法）
 
 ### Step 1: 生成策略代码
+
+**Python 模式**按 `docs/strategy/QUICKSTART.md` 规范生成 1.1–1.6 文件；
+**Rust 模式**跳到 §1.7，生成策略 `.rs` + `strategy.yaml` + spec，不生成 Python 文件。
 
 按 QUICKSTART.md 规范生成以下文件：
 
@@ -834,7 +1202,143 @@ strategies/{strategy_name}/
 
 - `tests/test_{prefix}_core.py` — 核心逻辑测试（照参考实现 `strategies/example_ma_cross/tests/` 的写法）
 
+#### 1.7 Rust 模式：生成策略文件（替代 1.1–1.6）
+
+Rust 模式只生成 3 类文件，**不改** `build.rs` / `registry.rs` / `lib.rs`（接线区冻结）：
+
+| 文件 | 内容 |
+|------|------|
+| `crates/strategies/src/{strategy_name}.rs` | `Params` + 策略实现 + `register_strategy!` + `#[cfg(test)]` |
+| `config/{group}/strategy.yaml` | 策略级配置（`strategy_type` 对齐注册名） |
+| `docs/strategy/specs/{strategy_name}.strategy-spec.yaml` | Phase 0 产出的 spec 落盘 |
+
+按市场/形态从决策树复制模板后，只改：类型名、`Params`、打分/入场/止损逻辑、
+`register_strategy!` 的 name。最小骨架（单标示例，N>1 在
+`on_cross_section_bars` 里遍历快照即可，同一份代码不分叉）：
+
+```rust
+//! {strategy_name} — {一句话策略逻辑}
+//! 入场：{user entry}；出场：{user exit}；止损：{user stop}
+use serde::Deserialize;
+use strategy_core::candle::Timeframe;
+use strategy_core::signal::Side;
+use strategy_engine::bridge::CandleSeries;
+use strategy_engine::core::bar::Timeframe as EngineTimeframe;
+use strategy_engine::strategy::port::{
+    CrossSectionalStrategyPort, InstrumentAction, InstrumentSnapshot, PortfolioContext,
+};
+
+/// 私有参数；deny_unknown_fields 让配置写错字段名在启动时即报错
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Params {
+    pub fast_period: usize,
+    pub slow_period: usize,
+    pub stop_loss_pct: f64,
+}
+
+impl Default for Params {
+    fn default() -> Self {
+        Self { fast_period: 20, slow_period: 60, stop_loss_pct: 2.0 }
+    }
+}
+
+pub struct MyStrategy {
+    params: Params,
+    main_tf: Timeframe,
+}
+
+impl CrossSectionalStrategyPort for MyStrategy {
+    fn strategy_type(&self) -> &str { "{strategy_name}" }
+
+    // M1 必须保留：引擎据此聚合；其余是用户周期
+    fn timeframes(&self) -> Vec<EngineTimeframe> {
+        vec![EngineTimeframe::M1, EngineTimeframe::from(self.main_tf)]
+    }
+
+    fn on_cross_section_bars(
+        &mut self,
+        _newly_closed: &[EngineTimeframe],
+        snapshots: &[InstrumentSnapshot],
+        _portfolio: &PortfolioContext,
+    ) -> Vec<InstrumentAction> {
+        let mut out = Vec::new();
+        for s in snapshots {
+            // 数据过期只跳过本标的；有仓时的出场不能被 entry_eligible 门控
+            if s.stale {
+                continue;
+            }
+            let Some(series) = s.closed.as_ref() else { continue };
+            // 只读已闭合：series.closed(tf) → Option<&[Candle]>，长度不足直接 return
+            let Some(candles) = series.closed(self.main_tf) else { continue };
+            if candles.len() < self.params.slow_period + 1 {
+                continue;
+            }
+
+            // ① 有仓（s.position 为 Some）：
+            //    先判 pos.stop_price 硬止损，再判用户反向出场；命中则 push
+            //    InstrumentAction::Close { is_stop_loss: true/false, ... }，然后 continue。
+            // ② 空仓：先看 s.entry_eligible，再判用户入场条件；满足才 push
+            //    InstrumentAction::Open { side, price, stop_price, ... }。
+            //    止损价示例：price ∓ price * stop_loss_pct / 100；Open 必须带 stop_price。
+        }
+        out
+    }
+}
+
+// 文件尾唯一必须的接线；name 必须 == strategy_type() == 配置文件 strategy_type
+crate::register_strategy! {
+    name: "{strategy_name}",
+    factory: |args| {
+        let main_tf = Timeframe::parse(args.timeframe)?;
+        let params: Params = crate::registry::params_or_default(args.params)?;
+        Ok(Box::new(MyStrategy { params, main_tf }))
+    }
+}
+```
+
+**Rust 策略文件必须包含**：
+
+- `Params` 的 `deny_unknown_fields + Default`，且默认值与 `strategy.yaml` 的 `params` 一致。
+- `timeframes()` 含 `EngineTimeframe::M1`（配置里不写 1m）。
+- `Open` 必须带 `stop_price`；没有止损时先问用户或显式写明假设，不得静默发明。
+- 期货：目标数量从 `portfolio.multipliers` 取乘数，不写死；不要自己算手数/保证金/手续费/时段。
+- `#[cfg(test)]`：至少入场（多/空）+ 出场；期货补 `multiplier != 1`、整数手取整、
+  时段聚合用例。测试用 `CandleSeries::from_closed` 喂合成已闭合 K 线。
+
+**配置样例（期货单标；crypto 把 universe 换成 `{BTCUSDT, binance}`、去掉 initial_cash）**：
+
+```yaml
+# config/{group}/strategy.yaml
+strategy_type: {strategy_name}
+strategy_id: {strategy_name}:{symbol_lower}
+universe:
+  - { symbol: {SYMBOL}, exchange: {EXCHANGE} }
+timeframes: [{base_tf}, {higher_tf}]
+indicators: {}
+entry:  { default: [] }
+exit:   { default: [] }
+portfolio_exit: { stop_loss_pct: 8 }
+risk:   { max_total_notional: 1.0 }
+sizing: { per_position_pct: 1.0 }
+params: { ...与 Params::default() 一致... }
+```
+
+```yaml
+# config/{group}/_global.yaml（期货必须有 initial_cash；crypto 可省）
+mode: paper_trading
+warmup_days: 60
+initial_cash: 1000000   # 元；按 universe 等分后仍需够开 ≥1 手
+services:
+  trading: { exchange: {EXCHANGE}, account: demo }
+```
+
+> `strategy.yaml` **没有** `deny_unknown_fields`，字段名拼错会被 serde 静默忽略；
+> 写完必须用回测实际验证字段生效。`_global.yaml` 与旧 per-symbol 则严格校验。
+
 ### Step 2: 验证配置
+
+**Python 模式**：
 
 ```bash
 python3 -c "
@@ -866,9 +1370,49 @@ source .venv/bin/activate
 python3 -m pytest strategies/{strategy_name}/tests/ -v
 ```
 
+**Rust 模式验证**：
+
+```bash
+cd {project_path}
+
+# 1. 命名一致性：strategy_type() == register name == 文件名 == 配置 strategy_type
+grep -n 'fn strategy_type' -A 1 crates/strategies/src/{strategy_name}.rs
+grep -n 'register_strategy!' -A 2 crates/strategies/src/{strategy_name}.rs
+grep -n '^strategy_type:' config/{group}/strategy.yaml
+
+# 2. 格式/静态检查/测试（必须全绿）
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
+cargo test --workspace
+
+# 3. 配置能被加载（跑一次短区间回测；数据未就绪时至少确认配置解析不报错）
+cargo run -p strategy-app -- backtest \
+  --config config/{group}/strategy.yaml --start {start} --end {end}
+```
+
+**期货额外校验**：
+
+```bash
+# symbol 已在 contracts.yaml 声明（否则会静默退化为 crypto 兼容模式）
+grep -n "^\s*${FUTURES_SYMBOL}:" config/contracts.yaml
+
+# _global.yaml 有 initial_cash，且不存在策略 params 里写费率/乘数的情况
+grep -n 'initial_cash' config/{group}/_global.yaml
+grep -inE 'multiplier|margin_rate|commission|session_open' crates/strategies/src/{strategy_name}.rs \
+  config/{group}/strategy.yaml
+```
+
 ### Step 3: 运行审查检查表
 
 按 `docs/strategy/REVIEW_CHECKLIST.md` 逐项检查，输出结果。
+
+**Rust 模式必查**（对照 `docs/strategy/AI_CONSTRAINTS.md` 23 禁 + 12 必）：
+- 无 `now()`/系统时间；无策略内 IO；只读 `snapshot.closed`；`closed(tf)` 长度门控。
+- 未改 `build.rs`/`registry.rs`/`lib.rs`；`Params` 严格反序列化；`M1` 在 `timeframes()`。
+- 主路径无 `unwrap()/expect()`；未自持仓位状态；指标全量重算。
+- 等权目标乘 `portfolio.max_total_notional`；组合平仓用 `CloseMaster`。
+- 期货：symbol 已在 `contracts.yaml`；`initial_cash` 够开 1 手；未假设 7x24；
+  未自行模拟平今/平昨；`params` 无乘数/保证金/费率/时段；K 线位置已由用户确认。
 
 ### Step 4: 重写/同步 README.md（强制，Phase 3 前置条件）
 
@@ -915,7 +1459,7 @@ fi
 
 - 入场：{spec.entry.description}
 - 出场：{spec.exit 摘要}
-- 参数：per-symbol 配置（实盘回测共用）
+- 参数：Python per-symbol overrides（实盘回测共用）/ Rust `config/<group>/strategy.yaml` 的 `params`
 
 ## 快速开始
 
@@ -926,14 +1470,17 @@ python -m backtest.run_backtest --strategies {strategy_name}:{SYMBOL} --start 20
 
 ### Rust 模式
 ```bash
-cargo run --release -- backtest -- backtest --config config/{strategy_name}/example.yaml --symbol {SYMBOL} --start 20260601 --end 20260709
+cargo run -p strategy-app -- backtest \
+  --config config/{group}/strategy.yaml \
+  --start 20260601 --end 20260709
+# 期货需先按用户数据落位 1m CSV；可加 --data-dir / --output-dir / --initial-cash
 ```
 
 ## 项目结构
 
 （模板结构保留，strategies/ 段把 {strategy_name} 列为主策略，
   Python 参考实现：example_ma_cross / example_mtf_trend
-  Rust 参考实现：example_dual_ma / example_mtf_trend（位于 crates/strategies/src/）
+  Rust 参考实现：example_dual_ma / xsec_template / futures_single_trend（位于 crates/strategies/src/）
 
 ## 配置体系 / 文档导航 / 免责声明
 
@@ -942,7 +1489,7 @@ cargo run --release -- backtest -- backtest --config config/{strategy_name}/exam
 
 **重写规则**：
 - 主角换成开发策略；参考实现降级为"框架参考实现"一节，不占快速开始
-- 策略参数不复制进 README——参数细节留在配置文件（Python: `strategies/{name}/overrides/<SYMBOL>.yaml` / Rust: `config/{name}/example.yaml`）的注释里
+- 策略参数不复制进 README——参数细节留在配置文件（Python: `strategies/{name}/overrides/<SYMBOL>.yaml` / Rust: `config/{group}/strategy.yaml`）的注释里
 - 框架通用段落（配置体系、免责声明、文档导航、测试命令）保留不动
 - 根据 `STRATEGY_LANG` 只保留对应语言的快速开始命令：
   - `python` → 只保留 `### Python 模式` 段
@@ -952,7 +1499,7 @@ cargo run --release -- backtest -- backtest --config config/{strategy_name}/exam
 
 | 位置 | 更新内容 |
 |------|----------|
-| `## 项目结构` 的 `strategies/` 段 | 追加新策略目录（与参考实现同级的注释格式） |
+| `## 项目结构` 的策略段 | Python: `strategies/` 追加目录；Rust: `crates/strategies/src/` 追加文件行 |
 | `## 参考策略` 表格 | 追加一行：策略名 / 一句话说明 / 基类架构 / 时间周期 / 多标的 |
 | `## 快速开始` 的示例命令 | 若新策略更适合作演示，可替换现有示例 |
 
@@ -977,8 +1524,9 @@ fi
 
 # 验证 2：README 不包含模板残留（仅场景 A）
 if [ "$SCENE" = "A" ]; then
-    if grep -q "example_ma_cross" README.md && ! grep -q "框架参考实现" README.md; then
-        echo "❌ README 仍为模板视角：example_ma_cross 未标注为参考实现"
+    if [ "$STRATEGY_LANG" = "rust" ]; then REF_NAME="example_dual_ma"; else REF_NAME="example_ma_cross"; fi
+    if grep -q "$REF_NAME" README.md && ! grep -q "框架参考实现" README.md; then
+        echo "❌ README 仍为模板视角：$REF_NAME 未标注为参考实现"
         # 不进入 Phase 3
     fi
 fi
@@ -1011,17 +1559,24 @@ fi
 
 **单步模式**：
 - `/trading-dev scaffold` — 执行 Phase 1 Step 1-5（脚手架创建），前置：无
-- `/trading-dev develop` — 执行 Phase 2（策略代码生成），前置：已有脚手架 + `.strategy-spec.yaml`
+- `/trading-dev develop` — 执行 Phase 2（策略代码生成），前置：已有脚手架 +
+  `.strategy-spec.yaml`（Python `strategies/{name}/`；Rust `docs/strategy/specs/`）
 - `/trading-dev backtest` — 执行 Phase 3 Step 1-4（回测 + 验证），前置：已有策略代码 + K 线数据
 - `/trading-dev benchmark` — 只输出 benchmark 报告（Phase 3 Step 5），前置：已有回测结果
 
 ### 回测验收标准
 
-| 周期 | 时间范围 | 验收标准 |
+| 周期 | 时间范围（crypto 默认） | 验收标准 |
 |------|----------|----------|
-| 短期 | 20260601-20260709 | 至少一个代币费后收益 ≥ 20% |
-| 中期 | 20260101-20260709 | 至少一个代币费后收益 ≥ 20% |
-| 长期 | 20250101-20260709 | 至少一个代币费后收益 ≥ 20% |
+| 短期 | 20260601-20260709 | 至少一个标的费后收益 ≥ 20% |
+| 中期 | 20260101-20260709 | 至少一个标的费后收益 ≥ 20% |
+| 长期 | 20250101-20260709 | 至少一个标的费后收益 ≥ 20% |
+
+**期货的区间与标的**：
+- 标的来自 `config/<group>/strategy.yaml` 的 `universe`（不是 crypto 固定三币）。
+- 三个窗口必须落在用户提供的 1m 数据覆盖范围内；覆盖不足时改用可用区间的
+  短/中/长三段（或等分三段），并在 benchmark 中写明"区间按数据可用性调整"。
+- 不得用其他品种/区间顶替，也不得因数据不足跳过回测后仍宣称达标。
 
 **回测命令根据 `STRATEGY_LANG` 选择**：
 
@@ -1057,36 +1612,67 @@ python -m backtest.run_backtest \
 
 #### Rust 模式回测
 
-Rust 版回测通过 `cargo run --release -- backtest` 调用，当前无内置批量脚本。
-**注意**：Rust 版使用 per-strategy 配置（`config/{name}/example.yaml`），
-与 Python 的 per-symbol overrides 不同，回测时需指定 `--config`。
+统一入口是 `strategy-app` 的 `backtest` 子命令；策略/标的/仓位/风险都在
+`config/<group>/strategy.yaml` 里，`--strategy/--symbol/--cash` 不会覆盖它们。
 
 ```bash
-# Step 1-3: 短期/中期/长期回测（循环执行）
-for symbol in BTCUSDT ETHUSDT SOLUSDT; do
-    cargo run --release -- backtest \
-        --config config/{strategy_name}/example.yaml \
-        --symbol $symbol \
-        --start 20260601 --end 20260709
-done
+# Step 1-3: 短期/中期/长期回测（只换 --start/--end）
+cargo run -p strategy-app -- backtest \
+    --config config/{group}/strategy.yaml \
+    --start 20260601 --end 20260709 \
+    --data-dir ./data/klines --output-dir ./backtest_output
 
-# Step 4: 单标的复核
-cargo run --release -- backtest \
-    --config config/{strategy_name}/example.yaml \
-    --symbol BTCUSDT \
+# Step 4: 单区间复核（更长窗口）
+cargo run -p strategy-app -- backtest \
+    --config config/{group}/strategy.yaml \
     --start 20250101 --end 20260710
 ```
 
-> **Rust 回测输出**：`backtest_output/{run_id}/`，含 `result.json`（指标）、
-> `result.txt`（文本报告）、`*.png`（图表）、`state/{day}/`（每日快照）。
-> 验收时从 `result.json` 提取 metrics（字段名可能与 Python 版不同）。
+**批量矩阵**（多个配置/品种，期货与 crypto 可同批混跑）：
 
-**产物路径**：`{output_dir}/{strategy}/{date}/{time}/{symbol}/`，
-指标在 `backtest_result.json` 的 `metrics` 段（不在顶层）。
+```bash
+scripts/run_backtest_matrix.sh \
+    --start 20260101 --end 20260630 \
+    --data-dir ./data/klines --out ./reports \
+    config/{group}/strategy.yaml
+```
+
+> `strategy.yaml` 的标的由 `universe` 决定，`--symbol/--strategy/--cash` 不覆盖；
+> `--symbols` 只对旧 per-symbol `<SYMBOL>.yaml` 目录有效。
+
+**期货专用参数**：
+- `--initial-cash` 可覆盖配置里的初始权益；期货建议显式给（元），并确认够开 ≥1 手。
+- 配置目录模式（`--config <set_dir>`）仅 `run` 支持；`backtest` 逐组传
+  `<group>/strategy.yaml`。
+- 跨换月回测要注意：主力连续**不复权**，换月处价格断档是数据事实；
+  benchmark 里必须注明回测是否跨换月、回测窗口末尾是否有未平仓单
+  （`accounts[].position_count`）。
+
+> **Rust 回测输出**：`{output_dir}/{strategy_type}/{YYYYMMDD}/{HHMMSS}/{strategy_id 的 ':' 替换为 '_'}/`
+> - `backtest_result.json`：指标在 `metrics` 段（不在顶层）
+> - `backtest_report.txt`：人类可读摘要
+> - `backtest_analysis_report.md`：分析报告（注意"最大回撤（滚动峰谷）"与
+>   "权益振幅（全局峰谷差）"是两个口径，验收用最大回撤）
+> - `charts/*.png`：净值/回撤/分时净值
+> - `config.yaml`：本次实际生效配置快照（复现用）
+>
+> `metrics` 字段名（验收/诊断统一用这些）：
+> `total_return`、`roe`、`annualized_return`、`sharpe_ratio`、`sortino_ratio`、
+> `max_drawdown`、`win_rate`、`profit_factor`、`total_trades`、`winning_trades`、
+> `losing_trades`、`avg_trade_pnl`、`largest_win`、`largest_loss`、`avg_win`、
+> `avg_loss`、`trading_days`、`daily_return_mean`、`daily_return_std`。
+> 期货年化按 `365/交易日数` 计算，跨市场比较需自行换算。
 
 ### Step 5: 输出 benchmark.md
 
-综合三个代币的回测结果，生成 benchmark 报告。
+综合本次所有标的的回测结果（crypto 默认三币；期货取配置 `universe`），生成 benchmark 报告。
+Python 读 `backtest_result.json` 的 `metrics`；Rust 读
+`{output_dir}/{strategy_type}/{YYYYMMDD}/{HHMMSS}/{strategy_id 的 ':'→'_'}/backtest_result.json` 的 `metrics`。
+
+**期货额外写入 benchmark**：
+- 交易所/品种/`initial_cash`/数据路径来源（用户提供，非下载）
+- 数据覆盖区间与实际回测区间（若与默认窗口不同必须注明）
+- 是否跨换月、是否含未平仓单、手续费口径（`contracts.yaml` 中 rate/per_lot）
 
 **输出路径**：环境变量 `BENCHMARK_OUTPUT_PATH`，默认 `./benchmark_output`。
 
@@ -1108,11 +1694,11 @@ mkdir -p "$(dirname "$BENCHMARK_FILE")"
 ## 回测参数
 - 策略: {strategy_name}
 - 时间范围: 20250101 - 20260709
-- 代币: BTCUSDT, ETHUSDT, SOLUSDT
+- 标的: BTCUSDT, ETHUSDT, SOLUSDT（期货取 universe，如 CU/RB/I）
 
 ## 短期回测 (20260601-20260709)
 
-| 代币 | 费后收益 | 最大回撤 | 交易次数 | 胜率 |
+| 标的 | 费后收益 | 最大回撤 | 交易次数 | 胜率 |
 |------|---------|---------|---------|------|
 | BTCUSDT | ... | ... | ... | ... |
 | ETHUSDT | ... | ... | ... | ... |
@@ -1156,7 +1742,13 @@ Phase 2 和 Phase 3 形成跨 Phase 大闭环。回测不达标时，自动回�
 
 #### Step 1: 解析回测输出，提取诊断数据
 
-从 `{output_dir}/{strategy_name}/{date}/{time}/{symbol}/backtest_result.json` 提取：
+**产物路径按语言分叉**：
+- Python：`{output_dir}/{strategy_name}/{date}/{time}/{symbol}/backtest_result.json`
+- Rust：`{output_dir}/{strategy_type}/{YYYYMMDD}/{HHMMSS}/{strategy_id 的 ':' 替换为 '_'}/backtest_result.json`
+  （目录名形如 `{name}_{symbol_lower}`；多标横截面一次运行只产出一个
+  `strategy_id` 目录）
+
+从对应 `backtest_result.json` 的 `metrics` 段提取：
 
 ```python
 # 回测输出中的关键诊断字段
@@ -1187,9 +1779,13 @@ per_symbol_stats = {
 }
 ```
 
+> **Rust 注意**：横截面配置一次运行只产出一个组合 `accounts` 条目，没有现成的
+> per-symbol 统计。需要分品种归因时，复制一份只含单标的 `universe` 的配置重跑，
+> 或从引擎 `state/` 的仓位/成交快照聚合；**不得自行编造**未产出的分币种数字。
+
 #### Step 2: 读取策略代码，提取可调参数清单
 
-解析 `{prefix}_core.py` 和 `overrides/<SYMBOL>.yaml`，自动提取：
+**Python**：解析 `{prefix}_core.py` 和 `overrides/<SYMBOL>.yaml`，自动提取：
 
 ```python
 # 从 overrides/<SYMBOL>.yaml 的 params 段提取可调参数
@@ -1213,6 +1809,40 @@ hardcoded_thresholds = [
         "affects": "entry",
     }
 ]
+```
+
+**Rust**：解析 `crates/strategies/src/{strategy_name}.rs` 与
+`config/<group>/strategy.yaml`，自动提取：
+
+```python
+# 1) 配置 params（策略私有参数唯一入口）
+adjustable_params = {
+    "{param}": {
+        "current": config["params"]["{param}"],
+        "role": "从 Params 字段注释/使用处推断",
+        "affects": "entry / exit / risk / filter",
+        "suggested_range": "由策略逻辑与指标周期推导",
+        "source": "config/{group}/strategy.yaml",
+    }
+}
+
+# 2) 源码硬编码阈值（Params 之外的常量）
+hardcoded_thresholds = [
+    {
+        "location": "crates/strategies/src/{name}.rs:LINE",
+        "code": "if price <= pos.stop_price {",
+        "parameter": "hard stop 判定",
+        "current": "ATR mult / pct",
+        "suggested_range": "按 ATR 周期与波动推导",
+        "affects": "exit",
+    }
+]
+
+# 3) 结构参数（不在 params，但影响行为；只诊断不建议乱改）
+structural = ["timeframes[0] base TF", "rebalance.top_k/every_bars", "sizing/risk 比例"]
+
+# 4) 期货不可调项（属于 contracts.yaml，禁止写进 params）
+forbidden = ["multiplier", "margin_rate", "commission", "session_opens/closes"]
 ```
 
 #### Step 3: 综合诊断——回测症状 × 策略逻辑 × K线特征
@@ -1261,9 +1891,13 @@ hardcoded_thresholds = [
       {threshold_1}: {current} → {suggested}（{reason}）
 
   修改方案:
-    1. 修改 strategies/{strategy_name}/overrides/{SYMBOL}.yaml: {具体参数变更}
-    2. 修改 {prefix}_core.py: {具体代码变更}
-    3. {其他修改}
+    Python:
+      1. 修改 strategies/{strategy_name}/overrides/{SYMBOL}.yaml: {具体参数变更}
+      2. 修改 {prefix}_core.py: {具体代码变更}
+    Rust:
+      1. 修改 config/{group}/strategy.yaml 的 params: {具体参数变更}
+      2. 修改 crates/strategies/src/{strategy_name}.rs: {具体代码变更}
+      3. cargo test --workspace 后重跑 backtest
 
   归因标记: 本轮修改维度 = {维度名，如"入场阈值"/"止损倍数"/"指标周期"}
 ```
@@ -1272,7 +1906,7 @@ hardcoded_thresholds = [
 
 1. **每轮只改一个主维度**，辅维度最多一个，确保可归因
 2. **参数修改幅度**：首次调整步长为当前值的 ±20%（或参数合理范围的 1/3），后续轮次根据上轮效果缩放步长
-3. **代码修改优先级**：优先调参（改 overrides YAML）→ 调阈值（改 core.py 硬编码）→ 调逻辑（改 core.py 条件判断）
+3. **代码修改优先级**：优先调参（Python 改 overrides YAML / Rust 改 `strategy.yaml` 的 `params`）→ 调阈值（改 `{prefix}_core.py` / `{name}.rs` 常量）→ 调逻辑（改条件判断）；Rust 每次改完先 `cargo test --workspace`
 4. **禁止归因模糊**：连续 2 轮修改同维度无改善，换一个本质不同的维度
 5. **回撤优先**：`max_drawdown > 30%` 时优先处理风控（止损/仓位/冷却），再处理收益
 
@@ -1317,10 +1951,15 @@ Phase 1: 脚手架创建（一次性）
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
 | `STRATEGY_LANG` | `python` | 策略开发语言：`python` 或 `rust` |
-| `DATA_PATH` | `./data/klines` | K线数据存储路径（= settings.yaml 的 csv_dir） |
+| `STRATEGY_MARKET` | `crypto` | 市场：`crypto` 或 `futures`（futures 仅 rust 模式） |
+| `DATA_PATH` | `./data/klines` | K 线数据根目录（Python: csv_dir；Rust: `--data-dir`） |
 | `CTA_ENV` | `dev` | 运行环境（dev/test/prod） |
 | `BENCHMARK_OUTPUT_PATH` | `./benchmark_output` | benchmark 报告输出路径 |
-| `KLINE_DATA_DIR` | `./data/klines` | 共享 K线数据源目录（symlink 目标） |
+| `KLINE_DATA_DIR` | `./data/klines` | 共享 K 线数据源目录（symlink 目标） |
+| `FUTURES_EXCHANGE` | `SHFE` | 期货交易所：`SHFE` / `DCE` / `CZCE` / `INE` |
+| `FUTURES_SYMBOL` | `CU` | 期货品种代码（必须已在 `config/contracts.yaml` 声明） |
+| `FUTURES_KLINES_DIR` | （空） | 用户提供的期货 K 线根目录或 1m CSV 路径（**必填，不下载**） |
+| `FUTURES_INITIAL_CASH` | （空） | 期货初始权益（元）；也可写在 `_global.yaml` 的 `initial_cash` |
 
 ### 直连下单配置（live/smoking 模式必填）
 
@@ -1340,8 +1979,8 @@ Phase 1: 脚手架创建（一次性）
 |----------|--------|------|
 | `HTTPS_PROXY` / `HTTP_PROXY` | （空=直连） | 访问 Binance 公共源的代理（国内网络通常需要） |
 | `LOG_LEVEL` | `INFO` | 策略进程日志级别（manager 透传） |
-| `STRATEGY_TEMPLATE_TAG` | `v1.0.0` | 指定模板仓库 tag 版本 |
-| `TRADING_DEV_TEMPLATE_DIR` | （空） | 模板本地缓存路径（GitHub 克隆失败时回退） |
+| `STRATEGY_TEMPLATE_TAG` | Python `v1.0.0` / Rust 空（跟 main） | 指定模板仓库 tag；Rust 期货模板尚未打 tag |
+| `TRADING_DEV_TEMPLATE_DIR` | （空） | 本地模板目录；设置后优先使用（如最新 `strategy-template-rs`） |
 
 ### .env.example 模板
 
@@ -1361,8 +2000,14 @@ BINANCE_API_SECRET=
 # HTTP_PROXY=http://127.0.0.1:7890
 ```
 
-> **Rust 模式**：配置结构不同，详见 `config/{strategy}/example.yaml`（per-strategy），
-> 全局默认值在 `config/_global.example.yaml`。
+> **Rust 模式**：配置体系与 Python 不同——
+> - 策略级：`config/<group>/strategy.yaml`（`strategy_type`/`universe`/`timeframes`/
+>   `indicators`/`entry`/`exit`/`portfolio_exit`/`rebalance`/`risk`/`sizing`/`params`）
+> - 组级运行基线：`config/<group>/_global.yaml`（`mode`/`warmup_days`/`cash`/
+>   `initial_cash`/`services.trading`）；模板里是 gitignore 文件，从
+>   `config/_global.example.yaml` 生成
+> - 合约参数：仓库根 `config/contracts.yaml`（期货**唯一**来源）
+> - Rust 模板没有 `.env.example`；需要时自建 `.env`（`STRATEGY_SECRET`、代理），不入库。
 
 ---
 
@@ -1380,6 +2025,9 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
       "Bash(python3:*)",
       "Bash(python:*)",
       "Bash(pip:*)",
+      "Bash(cargo:*)",
+      "Bash(rustup:*)",
+      "Bash(scripts/run_backtest_matrix.sh:*)",
       "Bash(git init:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
@@ -1397,8 +2045,11 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 | 权限类别 | 具体操作 | 使用阶段 |
 |----------|----------|----------|
 | **Bash: cp/mkdir/ln** | 复制模板、创建目录、symlink K线数据 | Phase 1 |
-| **Bash: python3 -m venv** | 创建虚拟环境 | Phase 1 |
-| **Bash: pip install** | 安装依赖 | Phase 1 |
+| **Bash: python3 -m venv** | 创建虚拟环境（仅 Python） | Phase 1 |
+| **Bash: pip install** | 安装依赖（仅 Python） | Phase 1 |
+| **Bash: cargo fetch/test/fmt/clippy** | Rust 依赖、基线自检、测试 | Phase 1/2 |
+| **Bash: cargo run -p strategy-app** | Rust 回测/下载/数据命令 | Phase 1/3 |
+| **Bash: cargo run -p strategy-data --bin roll_build** | 期货逐合约 CSV → 主力连续 1m | Phase 1 |
 | **Bash: git init/add/commit** | 初始化仓库 | Phase 1 |
 | **Bash: python -m backtest** | 运行回测 | Phase 3 |
 | **Bash: python3 -m pytest** | 跑策略测试 | Phase 2 |
@@ -1411,7 +2062,7 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 
 ## Critical Constraints
 
-### 编码红线（来自 AI_CONSTRAINTS.md，14 条禁止 + 11 条必须）
+### Python 编码红线（来自模板 AI_CONSTRAINTS.md，14 条禁止 + 11 条必须）
 
 | # | 约束 | 原因 |
 |---|------|------|
@@ -1428,6 +2079,45 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 | 必须 | 平仓走 `_notify_exit_and_clear(..., is_stop_loss=...)` | 不要自己调 `clear_position()` |
 | 必须 | 入场调 `_notify_position_enter(symbol, state)` | 漏了仓位不落盘 |
 | 必须 | overrides 的 `params` 配置 `*_timeframes` | 否则该周期无数据 |
+
+### Rust 编码红线（来自模板 AI_CONSTRAINTS.md，23 禁 + 12 必，摘要）
+
+| # | 约束 | 原因 |
+|---|------|------|
+| 1 | 禁 `now()`/系统时间；只用 `snapshot.bar.open_time` | 回测逐字节可复现 |
+| 2 | 禁读未闭合 K 线/绕过 `snapshot.closed`；只用 `closed(tf)` | 类型层隔离未来函数 |
+| 3 | 禁策略内 IO（文件/网络/日志落盘） | 策略是纯计算 |
+| 4 | 禁改 `build.rs`/`registry.rs`/`lib.rs` 接线区 | 注册机制冻结 |
+| 5 | `Params` 必须 `deny_unknown_fields + default` | 参数拼错启动即报错 |
+| 6 | 指标 NaN/warmup 必须显式长度检查 | 数据不足不得出信号 |
+| 7 | `timeframes()` 必须含 `M1` | 聚合器据此注册 |
+| 8 | `on_cross_section_bars` 主路径禁 `unwrap()/expect()` | 用 `Option`/`?` 静默降级 |
+| 9 | 禁自持 `master_id`/子仓/总仓状态 | 账本由引擎 `MasterPosition`/`SubPosition` 持有 |
+| 10 | 禁 `strategy_type()` / 注册名 / 配置名不一致 | signal_id 与报表路径会分裂 |
+| 11 | 禁 `Params::default()` 与配置 `params` 不一致 | 文档即契约 |
+| 12 | 禁无测试新增策略；至少覆盖入场 + 出场 | 行为不可验证 |
+| 13 | 禁在 `portfolio.master.state == Closing` 时开/加/调仓 | `StrategyBase` 已内置门控 |
+| 14 | 等权目标必须乘 `portfolio.max_total_notional`，不用全额 NAV | 否则目标高于执行容量，产生拒单 |
+| 15 | 组合级退出用 `CloseMaster`，不逐标的 `Close` 模拟 | 总仓状态机不成立 |
+| 16 | 禁在策略/`params` 写死乘数/手数/保证金/手续费 | 唯一来源 `config/contracts.yaml` |
+| 17 | 禁期货 symbol 未在 `contracts.yaml` 声明就回测 | 会静默退化为 crypto 兼容模式 |
+| 18 | 禁自行拼日盘/夜盘/午休或按 UTC 断交易日 | 引擎 `SessionWindowPolicy` 负责 |
+| 19 | 禁在策略内模拟平今/平昨 | `offset` 由执行层生成；只发 `Close`/`CloseMaster`/`Adjust` |
+| 20 | 禁用户未提供期货 K 线就回测/用 mock 顶替 | 结果不可信 |
+| 必须 | 文件尾 `register_strategy!` 恰好一次；文件名 == 注册名 | 注册表自动发现 |
+| 必须 | 期货配置显式 `initial_cash`，等分后够开 1 手 | 否则部分品种永远开不出仓 |
+| 必须 | 期货用例覆盖 `multiplier != 1`、整数手取整、时段聚合 | 换品种即错的最常见来源 |
+
+### 期货数据与市场规则（仅 Rust 模式）
+
+| # | 规则 |
+|---|------|
+| 1 | 用户说"期货"时**不提供下载**，先索要 K 线路径（逐合约目录或已生成 1m CSV） |
+| 2 | 期货数据落位 `data/klines/1m/<EXCHANGE>/cn_futures/<SYMBOL>_1m.csv`（Rust）或模板约定路径（Python） |
+| 3 | 回测区间必须落在数据覆盖范围内；不足先要数据，不得换品种/换区间顶替 |
+| 4 | `config/contracts.yaml` 是乘数/保证金/费率/时段的唯一来源，策略 `params` 禁止出现 |
+| 5 | 主力连续不复权；跨换月回测需在 benchmark 注明断档与偏差 |
+| 6 | 没跑通回测不得写"已跑通"；缺数据就停在 Phase 1 并在交付说明列出缺口 |
 
 ### 配置文件格式
 
@@ -1463,18 +2153,20 @@ Skill 执行时需要以下权限，应在项目 `.claude/settings.json` 中预�
 Phase -1: 交互式引导（仅无参数时）
   ├── Step 1: 问子命令（默认 new）
   ├── Step 2: 问策略来源（new 子命令）
+  ├── Step 2.5: 问语言/市场（期货追问 K 线路径/交易所/初始权益）
   └── Step 3: 汇总确认 -> 进 Phase 0
        ↓
-Phase 0: 环境预检 + 策略信息获取
-  ├── Step 0: 环境预检（Python/ta-lib/pip/K线数据/磁盘）
+Phase 0: 主机级环境预检 + 策略信息获取
+  ├── Step 0: 主机级预检（Python/Rust 工具链、磁盘；期货用户 K 线路径）
   ├── Step 1: 解析策略来源（文件/目录/URL/自然语言/多轮对话）
-  ├── Step 2: 统一提取为 .strategy-spec.yaml（schema 见 docs/strategy/STRATEGY_SPEC.md）
+  ├── Step 2: 统一提取为 .strategy-spec.yaml（按语言落盘；含 market/data_source/backtest）
   └── Step 3: 执行确认（全自动→直接执行 / 交互→用户确认）
        ↓
 Phase 1: 脚手架创建（一次性）
-  ├── 镜像复制模板（含两个参考实现）
-  ├── 创建 Python venv + 安装依赖
-  ├── 准备 K 线数据（symlink / download_data.py 下载，路径 {csv_dir}/{interval}/）
+  ├── 镜像复制模板（含参考实现），校验 Phase 0 落盘的 spec
+  ├── Rust: cargo metadata + contracts.yaml（期货）→ cargo fetch + 基线自检
+  ├── Python: venv + 依赖
+  ├── 准备 K 线数据（crypto 自动下载；futures 必须用户提供，禁止下载）
   ├── git init + 首次 commit
   └── 输出就绪报告
        ↓
@@ -1482,16 +2174,20 @@ Phase 1: 脚手架创建（一次性）
 │ Loop (最多 5 轮)                             │
 │                                             │
 │   Phase 2: 生成/修改策略代码                  │
-│     ├── 读规范文档 + 参考实现 example_ma_cross │
-│     ├── 生成 strategy.py + {prefix}_core.py  │
-│     ├── 生成 overrides/<SYMBOL>.yaml + 测试   │
-│     ├── 登记 config/strategies.yaml          │
-│     ├── 验证配置格式 + 跑测试                  │
+│     ├── 读规范文档 + 对应市场/形态参考实现      │
+│     ├── Python: strategy.py + core + overrides │
+│     │   Rust: crates/strategies/src/{name}.rs  │
+│     │         + config/{group}/strategy.yaml   │
+│     ├── 生成测试                              │
+│     ├── 验证配置 + 跑测试                      │
 │     ├── 运行审查检查表                        │
 │     └── 重写/同步 README.md（场景A重写/B增量） │
 │         ↓                                   │
 │   Phase 3: 回测验证                          │
-│     ├── 短期 → 中期 → 长期（run_backtest_batch.sh）│
+│     ├── 短期 → 中期 → 长期                   │
+│     │   Python: run_backtest_batch.sh        │
+│     │   Rust: cargo run -p strategy-app --   │
+│     │         backtest / run_backtest_matrix │
 │     └── 解析 backtest_result.json 的 metrics │
 │         ↓                                   │
 │   达标？ ── 是 ──→ 输出 benchmark.md         │

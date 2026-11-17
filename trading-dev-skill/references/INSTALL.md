@@ -6,8 +6,9 @@
 |------|---------|------|
 | Claude Code | 最新版 | CLI / Desktop / IDE 扩展均可 |
 | Python | 3.10+ | Python 模式策略运行环境 |
-| Rust | 最新稳定版 | Rust 模式策略运行环境（rustc + cargo） |
+| Rust | 以模板 `rust-toolchain.toml` 为准（当前 1.98.1） | Rust 模式策略运行环境（rustc + cargo + rustup）；浮动 stable 会导致 fmt/clippy 漂移 |
 | ta-lib C 库 | 0.4.0 | 回测指标计算（可选，缺则回测不可用；仅 Python 模式需要） |
+| 期货 1m K 线 | — | **期货模式必需**：用户提供逐合约 CSV 目录或已生成的 1m CSV；模板不附带、不下载 |
 
 ## 安装方式
 
@@ -58,25 +59,60 @@ ln -s /home/qpw/workspace/trading/trading-dev-skill ~/.claude/skills/trading-dev
 | 语言 | 仓库 | 默认 Tag |
 |------|------|----------|
 | Python（默认） | `https://github.com/ZkwareDAO/strategy-template.git` | `v1.0.0` |
-| Rust | `https://github.com/ZkwareDAO/strategy-template-rs.git` | `v1.0.0` |
+| Rust | `https://github.com/ZkwareDAO/strategy-template-rs.git` | 空（跟 `main`；`strategy.yaml` 与期货模板尚未打 tag） |
 
-**选择语言**：
+**选择语言与市场**：
 ```bash
-# 默认 Python；切换 Rust 模式
+# 默认 Python + crypto
+export STRATEGY_LANG=python
+export STRATEGY_MARKET=crypto
+
+# Rust 模式（crypto 或 futures）
 export STRATEGY_LANG=rust
+export STRATEGY_MARKET=futures
+
+# 期货模式必须提供 K 线位置（不下载）
+export FUTURES_EXCHANGE=SHFE
+export FUTURES_SYMBOL=CU
+export FUTURES_KLINES_DIR=/path/to/klines   # 或 /path/to/CU_1m.csv
+export FUTURES_INITIAL_CASH=1000000
 ```
 
 **指定版本（tag）**：
 ```bash
-# 默认拉取 v1.0.0；可覆盖为其他 tag
+# Python 默认 v1.0.0；Rust 默认跟 main，可显式覆盖
 export STRATEGY_TEMPLATE_TAG=v1.0.0
 ```
 
 **离线回退（本地缓存）**：
 ```bash
-# GitHub 克隆失败时使用本地缓存
-export TRADING_DEV_TEMPLATE_DIR=/path/to/local/strategy-template
+# 设置后优先使用本地模板（如当前最新开发线）
+export TRADING_DEV_TEMPLATE_DIR=/home/qpw/workspace/strategy-template-rs
 ```
+
+### 期货模式前置（仅 Rust 模板，硬要求）
+
+Python 模板没有 `contracts.yaml`、整数手/乘数、日盘夜盘时段与平今语义，
+**不能用于期货**；期货必须用 `STRATEGY_LANG=rust` + `strategy-template-rs`。
+
+模板**不提供期货行情下载**，也没有自动下载命令。必须先拿到用户数据：
+
+```bash
+# A. 逐合约原始 CSV 目录（文件名 {PRODUCT}{YYMM}.csv，列
+#    symbol,bob|open_time,open,high,low,close,volume,position）
+cargo run -p strategy-data --bin roll_build -- \
+  --in <用户目录> --product CU --out <临时目录>
+cp <临时目录>/1m/CU_CONT_1m.csv data/klines/1m/SHFE/cn_futures/CU_1m.csv
+
+# B. 用户已有标准 10 列 1m CSV：直接落位，或回测时 --data-dir 指向数据根
+```
+
+同时确认：
+
+- 品种已在仓库根 `config/contracts.yaml` 声明（乘数/保证金/费率/时段），
+  否则会静默退化为 crypto 兼容模式（结果不可信）。
+- `_global.yaml` 显式 `initial_cash`（元），按 universe 等分后仍够开 ≥1 手。
+- 回测区间落在数据覆盖范围内；不足时向用户索要，不得用 mock/其他品种顶替。
 
 ### Benchmark 输出路径
 
@@ -118,7 +154,9 @@ trading/
 │   └── trading-dev.md           # /trading-dev 命令入口
 ├── trading-dev-skill/
 │   ├── SKILL.md                 # Skill 定义（Claude Code 读取）
-│   └── INSTALL.md               # 本文件
+│   └── references/
+│       ├── INSTALL.md           # 本文件
+│       └── ANALYSIS.md          # 流程/时序分析
 └── cta_volume_resonance/        # 未来 skill 示例
 ```
 
@@ -135,8 +173,9 @@ trading/
 ## 使用流程
 
 ```
-# 选择语言（默认 Python）
-export STRATEGY_LANG=python   # 或 rust
+# 选择语言与市场（默认 Python + crypto）
+export STRATEGY_LANG=python      # 或 rust
+export STRATEGY_MARKET=crypto    # 或 futures（需先提供 K 线路径）
 
 /trading-dev new              → 创建项目脚手架 + 策略开发 + 回测验证
 /trading-dev new --from <src> → 全自动模式
